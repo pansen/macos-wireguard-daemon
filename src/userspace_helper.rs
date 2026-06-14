@@ -14,6 +14,8 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(all(unix, target_os = "linux"))]
 use std::path::Path;
@@ -39,9 +41,7 @@ use gotatun::x25519::{PublicKey, StaticSecret};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 #[cfg(unix)]
-use tracing::info;
-#[cfg(target_os = "macos")]
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -53,6 +53,21 @@ const SOCK_DIR: &str = "/var/run/wireguard";
 const HELPER_ENV: &str = "TUNMUX_GOTATUN_HELPER";
 #[cfg(unix)]
 const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
+
+#[cfg(unix)]
+fn gotatun_pid_path(interface: &str) -> PathBuf {
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.pid"))
+}
+
+#[cfg(unix)]
+fn gotatun_name_path(interface: &str) -> PathBuf {
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.name"))
+}
+
+#[cfg(unix)]
+fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.cleanup"))
+}
 
 #[cfg(unix)]
 struct RunningDevice {
@@ -205,12 +220,94 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 }
             };
 
-            signal_parent(true).context("failed to notify parent about helper startup")?;
-            rt.block_on(wait_for_shutdown(&running))?;
-            cleanup_network(&running);
-            rt.block_on(async {
-                running.device.stop().await;
+            let pid_path = gotatun_pid_path(interface);
+            if let Err(error) = write_runtime_file(&pid_path, &std::process::id().to_string()) {
+                cleanup_network(&running).ok();
+                rt.block_on(async {
+                    running.device.stop().await;
+                });
+                let _ = std::fs::remove_file(&running.control_socket_path);
+                let _ = std::fs::remove_file(gotatun_name_path(interface));
+                let _ = signal_parent(false);
+                return Err(error.context("failed to write userspace helper pid file"));
+            }
+
+            if let Err(error) = signal_parent(true) {
+                cleanup_network(&running).ok();
+                rt.block_on(async {
+                    running.device.stop().await;
+                });
+                let _ = std::fs::remove_file(&running.control_socket_path);
+                let _ = std::fs::remove_file(&pid_path);
+                let _ = std::fs::remove_file(gotatun_name_path(interface));
+                return Err(error).context("failed to notify parent about helper startup");
+            }
+            debug!(
+                interface = running.control_interface_name,
+                actual_interface = running.interface_name,
+                pid = std::process::id(),
+                "userspace_helper_ready"
+            );
+            let shutdown_started = std::time::Instant::now();
+            let wait_result = rt.block_on(wait_for_shutdown(&running));
+            debug!(
+                interface = running.control_interface_name,
+                elapsed_ms = shutdown_started.elapsed().as_millis(),
+                result = ?wait_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
+                "userspace_helper_shutdown_triggered"
+            );
+
+            let cleanup_started = std::time::Instant::now();
+            let cleanup_result = cleanup_network(&running);
+            debug!(
+                interface = running.control_interface_name,
+                elapsed_ms = cleanup_started.elapsed().as_millis(),
+                result = ?cleanup_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
+                "userspace_helper_network_cleanup_complete"
+            );
+
+            let control_socket_path = running.control_socket_path.clone();
+            let stop_started = std::time::Instant::now();
+            let stop_result = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), running.device.stop())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("gotatun device stop timed out after 5 seconds"))
             });
+            debug!(
+                interface,
+                elapsed_ms = stop_started.elapsed().as_millis(),
+                result = ?stop_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
+                "userspace_helper_device_stop_complete"
+            );
+
+            let mut errors = Vec::new();
+            if let Err(error) = wait_result {
+                errors.push(format!("shutdown wait failed: {error}"));
+            }
+            if let Err(error) = cleanup_result {
+                errors.push(format!("network cleanup failed: {error}"));
+            }
+            if let Err(error) = stop_result {
+                // Exiting the helper closes the tunnel fd even if gotatun's graceful
+                // stop future stalls. The privileged caller verifies utun removal.
+                warn!(
+                    interface,
+                    error = %error,
+                    "userspace_helper_device_stop_forced_by_process_exit"
+                );
+            }
+            let final_result = finish_cleanup(errors);
+
+            let status = match &final_result {
+                Ok(()) => "ok\n".to_string(),
+                Err(error) => format!("error: {error}\n"),
+            };
+            write_runtime_file_atomic(&gotatun_cleanup_status_path(interface), &status)?;
+            let _ = std::fs::remove_file(&control_socket_path);
+            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(gotatun_name_path(interface));
+
+            final_result?;
         }
     }
 
@@ -273,6 +370,8 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
     };
 
     let control_socket_path = PathBuf::from(SOCK_DIR).join(format!("{}.sock", interface));
+    write_runtime_file(&gotatun_name_path(interface), &interface_name)
+        .context("failed to write userspace helper interface name")?;
     Ok(RunningDevice {
         interface_name,
         control_interface_name: interface.to_string(),
@@ -302,10 +401,17 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            _ = sigint.recv() => break,
-            _ = sigterm.recv() => break,
+            _ = sigint.recv() => {
+                debug!(interface = running.control_interface_name, trigger = "sigint", "userspace_helper_shutdown_requested");
+                break;
+            },
+            _ = sigterm.recv() => {
+                debug!(interface = running.control_interface_name, trigger = "sigterm", "userspace_helper_shutdown_requested");
+                break;
+            },
             _ = ticker.tick() => {
                 if !running.control_socket_path.exists() {
+                    debug!(interface = running.control_interface_name, trigger = "control_socket_removed", "userspace_helper_shutdown_requested");
                     break;
                 }
 
@@ -324,7 +430,8 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                         log_macos_dataplane_probe(
                             &running.control_interface_name,
                             &mut last_transfer,
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -335,14 +442,14 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(u64, u64)>) {
+async fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(u64, u64)>) {
     let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
     let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
         Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
         53,
     )));
 
-    match read_wg_transfer_bytes(interface) {
+    match read_wg_transfer_bytes(interface).await {
         Ok(Some((rx_bytes, tx_bytes))) => {
             let (delta_rx_bytes, delta_tx_bytes) = last_transfer
                 .map(|(prev_rx, prev_tx)| {
@@ -396,11 +503,28 @@ fn send_udp_probe(target: SocketAddr) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
-    let output = Command::new("wg")
-        .args(["show", interface, "transfer"])
-        .output()
-        .context("failed to run wg show transfer")?;
+async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    // `wg show <iface> transfer` connects to gotatun's in-process UAPI socket, which can only
+    // be serviced by the async UAPI task running on this same runtime. Running the command
+    // inline would block the runtime thread and self-deadlock (the runtime can no longer poll
+    // the task that `wg` is waiting on). Run it on a blocking thread, bounded by a timeout, so
+    // the runtime stays free to answer the UAPI request and a stuck `wg` can never wedge us.
+    let owned_interface = interface.to_string();
+    let output = match tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::task::spawn_blocking(move || {
+            Command::new("wg")
+                .args(["show", &owned_interface, "transfer"])
+                .output()
+        }),
+    )
+    .await
+    {
+        Ok(join_result) => join_result
+            .context("wg show transfer task panicked")?
+            .context("failed to run wg show transfer")?,
+        Err(_) => anyhow::bail!("wg show {} transfer timed out", interface),
+    };
     if !output.status.success() {
         anyhow::bail!("wg show {} transfer failed", interface);
     }
@@ -638,14 +762,32 @@ fn configure_network(
 }
 
 #[cfg(unix)]
-fn cleanup_network(running: &RunningDevice) {
+fn cleanup_network(running: &RunningDevice) -> anyhow::Result<()> {
     match &running.cleanup {
-        CleanupState::None => {}
+        CleanupState::None => Ok(()),
         #[cfg(target_os = "linux")]
         CleanupState::Linux(state) => cleanup_network_linux(state),
         #[cfg(target_os = "macos")]
         CleanupState::Macos(state) => cleanup_network_macos(state),
     }
+}
+
+#[cfg(unix)]
+fn write_runtime_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_runtime_file_atomic(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    write_runtime_file(&temp_path, contents)?;
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -680,7 +822,7 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
-    info!(command = %format_command_for_log(name, args), "userspace_helper_command");
+    debug!(command = %format_command_for_log(name, args), "userspace_helper_command");
     Command::new(name)
         .args(args)
         .output()
@@ -761,13 +903,24 @@ fn configure_network_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_network_linux(state: &LinuxCleanupState) {
+fn cleanup_network_linux(state: &LinuxCleanupState) -> anyhow::Result<()> {
+    debug!(
+        routes = state.routes_added.len(),
+        restore_resolv_conf = state.original_resolv_conf.is_some(),
+        "userspace_helper_network_cleanup_begin"
+    );
+    let mut errors = Vec::new();
     for route in state.routes_added.iter().rev() {
-        let _ = del_linux_route(route);
+        if let Err(error) = del_linux_route(route) {
+            errors.push(error.to_string());
+        }
     }
     if let Some(original) = &state.original_resolv_conf {
-        let _ = std::fs::write("/etc/resolv.conf", original);
+        if let Err(error) = std::fs::write("/etc/resolv.conf", original) {
+            errors.push(format!("restore /etc/resolv.conf failed: {error}"));
+        }
     }
+    finish_cleanup(errors)
 }
 
 #[cfg(target_os = "linux")]
@@ -948,113 +1101,150 @@ fn configure_network_macos(
     interface: &str,
     config: &ParsedUserspaceConfig,
 ) -> anyhow::Result<MacosCleanupState> {
-    let mut routes_added = Vec::new();
-    let has_ipv4_address = config
-        .addresses
-        .iter()
-        .any(|address| !address.contains(':'));
-    let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
-    for address in &config.addresses {
-        let (ip, prefix) = parse_cidr(address)?;
-        match ip {
-            IpAddr::V4(addr) => {
-                let ip_string = addr.to_string();
-                run_command(
-                    "ifconfig",
-                    &[interface, "inet", address, ip_string.as_str(), "alias"],
-                )?;
-            }
-            IpAddr::V6(addr) => {
-                let ip_string = addr.to_string();
-                let prefix_string = prefix.to_string();
-                run_command(
-                    "ifconfig",
-                    &[
-                        interface,
-                        "inet6",
-                        ip_string.as_str(),
-                        "prefixlen",
-                        prefix_string.as_str(),
-                        "alias",
-                    ],
-                )?;
-            }
-        }
-    }
-    run_command("ifconfig", &[interface, "up"])?;
-    if let Err(error) = run_command("ifconfig", &[interface, "-rxcsum", "-txcsum"]) {
-        warn!(
-            interface,
-            error = %error,
-            "userspace_helper_disable_checksum_offload_failed"
-        );
-    }
+    let mut state = MacosCleanupState {
+        routes_added: Vec::new(),
+        dns_services: Vec::new(),
+    };
 
-    let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
-    if !endpoint_is_ipv6 || has_ipv6_address {
-        if let Some(default_gateway) = get_macos_default_gateway(endpoint_is_ipv6)? {
-            let endpoint_route = MacosRoute {
-                is_ipv6: endpoint_is_ipv6,
-                destination: config.endpoint.ip().to_string(),
-                interface: None,
-                gateway: Some(default_gateway),
-            };
-            if add_macos_route(&endpoint_route)? {
-                routes_added.push(endpoint_route);
+    let setup_result = (|| -> anyhow::Result<()> {
+        let has_ipv4_address = config
+            .addresses
+            .iter()
+            .any(|address| !address.contains(':'));
+        let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
+        for address in &config.addresses {
+            let (ip, prefix) = parse_cidr(address)?;
+            match ip {
+                IpAddr::V4(addr) => {
+                    let ip_string = addr.to_string();
+                    run_command(
+                        "ifconfig",
+                        &[interface, "inet", address, ip_string.as_str(), "alias"],
+                    )?;
+                }
+                IpAddr::V6(addr) => {
+                    let ip_string = addr.to_string();
+                    let prefix_string = prefix.to_string();
+                    run_command(
+                        "ifconfig",
+                        &[
+                            interface,
+                            "inet6",
+                            ip_string.as_str(),
+                            "prefixlen",
+                            prefix_string.as_str(),
+                            "alias",
+                        ],
+                    )?;
+                }
             }
         }
-    }
-
-    for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
-        if add_macos_route(&route)? {
-            routes_added.push(route);
+        run_command("ifconfig", &[interface, "up"])?;
+        if let Err(error) = run_command("ifconfig", &[interface, "-rxcsum", "-txcsum"]) {
+            warn!(
+                interface,
+                error = %error,
+                "userspace_helper_disable_checksum_offload_failed"
+            );
         }
+
+        let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
+        if !endpoint_is_ipv6 || has_ipv6_address {
+            if let Some(default_gateway) = get_macos_default_gateway(endpoint_is_ipv6)? {
+                let endpoint_route = MacosRoute {
+                    is_ipv6: endpoint_is_ipv6,
+                    destination: config.endpoint.ip().to_string(),
+                    interface: None,
+                    gateway: Some(default_gateway),
+                };
+                if add_macos_route(&endpoint_route)? {
+                    state.routes_added.push(endpoint_route);
+                }
+            }
+        }
+
+        for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
+            if add_macos_route(&route)? {
+                state.routes_added.push(route);
+            }
+        }
+
+        configure_macos_dns(config, &mut state.dns_services)
+    })();
+
+    if let Err(setup_error) = setup_result {
+        return match cleanup_network_macos(&state) {
+            Ok(()) => Err(setup_error),
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "setup failed: {}; rollback failed: {}",
+                setup_error,
+                cleanup_error
+            )),
+        };
     }
 
-    let dns_services = configure_macos_dns(config)?;
-
-    Ok(MacosCleanupState {
-        routes_added,
-        dns_services,
-    })
+    Ok(state)
 }
 
 #[cfg(target_os = "macos")]
-fn cleanup_network_macos(state: &MacosCleanupState) {
+fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
+    debug!(
+        routes = state.routes_added.len(),
+        dns_services = state.dns_services.len(),
+        "userspace_helper_network_cleanup_begin"
+    );
+    let mut errors = Vec::new();
     for route in state.routes_added.iter().rev() {
-        let _ = del_macos_route(route);
+        if let Err(error) = del_macos_route(route) {
+            errors.push(error.to_string());
+        }
     }
     for service in state.dns_services.iter().rev() {
-        let _ = restore_macos_dns_service(service);
+        if let Err(error) = restore_macos_dns_service(service) {
+            errors.push(format!(
+                "restore DNS for {:?} failed: {error}",
+                service.service
+            ));
+        }
+    }
+    finish_cleanup(errors)
+}
+
+#[cfg(unix)]
+fn finish_cleanup(errors: Vec<String>) -> anyhow::Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("; "))
     }
 }
 
 #[cfg(target_os = "macos")]
 fn configure_macos_dns(
     config: &ParsedUserspaceConfig,
-) -> anyhow::Result<Vec<MacosDnsServiceState>> {
+    saved: &mut Vec<MacosDnsServiceState>,
+) -> anyhow::Result<()> {
     if config.dns_servers.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let services = list_macos_network_services()?;
-    let mut saved = Vec::new();
 
     for service in services {
         let previous_dns = get_macos_dns_servers(&service)?;
         let previous_search = get_macos_search_domains(&service)?;
 
-        set_macos_dns_servers(&service, &config.dns_servers)?;
-        set_macos_search_domains_empty(&service)?;
-
         saved.push(MacosDnsServiceState {
-            service,
+            service: service.clone(),
             dns_servers: previous_dns,
             search_domains: previous_search,
         });
+
+        set_macos_dns_servers(&service, &config.dns_servers)?;
+        set_macos_search_domains_empty(&service)?;
     }
 
-    Ok(saved)
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1194,16 +1384,37 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
 fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
     let mut args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
     args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
+    args.push(macos_route_target_kind(route).into());
     args.push(route.destination.clone());
-    if let Some(gateway) = &route.gateway {
-        args.push(gateway.clone());
-    }
-    if let Some(interface) = &route.interface {
-        args.push("-interface".into());
-        args.push(interface.clone());
-    }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command("route", &refs)
+    let output = run_command_capture_output("route", &refs)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stderr.contains("not in table") || stdout.contains("not in table") {
+        return Ok(());
+    }
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    anyhow::bail!("route {} failed: {}", refs.join(" "), detail)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_target_kind(route: &MacosRoute) -> &'static str {
+    let host_prefix = if route.is_ipv6 { "/128" } else { "/32" };
+    if route.gateway.is_some()
+        || route.destination.ends_with(host_prefix)
+        || !route.destination.contains('/')
+    {
+        "-host"
+    } else {
+        "-net"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1312,4 +1523,36 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
         .parse()
         .with_context(|| format!("invalid cidr prefix {}", prefix))?;
     Ok((ip, prefix))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{macos_route_target_kind, MacosRoute};
+
+    #[test]
+    fn macos_route_delete_uses_destination_kind_without_add_qualifiers() {
+        let network = MacosRoute {
+            is_ipv6: false,
+            destination: "55.56.57.0/24".to_string(),
+            interface: Some("utun9".to_string()),
+            gateway: None,
+        };
+        assert_eq!(macos_route_target_kind(&network), "-net");
+
+        let endpoint = MacosRoute {
+            is_ipv6: false,
+            destination: "23.88.101.22".to_string(),
+            interface: None,
+            gateway: Some("55.56.57.1".to_string()),
+        };
+        assert_eq!(macos_route_target_kind(&endpoint), "-host");
+
+        let host_cidr = MacosRoute {
+            is_ipv6: true,
+            destination: "2001:db8::1/128".to_string(),
+            interface: Some("utun9".to_string()),
+            gateway: None,
+        };
+        assert_eq!(macos_route_target_kind(&host_cidr), "-host");
+    }
 }
