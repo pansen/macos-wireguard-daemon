@@ -105,11 +105,60 @@ struct LinuxRoute {
 
 #[cfg(target_os = "macos")]
 struct MacosCleanupState {
-    routes_added: Vec<MacosRoute>,
+    /// Live routing state. Mutated by the network-change reconciler while the
+    /// tunnel is up and read by teardown, hence the interior mutability.
+    routing: std::sync::Mutex<MacosRoutingState>,
+    /// DNS overrides captured at connect and restored at teardown.
+    //
+    // TODO(dns-roam-reconcile): DNS is configured once at connect and is NOT
+    // re-applied when the network environment changes. After a roam the
+    // primary network service can change, leaving tunnel DNS unapplied on the
+    // new primary. The reconciler should re-assert DNS the same way it
+    // re-applies routes (see `macos_reconcile_routes`).
     dns_services: Vec<MacosDnsServiceState>,
+    /// Immutable inputs the reconciler replays on every network change.
+    reconcile: MacosReconcileInputs,
+}
+
+/// Routing state the reconciler keeps in sync with the live network.
+#[cfg(target_os = "macos")]
+struct MacosRoutingState {
+    /// Routes this tunnel currently owns; the source of truth for teardown.
+    routes_added: Vec<MacosRoute>,
+    /// Last observed network environment. A change drives reconciliation.
+    fingerprint: MacosNetworkFingerprint,
+}
+
+/// Inputs captured at connect that the reconciler needs to recompute routing.
+#[cfg(target_os = "macos")]
+struct MacosReconcileInputs {
+    interface: String,
+    endpoint: IpAddr,
+    endpoint_is_ipv6: bool,
+    /// Whether the endpoint must be pinned out of the tunnel via the physical
+    /// gateway. Only true when AllowedIPs would otherwise capture it (e.g. a
+    /// full tunnel); split tunnels reach the endpoint over the default route,
+    /// so an unpinned endpoint roams to a new network with no stale route.
+    endpoint_needs_pin: bool,
+    allowed_ips: Vec<String>,
+    dns_servers: Vec<String>,
+    has_ipv4_address: bool,
+    has_ipv6_address: bool,
+}
+
+/// A snapshot of the host network environment relevant to tunnel routing.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default, PartialEq)]
+struct MacosNetworkFingerprint {
+    /// Directly-connected subnets of physical interfaces (the LANs we must not
+    /// hijack), sorted+deduped for stable comparison.
+    local_subnets: Vec<(IpAddr, u8)>,
+    /// Default gateway for the endpoint's address family (for the endpoint pin).
+    endpoint_gateway: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, PartialEq)]
 struct MacosRoute {
     is_ipv6: bool,
     destination: String,
@@ -425,6 +474,12 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 
                 #[cfg(target_os = "macos")]
                 {
+                    // Adapt routing to network changes (roam, suspend/resume,
+                    // link up/down) live, without requiring a reconnect.
+                    if let CleanupState::Macos(state) = &running.cleanup {
+                        macos_reconcile_routes(state);
+                    }
+
                     if diag_enabled && std::time::Instant::now() >= next_diag_at {
                         next_diag_at = std::time::Instant::now() + Duration::from_secs(5);
                         log_macos_dataplane_probe(
@@ -1101,17 +1156,36 @@ fn configure_network_macos(
     interface: &str,
     config: &ParsedUserspaceConfig,
 ) -> anyhow::Result<MacosCleanupState> {
-    let mut state = MacosCleanupState {
-        routes_added: Vec::new(),
-        dns_services: Vec::new(),
+    let has_ipv4_address = config
+        .addresses
+        .iter()
+        .any(|address| !address.contains(':'));
+    let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
+    let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
+    let endpoint_family_supported = !endpoint_is_ipv6 || has_ipv6_address;
+    // Decision (1): only pin the endpoint out of the tunnel when AllowedIPs
+    // would otherwise capture it (full tunnel). A split tunnel reaches the
+    // endpoint over the default route, so leaving it unpinned means roaming to
+    // a new LAN "just works" with no stale gateway route to fix up.
+    let endpoint_needs_pin = endpoint_family_supported
+        && macos_allowed_ips_cover_endpoint(&config.allowed_ips, config.endpoint.ip());
+
+    let inputs = MacosReconcileInputs {
+        interface: interface.to_string(),
+        endpoint: config.endpoint.ip(),
+        endpoint_is_ipv6,
+        endpoint_needs_pin,
+        allowed_ips: config.allowed_ips.clone(),
+        dns_servers: config.dns_servers.clone(),
+        has_ipv4_address,
+        has_ipv6_address,
     };
 
+    let mut routes_added: Vec<MacosRoute> = Vec::new();
+    let mut dns_services: Vec<MacosDnsServiceState> = Vec::new();
+    let mut fingerprint = MacosNetworkFingerprint::default();
+
     let setup_result = (|| -> anyhow::Result<()> {
-        let has_ipv4_address = config
-            .addresses
-            .iter()
-            .any(|address| !address.contains(':'));
-        let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
         for address in &config.addresses {
             let (ip, prefix) = parse_cidr(address)?;
             match ip {
@@ -1148,53 +1222,66 @@ fn configure_network_macos(
             );
         }
 
-        let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
-        if !endpoint_is_ipv6 || has_ipv6_address {
-            if let Some(default_gateway) = get_macos_default_gateway(endpoint_is_ipv6)? {
-                let endpoint_route = MacosRoute {
-                    is_ipv6: endpoint_is_ipv6,
-                    destination: config.endpoint.ip().to_string(),
-                    interface: None,
-                    gateway: Some(default_gateway),
-                };
-                if add_macos_route(&endpoint_route)? {
-                    state.routes_added.push(endpoint_route);
-                }
-            }
+        // Compute the initial desired routes the same way the reconciler will,
+        // so the LAN-exclusion is applied from the very first packet.
+        fingerprint = macos_current_fingerprint(&inputs);
+        for route in macos_desired_routes(&inputs, &fingerprint) {
+            add_macos_route(&route)?;
+            routes_added.push(route);
         }
+        log_macos_routing_overview("connect", &inputs, &routes_added, &fingerprint);
 
-        for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
-            if add_macos_route(&route)? {
-                state.routes_added.push(route);
-            }
-        }
-
-        configure_macos_dns(config, &mut state.dns_services)
+        // TODO(dns-roam-reconcile): DNS is applied once here; unlike routes it
+        // is not recomputed on network change. See MacosCleanupState.dns_services.
+        configure_macos_dns(config, &mut dns_services)
     })();
 
     if let Err(setup_error) = setup_result {
-        return match cleanup_network_macos(&state) {
-            Ok(()) => Err(setup_error),
-            Err(cleanup_error) => Err(anyhow::anyhow!(
+        let mut errors = Vec::new();
+        for route in routes_added.iter().rev() {
+            if let Err(error) = del_macos_route(route) {
+                errors.push(error.to_string());
+            }
+        }
+        for service in dns_services.iter().rev() {
+            if let Err(error) = restore_macos_dns_service(service) {
+                errors.push(format!("restore DNS for {:?} failed: {error}", service.service));
+            }
+        }
+        return if errors.is_empty() {
+            Err(setup_error)
+        } else {
+            Err(anyhow::anyhow!(
                 "setup failed: {}; rollback failed: {}",
                 setup_error,
-                cleanup_error
-            )),
+                errors.join("; ")
+            ))
         };
     }
 
-    Ok(state)
+    Ok(MacosCleanupState {
+        routing: std::sync::Mutex::new(MacosRoutingState {
+            routes_added,
+            fingerprint,
+        }),
+        dns_services,
+        reconcile: inputs,
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
+    let routing = state
+        .routing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     debug!(
-        routes = state.routes_added.len(),
+        routes = routing.routes_added.len(),
         dns_services = state.dns_services.len(),
         "userspace_helper_network_cleanup_begin"
     );
     let mut errors = Vec::new();
-    for route in state.routes_added.iter().rev() {
+    for route in routing.routes_added.iter().rev() {
         if let Err(error) = del_macos_route(route) {
             errors.push(error.to_string());
         }
@@ -1419,13 +1506,13 @@ fn macos_route_target_kind(route: &MacosRoute) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn macos_allowed_routes(
-    config: &ParsedUserspaceConfig,
+    allowed_ips: &[String],
     interface: &str,
     has_ipv4_address: bool,
     has_ipv6_address: bool,
 ) -> Vec<MacosRoute> {
     let mut routes = Vec::new();
-    for allowed in &config.allowed_ips {
+    for allowed in allowed_ips {
         match allowed.as_str() {
             "0.0.0.0/0" => {
                 if !has_ipv4_address {
@@ -1480,6 +1567,362 @@ fn macos_allowed_routes(
     routes
 }
 
+/// The routes this tunnel wants installed for the given network environment:
+/// the (optional) endpoint pin plus the AllowedIPs routes, minus any subnet
+/// we are currently directly attached to (so we never hijack our own LAN).
+#[cfg(target_os = "macos")]
+fn macos_desired_routes(
+    inputs: &MacosReconcileInputs,
+    fingerprint: &MacosNetworkFingerprint,
+) -> Vec<MacosRoute> {
+    let mut routes = Vec::new();
+
+    if inputs.endpoint_needs_pin {
+        if let Some(gateway) = &fingerprint.endpoint_gateway {
+            routes.push(MacosRoute {
+                is_ipv6: inputs.endpoint_is_ipv6,
+                destination: inputs.endpoint.to_string(),
+                interface: None,
+                gateway: Some(gateway.clone()),
+            });
+        }
+    }
+
+    for route in macos_allowed_routes(
+        &inputs.allowed_ips,
+        &inputs.interface,
+        inputs.has_ipv4_address,
+        inputs.has_ipv6_address,
+    ) {
+        if let Some((subnet_ip, subnet_prefix)) =
+            macos_route_excluded_by_local_subnet(&route, &fingerprint.local_subnets)
+        {
+            debug!(
+                destination = %route.destination,
+                local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
+                "userspace_helper_route_excluded_local_lan"
+            );
+            continue;
+        }
+        routes.push(route);
+    }
+
+    routes
+}
+
+/// Returns the connected subnet that makes `route` local (so it must stay off
+/// the tunnel), or `None` if the route should be installed normally.
+#[cfg(target_os = "macos")]
+fn macos_route_excluded_by_local_subnet(
+    route: &MacosRoute,
+    local_subnets: &[(IpAddr, u8)],
+) -> Option<(IpAddr, u8)> {
+    // Only tunnel-bound routes (interface, no gateway) can hijack a LAN.
+    if route.interface.is_none() || route.gateway.is_some() {
+        return None;
+    }
+    let (ip, prefix) = parse_cidr(&route.destination).ok()?;
+    let destination = (macos_network_base(ip, prefix), prefix);
+    local_subnets
+        .iter()
+        .find(|local| macos_subnet_contains(local, &destination))
+        .copied()
+}
+
+/// True when `route` is equal to, or fully inside, the connected subnet `local`.
+#[cfg(target_os = "macos")]
+fn macos_subnet_contains(local: &(IpAddr, u8), route: &(IpAddr, u8)) -> bool {
+    if route.1 < local.1 {
+        return false;
+    }
+    match (local.0, route.0) {
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {
+            macos_network_base(route.0, local.1) == macos_network_base(local.0, local.1)
+        }
+        _ => false,
+    }
+}
+
+/// Mask `ip` down to its network base for the given prefix length.
+#[cfg(target_os = "macos")]
+fn macos_network_base(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let masked = match prefix {
+                0 => 0,
+                p if p >= 32 => bits,
+                p => bits & (u32::MAX << (32 - p)),
+            };
+            IpAddr::V4(Ipv4Addr::from(masked))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let masked = match prefix {
+                0 => 0,
+                p if p >= 128 => bits,
+                p => bits & (u128::MAX << (128 - p)),
+            };
+            IpAddr::V6(Ipv6Addr::from(masked))
+        }
+    }
+}
+
+/// True when any AllowedIPs entry would route the endpoint into the tunnel.
+#[cfg(target_os = "macos")]
+fn macos_allowed_ips_cover_endpoint(allowed_ips: &[String], endpoint: IpAddr) -> bool {
+    allowed_ips.iter().any(|allowed| {
+        let Ok((net, prefix)) = parse_cidr(allowed) else {
+            return false;
+        };
+        match (net, endpoint) {
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {
+                macos_network_base(endpoint, prefix) == macos_network_base(net, prefix)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Snapshot the current network environment that drives tunnel routing.
+#[cfg(target_os = "macos")]
+fn macos_current_fingerprint(inputs: &MacosReconcileInputs) -> MacosNetworkFingerprint {
+    let local_subnets = macos_local_connected_subnets(&inputs.interface);
+    // Only the endpoint pin needs the gateway; skip the lookup otherwise so we
+    // do not run `route get default` on every (no-op) reconcile tick.
+    let endpoint_gateway = if inputs.endpoint_needs_pin {
+        get_macos_default_gateway(inputs.endpoint_is_ipv6).unwrap_or(None)
+    } else {
+        None
+    };
+    MacosNetworkFingerprint {
+        local_subnets,
+        endpoint_gateway,
+    }
+}
+
+/// Re-apply routing when the host network changed (roam, suspend/resume, link
+/// up/down). Cheap and silent when nothing changed; expressive when it acts.
+#[cfg(target_os = "macos")]
+fn macos_reconcile_routes(state: &MacosCleanupState) {
+    let inputs = &state.reconcile;
+    let fingerprint = macos_current_fingerprint(inputs);
+
+    let mut routing = state
+        .routing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if fingerprint == routing.fingerprint {
+        return;
+    }
+
+    let previous = routing.fingerprint.clone();
+    info!(
+        interface = inputs.interface,
+        old_gateway = ?previous.endpoint_gateway,
+        new_gateway = ?fingerprint.endpoint_gateway,
+        old_local_subnets = %format_subnets(&previous.local_subnets),
+        new_local_subnets = %format_subnets(&fingerprint.local_subnets),
+        "userspace_helper_network_change_detected"
+    );
+
+    let desired = macos_desired_routes(inputs, &fingerprint);
+    let current = routing.routes_added.clone();
+    let mut installed: Vec<MacosRoute> = Vec::new();
+    let (mut added, mut removed, mut errors) = (0usize, 0usize, 0usize);
+
+    // Remove routes that are no longer desired (e.g. a LAN we just left, or a
+    // stale endpoint pin via the previous gateway).
+    for route in &current {
+        if !desired.contains(route) {
+            match del_macos_route(route) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    errors += 1;
+                    warn!(
+                        destination = %route.destination,
+                        error = %error,
+                        "userspace_helper_reconcile_route_delete_failed"
+                    );
+                }
+            }
+        }
+    }
+
+    // Add newly desired routes; keep the ones already present.
+    for route in desired {
+        if current.contains(&route) {
+            installed.push(route);
+            continue;
+        }
+        match add_macos_route(&route) {
+            Ok(_) => {
+                added += 1;
+                installed.push(route);
+            }
+            Err(error) => {
+                errors += 1;
+                warn!(
+                    destination = %route.destination,
+                    error = %error,
+                    "userspace_helper_reconcile_route_add_failed"
+                );
+            }
+        }
+    }
+
+    routing.routes_added = installed;
+    routing.fingerprint = fingerprint.clone();
+
+    info!(
+        interface = inputs.interface,
+        routes_added = added,
+        routes_removed = removed,
+        errors,
+        "userspace_helper_reconcile_applied"
+    );
+    log_macos_routing_overview("reconcile", inputs, &routing.routes_added, &fingerprint);
+}
+
+/// Emit a full route + DNS overview. Called once at connect and after every
+/// reconcile action, so the log always shows the resulting tunnel state.
+#[cfg(target_os = "macos")]
+fn log_macos_routing_overview(
+    reason: &str,
+    inputs: &MacosReconcileInputs,
+    routes: &[MacosRoute],
+    fingerprint: &MacosNetworkFingerprint,
+) {
+    info!(
+        reason,
+        interface = inputs.interface,
+        endpoint = %inputs.endpoint,
+        endpoint_pinned = inputs.endpoint_needs_pin,
+        endpoint_gateway = ?fingerprint.endpoint_gateway,
+        local_subnets = %format_subnets(&fingerprint.local_subnets),
+        tunnel_routes = %format_routes(routes),
+        // TODO(dns-roam-reconcile): report live per-service DNS here once DNS
+        // is reconciled; for now this is the static configured server list.
+        dns_servers = %format_list(&inputs.dns_servers),
+        dns_reconciled = false,
+        "userspace_helper_routing_overview"
+    );
+}
+
+/// Directly-connected subnets of up, non-loopback, non-point-to-point
+/// interfaces (the physical LANs), excluding the tunnel itself.
+#[cfg(target_os = "macos")]
+fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
+    // Call ifconfig directly (not run_command_capture_output) to avoid emitting
+    // a debug command log line on every reconcile tick.
+    let output = match Command::new("ifconfig").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut subnets = Vec::new();
+    let mut interface_qualifies = false;
+    for line in text.lines() {
+        if !line.starts_with(|c: char| c.is_whitespace()) {
+            // Interface header: "en0: flags=8863<UP,BROADCAST,...> mtu 1500".
+            interface_qualifies = false;
+            if let Some((name, rest)) = line.split_once(':') {
+                interface_qualifies = name.trim() != tunnel_interface
+                    && rest.contains("UP")
+                    && !rest.contains("LOOPBACK")
+                    && !rest.contains("POINTOPOINT");
+            }
+            continue;
+        }
+        if !interface_qualifies {
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            if let Some(subnet) = parse_ifconfig_inet4_subnet(rest) {
+                subnets.push(subnet);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
+            if let Some(subnet) = parse_ifconfig_inet6_subnet(rest) {
+                subnets.push(subnet);
+            }
+        }
+    }
+    subnets.sort();
+    subnets.dedup();
+    subnets
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ifconfig_inet4_subnet(rest: &str) -> Option<(IpAddr, u8)> {
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let ip: Ipv4Addr = fields.first()?.parse().ok()?;
+    let mask_index = fields.iter().position(|field| *field == "netmask")?;
+    let prefix = parse_macos_hex_netmask(fields.get(mask_index + 1)?)?;
+    Some((macos_network_base(IpAddr::V4(ip), prefix), prefix))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ifconfig_inet6_subnet(rest: &str) -> Option<(IpAddr, u8)> {
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // Strip any zone id, e.g. "fe80::1%en0".
+    let address = fields.first()?.split('%').next()?;
+    let ip: Ipv6Addr = address.parse().ok()?;
+    // Skip link-local (fe80::/10) and loopback; they are not routable LANs.
+    if ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80 {
+        return None;
+    }
+    let prefix_index = fields.iter().position(|field| *field == "prefixlen")?;
+    let prefix: u8 = fields.get(prefix_index + 1)?.parse().ok()?;
+    Some((macos_network_base(IpAddr::V6(ip), prefix), prefix))
+}
+
+/// Convert a macOS hex netmask ("0xffffff00") to a prefix length.
+#[cfg(target_os = "macos")]
+fn parse_macos_hex_netmask(mask: &str) -> Option<u8> {
+    let hex = mask
+        .strip_prefix("0x")
+        .or_else(|| mask.strip_prefix("0X"))?;
+    Some(u32::from_str_radix(hex, 16).ok()?.count_ones() as u8)
+}
+
+#[cfg(target_os = "macos")]
+fn format_subnets(subnets: &[(IpAddr, u8)]) -> String {
+    if subnets.is_empty() {
+        return "none".to_string();
+    }
+    subnets
+        .iter()
+        .map(|(ip, prefix)| format!("{ip}/{prefix}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(target_os = "macos")]
+fn format_routes(routes: &[MacosRoute]) -> String {
+    if routes.is_empty() {
+        return "none".to_string();
+    }
+    routes
+        .iter()
+        .map(|route| match (&route.gateway, &route.interface) {
+            (Some(gateway), _) => format!("{}->gw {}", route.destination, gateway),
+            (None, Some(interface)) => format!("{}->{}", route.destination, interface),
+            (None, None) => route.destination.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(target_os = "macos")]
+fn format_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
     let mut args = vec!["-n", "get"];
@@ -1527,7 +1970,13 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{macos_route_target_kind, MacosRoute};
+    use super::*;
+    use std::net::IpAddr;
+
+    fn subnet(value: &str) -> (IpAddr, u8) {
+        let (ip, prefix) = parse_cidr(value).expect("valid cidr");
+        (macos_network_base(ip, prefix), prefix)
+    }
 
     #[test]
     fn macos_route_delete_uses_destination_kind_without_add_qualifiers() {
@@ -1554,5 +2003,104 @@ mod tests {
             gateway: None,
         };
         assert_eq!(macos_route_target_kind(&host_cidr), "-host");
+    }
+
+    #[test]
+    fn hex_netmask_converts_to_prefix() {
+        assert_eq!(parse_macos_hex_netmask("0xffffff00"), Some(24));
+        assert_eq!(parse_macos_hex_netmask("0xffff0000"), Some(16));
+        assert_eq!(parse_macos_hex_netmask("0xffffffff"), Some(32));
+        assert_eq!(parse_macos_hex_netmask("0x00000000"), Some(0));
+        assert_eq!(parse_macos_hex_netmask("not-hex"), None);
+    }
+
+    #[test]
+    fn endpoint_pinned_only_when_allowed_ips_cover_it() {
+        let endpoint: IpAddr = "23.88.101.22".parse().unwrap();
+        let split = vec!["100.64.0.0/24".to_string(), "55.56.57.0/24".to_string()];
+        assert!(!macos_allowed_ips_cover_endpoint(&split, endpoint));
+        let full = vec!["0.0.0.0/0".to_string()];
+        assert!(macos_allowed_ips_cover_endpoint(&full, endpoint));
+    }
+
+    fn split_inputs() -> MacosReconcileInputs {
+        MacosReconcileInputs {
+            interface: "utun6".to_string(),
+            endpoint: "23.88.101.22".parse().unwrap(),
+            endpoint_is_ipv6: false,
+            endpoint_needs_pin: false,
+            allowed_ips: vec!["55.56.57.0/24".to_string(), "100.64.0.0/24".to_string()],
+            dns_servers: vec!["100.64.1.1".to_string()],
+            has_ipv4_address: true,
+            has_ipv6_address: false,
+        }
+    }
+
+    #[test]
+    fn local_lan_is_excluded_but_returns_to_the_tunnel_on_a_different_lan() {
+        let inputs = split_inputs();
+
+        // Sitting in the home LAN: that subnet must NOT be routed into the tunnel.
+        let home = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("55.56.57.0/24")],
+            endpoint_gateway: None,
+        };
+        let dests: Vec<String> = macos_desired_routes(&inputs, &home)
+            .into_iter()
+            .map(|route| route.destination)
+            .collect();
+        assert!(!dests.iter().any(|d| d == "55.56.57.0/24"));
+        assert!(dests.iter().any(|d| d == "100.64.0.0/24"));
+
+        // After roaming elsewhere, 55.56.57.0/24 is remote again and IS tunnelled.
+        let elsewhere = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("10.20.30.0/24")],
+            endpoint_gateway: None,
+        };
+        let dests: Vec<String> = macos_desired_routes(&inputs, &elsewhere)
+            .into_iter()
+            .map(|route| route.destination)
+            .collect();
+        assert!(dests.iter().any(|d| d == "55.56.57.0/24"));
+        assert!(dests.iter().any(|d| d == "100.64.0.0/24"));
+    }
+
+    #[test]
+    fn containment_matches_equal_and_more_specific_routes_only() {
+        let local = subnet("55.56.57.0/24");
+
+        let equal = MacosRoute {
+            is_ipv6: false,
+            destination: "55.56.57.0/24".to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        assert!(macos_route_excluded_by_local_subnet(&equal, &[local]).is_some());
+
+        let more_specific = MacosRoute {
+            is_ipv6: false,
+            destination: "55.56.57.128/25".to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        assert!(macos_route_excluded_by_local_subnet(&more_specific, &[local]).is_some());
+
+        // A broader supernet is not treated as local (we do not split routes).
+        let broader = MacosRoute {
+            is_ipv6: false,
+            destination: "55.56.0.0/16".to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        assert!(macos_route_excluded_by_local_subnet(&broader, &[local]).is_none());
+
+        // Gatewayed (non-tunnel) routes are never excluded.
+        let gatewayed = MacosRoute {
+            is_ipv6: false,
+            destination: "55.56.57.0/24".to_string(),
+            interface: None,
+            gateway: Some("10.0.0.1".to_string()),
+        };
+        assert!(macos_route_excluded_by_local_subnet(&gatewayed, &[local]).is_none());
     }
 }
