@@ -207,10 +207,16 @@ pub(super) fn dispatch(
             action,
             interface,
             config_content,
+            mtu_override,
             debug,
         } => match action {
             GotaTunAction::Up => {
-                match run_gotatun_up(interface.as_str(), config_content.as_str(), debug) {
+                match run_gotatun_up(
+                    interface.as_str(),
+                    config_content.as_str(),
+                    mtu_override,
+                    debug,
+                ) {
                     Ok(()) => PrivilegedResponse::Unit,
                     Err(e) => PrivilegedResponse::Error {
                         code: categorize_error(&e),

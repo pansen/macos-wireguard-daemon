@@ -328,6 +328,7 @@ pub(super) fn wg_format_bytes(bytes: u64) -> String {
 pub(super) fn run_gotatun_up(
     interface: &str,
     config_content: &str,
+    mtu_override: Option<u16>,
     debug_enabled: bool,
 ) -> Result<()> {
     use base64::Engine;
@@ -351,6 +352,9 @@ pub(super) fn run_gotatun_up(
         .env("TUNMUX_GOTATUN_HELPER", "1")
         .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
         .arg(interface);
+    if let Some(mtu) = mtu_override {
+        command.env("TUNMUX_GOTATUN_MTU_OVERRIDE", mtu.to_string());
+    }
     if debug_enabled {
         command.env("TUNMUX_DEBUG", "1");
     }

@@ -105,6 +105,8 @@ pub enum PrivilegedRequest {
         interface: String,
         config_content: String,
         #[serde(default)]
+        mtu_override: Option<u16>,
+        #[serde(default)]
         debug: bool,
     },
 
@@ -271,11 +273,15 @@ impl PrivilegedRequest {
                 action,
                 interface,
                 config_content,
+                mtu_override,
                 ..
             } => {
                 validate_interface_name(interface)?;
                 if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
                     return Err("config_content cannot be empty".into());
+                }
+                if mtu_override.is_some_and(|mtu| mtu < 576) {
+                    return Err("mtu_override must be >= 576".into());
                 }
                 Ok(())
             }

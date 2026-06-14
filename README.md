@@ -287,8 +287,16 @@ IPv6 interface address.
 
 `--mtu` is supported by provider `connect` commands. For most providers it
 applies to direct and proxy kernel tunnels, as well as generated wg-quick and
-userspace configs. For `wgconf`, `--mtu` is supported in kernel mode (direct
-or `--proxy`) and is not supported with `--local-proxy`.
+userspace configs. `wgconf` reads `MTU =` from `[Interface]`; an explicit
+`--mtu` overrides it for direct kernel/userspace mode and kernel `--proxy`.
+MTU is not supported with `--local-proxy`, which does not create a host TUN
+interface.
+
+Before testing the macOS userspace data plane, disable WireGuard.app On-Demand
+and deactivate matching tunnels. Verify `scutil --nc list` has no connected
+`com.wireguard.macos` entry. A remaining `utun` with MTU 1384 is typically a
+WireGuard.app tunnel rather than tunmux and can invalidate routing or traffic
+tests.
 
 ## Linux Namespace Proxy Mode (`--proxy`)
 

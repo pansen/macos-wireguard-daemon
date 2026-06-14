@@ -27,6 +27,7 @@ struct RoutedConfig {
     private_key: String,
     addresses: Vec<String>,
     dns_servers: Vec<String>,
+    mtu: Option<u16>,
     server_public_key: String,
     server_ip: String,
     server_port: u16,
@@ -63,11 +64,15 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if args.mtu.is_some()
         && !args.proxy
         && !args.local_proxy
-        && backend != wireguard::backend::WgBackend::Kernel
+        && !matches!(
+            backend,
+            wireguard::backend::WgBackend::Kernel | wireguard::backend::WgBackend::Userspace
+        )
     {
-        anyhow::bail!(
-            "--mtu for wgconf is supported only in kernel mode (or with --proxy kernel mode)"
-        );
+        anyhow::bail!("--mtu for wgconf is supported only with kernel or userspace backends");
+    }
+    if let Some(mtu) = args.mtu {
+        wireguard::config::validate_mtu(mtu)?;
     }
 
     let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
@@ -105,7 +110,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_local_proxy(&source, routed, args.mtu, config)?;
+        connect_local_proxy(&source, routed, config)?;
     } else {
         connect_direct(
             &source,
@@ -201,8 +206,12 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Userspace => {
-            let effective_iface =
-                wireguard::userspace::up(&source.config_text, INTERFACE_NAME, PROVIDER)?;
+            let effective_iface = wireguard::userspace::up_with_mtu(
+                &source.config_text,
+                INTERFACE_NAME,
+                PROVIDER,
+                mtu,
+            )?;
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
@@ -242,7 +251,7 @@ fn connect_direct(
                 private_key: &routed.private_key,
                 addresses: &addresses,
                 dns_servers: &dns_servers,
-                mtu,
+                mtu: mtu.or(routed.mtu),
                 server_public_key: &routed.server_public_key,
                 server_ip: &routed.server_ip,
                 server_port: routed.server_port,
@@ -294,7 +303,7 @@ fn connect_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
-        mtu,
+        mtu: mtu.or(routed.mtu),
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -319,7 +328,6 @@ fn connect_proxy(
 fn connect_local_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
-    mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = connection_ops::derive_instance_name(
@@ -337,7 +345,7 @@ fn connect_local_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
-        mtu,
+        mtu: None,
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -462,6 +470,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
         private_key: parsed.private_key.clone(),
         addresses,
         dns_servers,
+        mtu: parsed.mtu,
         server_public_key,
         server_ip,
         server_port,
@@ -738,10 +747,18 @@ mod tests {
         let parsed = parse_routed_config(with_dns).expect("parse routed config");
         assert_eq!(parsed.server_ip, "2001:db8::1");
         assert_eq!(parsed.server_port, 51820);
+        assert_eq!(parsed.mtu, None);
 
         let with_dns_hostname = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = localhost:51820\n";
         let parsed = parse_routed_config(with_dns_hostname).expect("parse hostname endpoint");
         assert_eq!(parsed.server_port, 51820);
+    }
+
+    #[test]
+    fn routed_parse_retains_interface_mtu() {
+        let config = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n";
+        let parsed = parse_routed_config(config).expect("parse routed config");
+        assert_eq!(parsed.mtu, Some(1280));
     }
 
     #[test]

@@ -17,22 +17,14 @@ pub struct ResolvedServer<'a> {
 }
 
 /// Resolve the WireGuard backend and validate options from ConnectOptions.
-pub fn resolve_opts(
-    opts: &ConnectOptions,
-    default_backend: &str,
-) -> anyhow::Result<WgBackend> {
+pub fn resolve_opts(opts: &ConnectOptions, default_backend: &str) -> anyhow::Result<WgBackend> {
     let backend = resolve_connect_backend(
         opts.backend.as_deref(),
         default_backend,
         opts.proxy,
         opts.local_proxy,
     )?;
-    validate_disable_ipv6_direct_kernel(
-        opts.disable_ipv6,
-        opts.proxy,
-        opts.local_proxy,
-        backend,
-    )?;
+    validate_disable_ipv6_direct_kernel(opts.disable_ipv6, opts.proxy, opts.local_proxy, backend)?;
     Ok(backend)
 }
 
@@ -60,8 +52,7 @@ pub fn connect_routed(
         let instance = derive_instance_name(server.instance_seed, "server", server.display_name)?;
         ensure_instance_available(&instance, "server", server.display_name)?;
 
-        let proxy_config =
-            resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
+        let proxy_config = resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
         connect_proxy_via_netns(&ConnectContext {
             provider,
             instance: &instance,
@@ -77,8 +68,7 @@ pub fn connect_routed(
         let instance = derive_instance_name(server.instance_seed, "server", server.display_name)?;
         ensure_instance_available(&instance, "server", server.display_name)?;
 
-        let proxy_config =
-            resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
+        let proxy_config = resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
         connect_local_proxy_instance(&LocalProxyContext {
             provider,
             instance: &instance,
@@ -399,8 +389,7 @@ pub fn connect_direct_wg(
         }
         WgBackend::Userspace => {
             let wg_config = wireguard::config::generate_config(params);
-            let effective_iface =
-                wireguard::userspace::up(&wg_config, interface_name, provider)?;
+            let effective_iface = wireguard::userspace::up(&wg_config, interface_name, provider)?;
             build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
         }
         WgBackend::Kernel => {

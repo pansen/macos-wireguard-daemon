@@ -53,6 +53,8 @@ const SOCK_DIR: &str = "/var/run/wireguard";
 const HELPER_ENV: &str = "TUNMUX_GOTATUN_HELPER";
 #[cfg(unix)]
 const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
+#[cfg(unix)]
+const MTU_OVERRIDE_ENV: &str = "TUNMUX_GOTATUN_MTU_OVERRIDE";
 
 #[cfg(unix)]
 fn gotatun_pid_path(interface: &str) -> PathBuf {
@@ -180,6 +182,7 @@ struct ParsedUserspaceConfig {
     addresses: Vec<String>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     dns_servers: Vec<String>,
+    mtu: Option<u16>,
     peer_public_key: [u8; 32],
     peer_preshared_key: Option<[u8; 32]>,
     allowed_ips: Vec<String>,
@@ -624,7 +627,20 @@ fn parse_config_from_env() -> anyhow::Result<Option<ParsedUserspaceConfig>> {
         .decode(encoded)
         .context("failed to decode userspace WireGuard config")?;
     let text = String::from_utf8(bytes).context("userspace WireGuard config is not UTF-8")?;
-    parse_wg_quick_config(&text).map(Some)
+    let mut config = parse_wg_quick_config(&text)?;
+    if let Some(value) = std::env::var_os(MTU_OVERRIDE_ENV) {
+        let value = value
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("{} is not valid UTF-8", MTU_OVERRIDE_ENV))?;
+        apply_mtu_override(&mut config, value)?;
+    }
+    Ok(Some(config))
+}
+
+#[cfg(unix)]
+fn apply_mtu_override(config: &mut ParsedUserspaceConfig, value: &str) -> anyhow::Result<()> {
+    config.mtu = Some(crate::wireguard::config::parse_mtu(value)?);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -639,6 +655,7 @@ fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> 
     let mut private_key = None;
     let mut addresses: Vec<String> = Vec::new();
     let mut dns_servers: Vec<String> = Vec::new();
+    let mut mtu = None;
     let mut peer_public_key = None;
     let mut peer_preshared_key = None;
     let mut allowed_ips: Vec<String> = Vec::new();
@@ -672,6 +689,7 @@ fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> 
                 "PrivateKey" => private_key = Some(decode_key32("PrivateKey", value)?),
                 "Address" => addresses = split_csv(value),
                 "DNS" => dns_servers = split_csv(value),
+                "MTU" => mtu = Some(crate::wireguard::config::parse_mtu(value)?),
                 _ => {}
             },
             Section::Peer => match key {
@@ -700,6 +718,7 @@ fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> 
         private_key,
         addresses,
         dns_servers,
+        mtu,
         peer_public_key,
         peer_preshared_key,
         allowed_ips,
@@ -715,6 +734,32 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod userspace_config_tests {
+    use super::*;
+
+    const CONFIG: &str = "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.1:51820\n";
+
+    #[test]
+    fn userspace_config_parses_mtu() {
+        let parsed = parse_wg_quick_config(CONFIG).expect("parse config");
+        assert_eq!(parsed.mtu, Some(1280));
+    }
+
+    #[test]
+    fn userspace_config_rejects_invalid_mtu() {
+        let config = CONFIG.replace("MTU = 1280", "MTU = 575");
+        assert!(parse_wg_quick_config(&config).is_err());
+    }
+
+    #[test]
+    fn explicit_mtu_overrides_config_mtu() {
+        let mut parsed = parse_wg_quick_config(CONFIG).expect("parse config");
+        apply_mtu_override(&mut parsed, "1420").expect("apply override");
+        assert_eq!(parsed.mtu, Some(1420));
+    }
 }
 
 #[cfg(unix)]
@@ -900,6 +945,10 @@ fn configure_network_linux(
     let mut routes_added = Vec::new();
     let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
 
+    if let Some(mtu) = config.mtu {
+        let mtu = mtu.to_string();
+        run_command("ip", &["link", "set", "dev", interface, "mtu", &mtu])?;
+    }
     for address in &config.addresses {
         run_command("ip", &["addr", "add", address, "dev", interface])?;
     }
@@ -1186,6 +1235,10 @@ fn configure_network_macos(
     let mut fingerprint = MacosNetworkFingerprint::default();
 
     let setup_result = (|| -> anyhow::Result<()> {
+        if let Some(mtu) = config.mtu {
+            let mtu = mtu.to_string();
+            run_command("ifconfig", &[interface, "mtu", &mtu])?;
+        }
         for address in &config.addresses {
             let (ip, prefix) = parse_cidr(address)?;
             match ip {
@@ -1245,7 +1298,10 @@ fn configure_network_macos(
         }
         for service in dns_services.iter().rev() {
             if let Err(error) = restore_macos_dns_service(service) {
-                errors.push(format!("restore DNS for {:?} failed: {error}", service.service));
+                errors.push(format!(
+                    "restore DNS for {:?} failed: {error}",
+                    service.service
+                ));
             }
         }
         return if errors.is_empty() {
