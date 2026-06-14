@@ -737,6 +737,9 @@ pub enum WgconfCommand {
         all: bool,
     },
 
+    /// Show wgconf connection status (and `wg show` transfer/handshake)
+    Status,
+
     /// Save a WireGuard config file as a named profile
     Save {
         /// WireGuard .conf file path

@@ -38,6 +38,7 @@ pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Res
     match command {
         WgconfCommand::Connect(args) => cmd_connect(args, config),
         WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
+        WgconfCommand::Status => cmd_status(),
         WgconfCommand::Save { file, name } => cmd_save(&file, &name),
         WgconfCommand::List => cmd_list(),
         WgconfCommand::Remove { name } => cmd_remove(&name),
@@ -137,6 +138,51 @@ fn cmd_list() -> anyhow::Result<()> {
     for name in profiles {
         println!("{}", name);
     }
+    Ok(())
+}
+
+fn cmd_status() -> anyhow::Result<()> {
+    use crate::privileged_client::PrivilegedClient;
+    use crate::wireguard::connection::ConnectionState;
+
+    let connections: Vec<ConnectionState> = ConnectionState::load_all()?
+        .into_iter()
+        .filter(|conn| conn.provider == "wgconf")
+        .collect();
+
+    if connections.is_empty() {
+        println!("Not connected.");
+        return Ok(());
+    }
+
+    for (index, conn) in connections.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("Connected: {}", conn.server_display_name);
+        println!("  instance:  {}", conn.instance_name);
+        println!("  interface: {}", conn.interface_name);
+        println!("  endpoint:  {}", conn.server_endpoint);
+        println!("  backend:   {}", conn.backend);
+        if !conn.dns_servers.is_empty() {
+            println!("  dns:       {}", conn.dns_servers.join(", "));
+        }
+
+        // Live handshake/transfer via `wg show` (through the privileged service). The service is
+        // already running while connected, so this does not trigger a new sudo prompt.
+        match PrivilegedClient::new().wg_show(&conn.interface_name) {
+            Ok(output) if !output.trim().is_empty() => {
+                println!();
+                print!("{}", output);
+                if !output.ends_with('\n') {
+                    println!();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
+        }
+    }
+
     Ok(())
 }
 
