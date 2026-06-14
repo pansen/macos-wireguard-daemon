@@ -345,7 +345,7 @@ pub struct WgconfConnectArgs {
     #[arg(long)]
     pub disable_ipv6: bool,
 
-    /// Set WireGuard interface MTU (direct kernel mode)
+    /// Set WireGuard interface MTU (direct kernel or userspace mode)
     #[arg(long)]
     pub mtu: Option<u16>,
 }
