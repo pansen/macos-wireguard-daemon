@@ -70,6 +70,11 @@ fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn gotatun_log_path(interface: &str) -> PathBuf {
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.log"))
+}
+
+#[cfg(unix)]
 struct RunningDevice {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interface_name: String,
@@ -192,7 +197,8 @@ pub fn maybe_run_from_env() -> bool {
         return false;
     }
 
-    crate::logging::init_terminal(false);
+    // Logging is initialized to a per-interface file inside the daemonized child (see
+    // daemonize_and_run); not here, because the helper detaches from its parent's stdio.
 
     let mut args = std::env::args();
     let _program = args.next();
@@ -255,6 +261,17 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 let _ = signal_parent(false);
                 anyhow::bail!("failed to initialize userspace helper child: {}", e);
             }
+
+            // Log to a per-interface file rather than inherited stdio. This stops the helper's
+            // output from leaking into whichever terminal the privileged service was started in,
+            // and lets the service tail this file to stream setup/teardown logs back to the
+            // caller. Synchronous writer so the service reads complete lines without a flush race.
+            // Ensure the runtime dir exists first (it is otherwise created later by start_device).
+            let _ = std::fs::create_dir_all(SOCK_DIR);
+            let _ = crate::logging::init_file_sync(
+                &gotatun_log_path(interface).to_string_lossy(),
+                false,
+            );
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

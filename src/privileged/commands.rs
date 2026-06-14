@@ -338,6 +338,8 @@ pub(super) fn run_gotatun_up(
         gotatun_pid_path(interface),
         gotatun_name_path(interface),
         gotatun_cleanup_status_path(interface),
+        // Start a fresh session log so the streamed connect output is just this session's.
+        gotatun_log_path(interface),
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -619,6 +621,12 @@ fn gotatun_name_path(interface: &str) -> std::path::PathBuf {
 
 fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
     gotatun_runtime_path(interface, "cleanup")
+}
+
+/// Per-interface log file the gotatun helper writes to. The service tails this to stream the
+/// helper's setup/teardown output back to the calling CLI. Must match `userspace_helper`.
+pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
+    gotatun_runtime_path(interface, "log")
 }
 
 fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {

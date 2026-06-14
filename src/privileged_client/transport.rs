@@ -544,17 +544,7 @@ impl PrivilegedClient {
             .map_err(|e| AppError::Other(format!("flush request: {}", e)))?;
 
         let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
-            ));
-        }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        let response = read_framed_response(&mut reader)?;
         tracing::trace!( request = ?request_kind(request), "privileged_ctl_response");
 
         super::map_privileged_error(response)
@@ -582,20 +572,43 @@ impl PrivilegedClient {
             .flush()
             .map_err(|e| AppError::Other(format!("flush request stdin: {}", e)))?;
 
-        let mut response_line = String::new();
-        session
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response stdout: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
-            ));
-        }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        let response = read_framed_response(&mut session.stdout)?;
         tracing::trace!(
             request = ?request_kind(request), "privileged_ctl_stdio_response");
         super::map_privileged_error(response)
+    }
+}
+
+/// Read the server's reply, which is zero or more log frames (`{"log":"…"}`) followed by exactly
+/// one response frame (`{"kind":…}`). Log frames are printed to stderr (so the operation's
+/// privileged-side logs appear in the caller's terminal); the response frame is returned.
+///
+/// Backward compatible: an older server that sends only a response produces no log frames, so the
+/// first line is parsed as the response.
+fn read_framed_response<R: BufRead>(reader: &mut R) -> Result<super::PrivilegedResponse> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| AppError::Other(format!("read response: {}", e)))?;
+        if bytes == 0 {
+            return Err(AppError::Other(
+                "privileged server closed connection before responding".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            if let Some(serde_json::Value::String(text)) = map.get("log") {
+                eprintln!("{text}");
+                continue;
+            }
+        }
+        return serde_json::from_str::<super::PrivilegedResponse>(trimmed)
+            .map_err(|e| AppError::Other(format!("decode response: {}", e)));
     }
 }

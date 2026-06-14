@@ -133,9 +133,8 @@ pub fn serve(
                         authorized_group.as_deref(),
                     ) {
                         ClientReadResult::ConnectionClosed => break,
-                        ClientReadResult::Response(response) => {
-                            let mut buffer = serde_json::to_vec(&response)?;
-                            buffer.push(b'\n');
+                        ClientReadResult::Response { logs, response } => {
+                            let buffer = encode_response_frames(&logs, &response)?;
                             if let Err(e) = stream.write_all(&buffer) {
                                 warn!( error = ?e.to_string(), "privileged_response_write_failed");
                                 break;
@@ -192,9 +191,8 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
             return Ok(());
         }
 
-        let response = process_request_payload(&payload, &mut control_state, None);
-        let mut buffer = serde_json::to_vec(&response)?;
-        buffer.push(b'\n');
+        let (logs, response) = process_request_payload(&payload, &mut control_state, None);
+        let buffer = encode_response_frames(&logs, &response)?;
         writer.write_all(&buffer)?;
         writer.flush()?;
 
@@ -239,7 +237,28 @@ fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
 
 enum ClientReadResult {
     ConnectionClosed,
-    Response(PrivilegedResponse),
+    Response {
+        /// Log lines captured while handling the request, streamed to the caller before the
+        /// response (empty for requests that produce no captured output).
+        logs: Vec<String>,
+        response: PrivilegedResponse,
+    },
+}
+
+/// Serialize zero or more log frames (`{"log":"…"}`) followed by the response, each as a
+/// newline-delimited JSON line. The CLI prints log frames and returns on the response frame.
+fn encode_response_frames(
+    logs: &[String],
+    response: &PrivilegedResponse,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    for line in logs {
+        serde_json::to_writer(&mut buffer, &serde_json::json!({ "log": line }))?;
+        buffer.push(b'\n');
+    }
+    serde_json::to_writer(&mut buffer, response)?;
+    buffer.push(b'\n');
+    Ok(buffer)
 }
 
 fn handle_client(
@@ -253,10 +272,13 @@ fn handle_client(
         Ok(0) => return ClientReadResult::ConnectionClosed,
         Ok(_) => {}
         Err(e) => {
-            return ClientReadResult::Response(PrivilegedResponse::Error {
-                code: "Protocol".into(),
-                message: format!("failed to read request: {}", e),
-            });
+            return ClientReadResult::Response {
+                logs: Vec::new(),
+                response: PrivilegedResponse::Error {
+                    code: "Protocol".into(),
+                    message: format!("failed to read request: {}", e),
+                },
+            };
         }
     }
 
@@ -273,18 +295,24 @@ fn handle_client(
                         warn!(
                             uid = ?peer_uid,
                             gid = ?peer_gid, "peer_not_authorized");
-                        return ClientReadResult::Response(PrivilegedResponse::Error {
-                            code: "Auth".into(),
-                            message,
-                        });
+                        return ClientReadResult::Response {
+                            logs: Vec::new(),
+                            response: PrivilegedResponse::Error {
+                                code: "Auth".into(),
+                                message,
+                            },
+                        };
                     }
                     (peer_uid, peer_gid)
                 }
                 Err(e) => {
-                    return ClientReadResult::Response(PrivilegedResponse::Error {
-                        code: "Auth".into(),
-                        message: format!("SO_PEERCRED failed: {}", e),
-                    });
+                    return ClientReadResult::Response {
+                        logs: Vec::new(),
+                        response: PrivilegedResponse::Error {
+                            code: "Auth".into(),
+                            message: format!("SO_PEERCRED failed: {}", e),
+                        },
+                    };
                 }
             }
         }
@@ -296,34 +324,44 @@ fn handle_client(
         }
     };
 
-    ClientReadResult::Response(process_request_payload(
-        &payload,
-        control_state,
-        Some((peer.0, peer.1)),
-    ))
+    let (logs, response) =
+        process_request_payload(&payload, control_state, Some((peer.0, peer.1)));
+    ClientReadResult::Response { logs, response }
 }
 
 fn process_request_payload(
     payload: &str,
     control_state: &mut ControlState,
     peer: Option<(u32, u32)>,
-) -> PrivilegedResponse {
+) -> (Vec<String>, PrivilegedResponse) {
     if payload.trim().is_empty() {
-        return PrivilegedResponse::Error {
-            code: "Protocol".into(),
-            message: "empty privileged request".into(),
-        };
+        return (
+            Vec::new(),
+            PrivilegedResponse::Error {
+                code: "Protocol".into(),
+                message: "empty privileged request".into(),
+            },
+        );
     }
 
     let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(payload) {
         Ok(req) => req,
         Err(e) => {
-            return PrivilegedResponse::Error {
-                code: "Protocol".into(),
-                message: format!("invalid request format: {}", e),
-            };
+            return (
+                Vec::new(),
+                PrivilegedResponse::Error {
+                    code: "Protocol".into(),
+                    message: format!("invalid request format: {}", e),
+                },
+            );
         }
     };
+
+    // For gotatun up/down, capture this request's log output (the service's own lines via the
+    // thread-local capture, plus the helper's log file) so it can be streamed to the caller.
+    // Begin before the `privileged_request_received` line so it is included.
+    let gotatun_capture = gotatun_capture_for(&request);
+
     let request_kind = describe_request(&request);
     if let Some((uid, gid)) = peer {
         info!(
@@ -338,19 +376,93 @@ fn process_request_payload(
     }
 
     if let Err(e) = request.validate() {
-        return PrivilegedResponse::Error {
-            code: "Validation".into(),
-            message: e,
-        };
+        let logs = finish_gotatun_capture(gotatun_capture);
+        return (
+            logs,
+            PrivilegedResponse::Error {
+                code: "Validation".into(),
+                message: e,
+            },
+        );
     }
     if let Err(e) = cleanup_stale_managed_pid_registry_entries() {
-        return PrivilegedResponse::Error {
-            code: "IO".into(),
-            message: format!("managed pid cleanup failed: {}", e),
-        };
+        let logs = finish_gotatun_capture(gotatun_capture);
+        return (
+            logs,
+            PrivilegedResponse::Error {
+                code: "IO".into(),
+                message: format!("managed pid cleanup failed: {}", e),
+            },
+        );
     }
 
-    dispatch(request, control_state)
+    let response = dispatch(request, control_state);
+    let logs = finish_gotatun_capture(gotatun_capture);
+    (logs, response)
+}
+
+/// If `request` is a gotatun up/down, start capturing the service's log output and return the
+/// helper log file path plus the offset to stream from. `Up` resets the log to a fresh file
+/// (read from 0); `Down` streams only lines appended from the current end onward.
+fn gotatun_capture_for(request: &PrivilegedRequest) -> Option<(std::path::PathBuf, u64)> {
+    let PrivilegedRequest::GotaTunRun {
+        action, interface, ..
+    } = request
+    else {
+        return None;
+    };
+    crate::logging::begin_log_capture();
+    let path = commands::gotatun_log_path(interface);
+    let start = match action {
+        crate::privileged_api::GotaTunAction::Up => 0,
+        crate::privileged_api::GotaTunAction::Down => {
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        }
+    };
+    Some((path, start))
+}
+
+/// Finish a capture started by `gotatun_capture_for`: merge the service's captured lines with the
+/// helper's log tail, ordered by timestamp. Returns empty if no capture was active.
+fn finish_gotatun_capture(capture: Option<(std::path::PathBuf, u64)>) -> Vec<String> {
+    let service_lines = crate::logging::take_log_capture();
+    let Some((path, start)) = capture else {
+        return Vec::new();
+    };
+    let helper_lines = read_log_tail(&path, start);
+    merge_log_lines(service_lines, helper_lines)
+}
+
+/// Read a log file from `offset` to its end, returned as lines. Offsets are recorded at line
+/// boundaries (logs end with a newline), so no partial line is produced.
+fn read_log_tail(path: &std::path::Path, offset: u64) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return Vec::new();
+    }
+    contents.lines().map(str::to_string).collect()
+}
+
+/// Merge service and helper log lines, ordered by their leading timestamp. The timestamp is a
+/// fixed-width prefix so lexicographic order is chronological; a stable sort keeps same-second
+/// lines in insertion order (service lines first).
+fn merge_log_lines(service: Vec<String>, helper: Vec<String>) -> Vec<String> {
+    const TIMESTAMP_LEN: usize = "2026-06-14T08:18:02Z".len();
+    let mut all = service;
+    all.extend(helper);
+    all.sort_by(|a, b| {
+        let ta = a.get(0..TIMESTAMP_LEN).unwrap_or(a.as_str());
+        let tb = b.get(0..TIMESTAMP_LEN).unwrap_or(b.as_str());
+        ta.cmp(tb)
+    });
+    all
 }
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
