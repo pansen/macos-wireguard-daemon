@@ -104,6 +104,8 @@ pub enum PrivilegedRequest {
         action: GotaTunAction,
         interface: String,
         config_content: String,
+        #[serde(default)]
+        debug: bool,
     },
 
     EnsureDir {
@@ -269,6 +271,7 @@ impl PrivilegedRequest {
                 action,
                 interface,
                 config_content,
+                ..
             } => {
                 validate_interface_name(interface)?;
                 if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {

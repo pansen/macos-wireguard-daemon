@@ -164,6 +164,7 @@ Use verbose logs when needed:
 
 ```bash
 tunmux -v connect proton --country CH
+tunmux --debug wgconf disconnect
 RUST_LOG=debug tunmux disconnect --all
 ```
 

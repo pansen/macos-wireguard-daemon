@@ -206,9 +206,10 @@ pub(super) fn dispatch(
             action,
             interface,
             config_content,
+            debug,
         } => match action {
             GotaTunAction::Up => {
-                match run_gotatun_up(interface.as_str(), config_content.as_str()) {
+                match run_gotatun_up(interface.as_str(), config_content.as_str(), debug) {
                     Ok(()) => PrivilegedResponse::Unit,
                     Err(e) => PrivilegedResponse::Error {
                         code: categorize_error(&e),

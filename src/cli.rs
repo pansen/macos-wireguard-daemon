@@ -47,7 +47,7 @@ pub struct Cli {
     pub command: TopCommand,
 
     /// Enable verbose logging
-    #[arg(short, long, global = true)]
+    #[arg(short, long, visible_alias = "debug", global = true)]
     pub verbose: bool,
 }
 
@@ -909,6 +909,17 @@ mod tests {
         ProtonPortAction, ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
+
+    #[test]
+    fn parse_global_debug_alias_enables_verbose_logging() {
+        let before = Cli::try_parse_from(["tunmux", "--debug", "status"])
+            .expect("parse debug before command");
+        assert!(before.verbose);
+
+        let after = Cli::try_parse_from(["tunmux", "status", "--debug"])
+            .expect("parse debug after command");
+        assert!(after.verbose);
+    }
 
     #[test]
     fn parse_connect_wgconf_with_file() {

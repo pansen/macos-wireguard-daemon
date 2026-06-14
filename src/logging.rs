@@ -8,8 +8,12 @@ use tracing_subscriber::fmt::time::UtcTime;
 
 const LOG_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+const DEBUG_ENV: &str = "TUNMUX_DEBUG";
 
 fn level_from_env_or_default(default: LevelFilter) -> LevelFilter {
+    if debug_enabled() {
+        return LevelFilter::DEBUG;
+    }
     let Ok(value) = std::env::var("RUST_LOG") else {
         return default;
     };
@@ -27,6 +31,14 @@ fn level_from_env_or_default(default: LevelFilter) -> LevelFilter {
     } else {
         LevelFilter::INFO
     }
+}
+
+pub fn enable_debug() {
+    std::env::set_var(DEBUG_ENV, "1");
+}
+
+pub fn debug_enabled() -> bool {
+    std::env::var_os(DEBUG_ENV).is_some()
 }
 
 fn to_log_level_filter(level: LevelFilter) -> log::LevelFilter {

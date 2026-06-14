@@ -295,6 +295,7 @@ impl PrivilegedClient {
             action,
             interface: interface.to_string(),
             config_content: config_content.to_string(),
+            debug: crate::logging::debug_enabled(),
         })
     }
 

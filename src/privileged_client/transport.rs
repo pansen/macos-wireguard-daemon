@@ -16,8 +16,8 @@ use crate::error::{AppError, Result};
 use crate::privileged_api::PrivilegedRequest;
 
 use super::util::{
-    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind, shell_quote,
-    startup_lock_dir, stderr_requires_password, run_sudo_validate_with_timeout,
+    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind,
+    run_sudo_validate_with_timeout, shell_quote, startup_lock_dir, stderr_requires_password,
 };
 use super::PrivilegedClient;
 
@@ -285,11 +285,19 @@ impl PrivilegedClient {
             .arg("--autostarted")
             .arg("--authorized-group")
             .arg(self.authorized_group.as_str());
+        if crate::logging::debug_enabled() {
+            command.arg("--debug");
+        }
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command
                 .arg("--idle-timeout-ms")
                 .arg(idle_timeout_ms.to_string());
         }
+        // Detach the daemon's stdio. It is a long-lived background service; if it inherited the
+        // foreground process's stdout/stderr it would hold those fds (e.g. a `| tee` pipe) open
+        // for its whole lifetime, so the shell pipeline would never see EOF and would hang long
+        // after this command exited. Capture to the configured log file when set, else /dev/null.
+        command.stdin(Stdio::null());
         if let Some(log_path) = configured_privileged_stdio_log_path() {
             if let Some(parent) = log_path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -314,6 +322,9 @@ impl PrivilegedClient {
                 "privileged daemon start: capturing sudo/daemon stdio to {}",
                 log_path.display()
             );
+        } else {
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
         }
         debug!(cmd = "sudo -n -b tunmux privileged --serve", "exec");
         let status = command
@@ -382,6 +393,9 @@ impl PrivilegedClient {
             .arg(self.authorized_group.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
+        if crate::logging::debug_enabled() {
+            command.arg("--debug");
+        }
 
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command

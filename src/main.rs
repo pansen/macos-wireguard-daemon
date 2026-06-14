@@ -42,6 +42,9 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    if cli.verbose {
+        logging::enable_debug();
+    }
 
     match cli.command {
         // Privileged control server.
