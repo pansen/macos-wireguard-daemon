@@ -276,20 +276,25 @@ pub fn disconnect_one_provider_connection(
     if state.namespace_name.is_some() {
         ConnectionState::remove(&state.instance_name)?;
     } else {
-        match state.backend {
-            WgBackend::Kernel => {
-                wireguard::kernel::down(state)?;
-            }
-            WgBackend::WgQuick => {
-                wireguard::wg_quick::down(&state.interface_name, provider)?;
-                ConnectionState::remove(&state.instance_name)?;
-            }
-            WgBackend::Userspace => {
-                wireguard::userspace::down(&state.interface_name, provider)?;
-                ConnectionState::remove(&state.instance_name)?;
-            }
+        let teardown = match state.backend {
+            WgBackend::Kernel => wireguard::kernel::down(state),
+            WgBackend::WgQuick => wireguard::wg_quick::down(&state.interface_name, provider),
+            WgBackend::Userspace => wireguard::userspace::down(&state.interface_name, provider),
             WgBackend::LocalProxy => unreachable!(),
+        };
+        if let Err(error) = teardown {
+            // Don't let a failed teardown (an interface already gone after a
+            // reboot, or an unreachable privileged helper) leave the state file
+            // behind and wedge future connects -- warn and remove it anyway.
+            tracing::warn!(
+                instance = %state.instance_name,
+                interface = %state.interface_name,
+                backend = ?state.backend,
+                error = %error,
+                "connection teardown failed; removing state anyway"
+            );
         }
+        ConnectionState::remove(&state.instance_name)?;
     }
 
     hooks::run_ifdown(config, provider, state);
@@ -353,6 +358,44 @@ pub fn resolve_proxy_config(
     Ok(auto)
 }
 
+/// Detect whether a live direct (`_direct`) tunnel currently exists, clearing
+/// stale state left behind by a reboot or crash.
+///
+/// Returns `Ok(true)` when a real, still-active tunnel occupies the direct slot
+/// (the caller should refuse to start a new one) and `Ok(false)` when the slot
+/// is free -- removing any orphaned `_direct` state file in the process so a
+/// dead connection can never permanently wedge `connect`.
+pub fn direct_connection_active() -> anyhow::Result<bool> {
+    use crate::wireguard::connection::DIRECT_INSTANCE;
+
+    match ConnectionState::load(DIRECT_INSTANCE) {
+        Ok(Some(state)) => {
+            if state.is_live() {
+                return Ok(true);
+            }
+            tracing::warn!(
+                interface = %state.interface_name,
+                backend = ?state.backend,
+                server = %state.server_display_name,
+                "clearing stale direct connection state (no live tunnel; likely a reboot or crash)"
+            );
+            println!(
+                "Clearing stale connection state for '{}' (previous tunnel no longer active).",
+                state.server_display_name
+            );
+            ConnectionState::remove(DIRECT_INSTANCE)?;
+            Ok(false)
+        }
+        Ok(None) => Ok(false),
+        // A corrupt/unreadable state file would otherwise wedge connect forever.
+        Err(error) => {
+            tracing::warn!(error = %error, "removing unreadable direct connection state");
+            ConnectionState::remove(DIRECT_INSTANCE)?;
+            Ok(false)
+        }
+    }
+}
+
 /// Connect via WgQuick or Userspace backend in direct (non-proxy) mode.
 /// Handles generating the WG config, bringing the interface up, saving state, and running hooks.
 pub fn connect_direct_wg(
@@ -366,7 +409,7 @@ pub fn connect_direct_wg(
 ) -> anyhow::Result<()> {
     use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
 
-    if ConnectionState::exists(DIRECT_INSTANCE) {
+    if direct_connection_active()? {
         anyhow::bail!("Already connected via direct VPN. Disconnect first.");
     }
     if wireguard::wg_quick::is_interface_active(interface_name)

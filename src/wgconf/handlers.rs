@@ -207,7 +207,7 @@ fn connect_direct(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
+    if connection_ops::direct_connection_active()? {
         anyhow::bail!("Already connected via direct VPN. Disconnect first.");
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
