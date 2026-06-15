@@ -649,7 +649,8 @@ fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
 /// helper's setup/teardown output back to the calling CLI. Shares the single
 /// source of truth in `config` with `userspace_helper` so the paths always match.
 ///
-/// macOS: `~/Library/Logs/tunmux-<interface>.log`; Linux: `/var/log/tunmux/<interface>.log`.
+/// `/var/log/tunmux/<interface>.log` on all platforms (see
+/// `config::gotatun_helper_log_path`).
 pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
     crate::config::gotatun_helper_log_path(interface)
 }

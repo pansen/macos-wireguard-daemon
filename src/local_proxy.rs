@@ -93,9 +93,11 @@ pub fn spawn_daemon(
     config::ensure_user_proxy_dir()?;
     let pid_path = proxy::local_pid_file(instance);
     let log_path = proxy::local_log_file(instance);
-    // The log may live outside the proxy dir (macOS: ~/Library/Logs); ensure it exists.
+    // The log may live outside the proxy dir (macOS: ~/Library/Logs); ensure it
+    // exists, else the daemon spawn fails later with a less actionable error.
     if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
     }
     let status_path = std::path::PathBuf::from(format!("{}.status", pid_path.to_string_lossy()));
     let pid_file = pid_path.to_string_lossy();

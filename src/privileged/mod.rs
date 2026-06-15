@@ -260,7 +260,12 @@ fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
     }
 
     // We declare exactly one listener socket in the plist; take the first fd.
+    // Defensively close any extras (a misconfigured plist or future change could
+    // hand us more) so they aren't leaked when we free the array.
     let fd = unsafe { *fds };
+    for i in 1..count {
+        unsafe { libc::close(*fds.add(i)) };
+    }
     unsafe { libc::free(fds as *mut libc::c_void) };
 
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };

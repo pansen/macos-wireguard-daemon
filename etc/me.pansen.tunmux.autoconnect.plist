@@ -11,6 +11,12 @@
         <string>__HOME__/.local/bin/tunmux-autoconnect.sh</string>
     </array>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TUNMUX_PROFILE</key>
+        <string>__PROFILE__</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true />
     <key>StartInterval</key>

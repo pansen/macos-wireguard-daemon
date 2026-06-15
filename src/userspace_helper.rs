@@ -80,8 +80,8 @@ fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
 #[cfg(unix)]
 fn gotatun_log_path(interface: &str) -> PathBuf {
     // Shared with the privileged service (which clears and tails this file), so
-    // both derive it from the same place. macOS: ~/Library/Logs/tunmux-<iface>.log;
-    // Linux: /var/log/tunmux/<iface>.log.
+    // both derive it from the same place: /var/log/tunmux/<iface>.log on all
+    // platforms (see config::gotatun_helper_log_path).
     crate::config::gotatun_helper_log_path(interface)
 }
 

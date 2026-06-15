@@ -33,8 +33,8 @@ chown-after-bind window entirely and is the recommended fix.
 
 | Property | Value |
 |---|---|
-| Socket path | `/var/run/tunmux/ctl.sock` (`privileged_socket_path()`) |
-| Socket dir | `/var/run/tunmux` (`privileged_socket_dir()`), mode `0750` |
+| Socket path | `/Library/Application Support/tunmux/run/ctl.sock` (`privileged_socket_path()`) |
+| Socket dir | `/Library/Application Support/tunmux/run` (`privileged_socket_dir()`), mode `0750` |
 | Socket file mode | `0660` |
 | Owner / group | `root` / `tunmux` |
 
@@ -42,13 +42,19 @@ Both the dir and the file are chowned to group `tunmux` inside `serve()`.
 
 ### Server — `src/privileged/mod.rs` `serve()`
 
-`serve()` already chooses between an **activation-provided** listener and a
+`serve()` chooses between an **activation-provided** listener and a
 **self-bound** listener:
 
 ```rust
-let listener = match systemd_activated_listener()? {
-    Some(listener) => listener,          // Linux: fd 3 via LISTEN_PID / LISTEN_FDS
-    None => {                            // everything else: bind + chmod + chown
+let activated = {
+    #[cfg(target_os = "macos")]
+    { launchd_activated_listener()? }   // launch_activate_socket("Listeners")
+    #[cfg(not(target_os = "macos"))]
+    { systemd_activated_listener()? }   // Linux: fd 3 via LISTEN_PID / LISTEN_FDS
+};
+let listener = match activated {
+    Some(listener) => listener,
+    None => {                           // self-bind: bind + chmod + chown
         let listener = UnixListener::bind(&socket_path)?;
         set_permissions(&socket_path, 0o660)?;
         chown(&socket_path, group_gid)?;
@@ -58,10 +64,11 @@ let listener = match systemd_activated_listener()? {
 ```
 
 - `systemd_activated_listener()` is keyed on the systemd protocol (`LISTEN_PID`,
-  `LISTEN_FDS`, first fd at 3). **launchd does not set these**, so on macOS it
-  always returns `None` and falls through to the self-bind branch — the path that
-  produces the root-only socket.
-- There is **no `launch_activate_socket` path** yet.
+  `LISTEN_FDS`, first fd at 3) and is used on Linux.
+- On macOS, `launchd_activated_listener()` retrieves the launchd-provided socket
+  via `launch_activate_socket("Listeners", …)`. A sudo-spawned daemon is not a
+  launchd job, so the call returns `None` and falls through to the self-bind
+  branch (which still chmods/chowns the socket it creates).
 
 ### Authorization boundary — `src/privileged/mod.rs` `handle_client()`
 
@@ -116,7 +123,7 @@ A persistent (`KeepAlive`) root daemon that self-binds the socket.
 
 ### Goal
 
-`launchd` creates `/var/run/tunmux/ctl.sock` with `SockMode=0660` and
+`launchd` creates `/Library/Application Support/tunmux/run/ctl.sock` with `SockMode=0660` and
 `SockGroup=tunmux` **atomically at creation**, and hands the listening fd to the
 daemon via `launch_activate_socket("Listeners", …)`. The daemon never chmods/chowns
 the socket in the activation path. The unprivileged client is unchanged.
@@ -137,7 +144,7 @@ the socket in the activation path. The unprivileged client is unchanged.
 
 ### The two creation paths and how they stay compatible
 
-Both paths must converge on **one socket contract**: path `/var/run/tunmux/ctl.sock`,
+Both paths must converge on **one socket contract**: path `/Library/Application Support/tunmux/run/ctl.sock`,
 mode `0660`, group `tunmux`. They already share `config::privileged_socket_path()`;
 the plist's `SockPathName` / `SockMode` / `SockGroup` must match it exactly.
 
@@ -307,7 +314,7 @@ Notes:
         <key>Listeners</key>
         <dict>
             <key>SockPathName</key>
-            <string>/var/run/tunmux/ctl.sock</string>
+            <string>/Library/Application Support/tunmux/run/ctl.sock</string>
             <key>SockType</key>
             <string>stream</string>
             <key>SockFamily</key>
@@ -349,13 +356,13 @@ Changes from current:
 ### 3. `Makefile` — pre-create the socket directory
 
 Under on-demand activation the daemon may not be running to create
-`/var/run/tunmux`; launchd needs the parent directory to exist to create the socket
+`/Library/Application Support/tunmux/run`; launchd needs the parent directory to exist to create the socket
 file. Add to `install/privileged` (the `tunmux` group already exists by this point):
 
 ```make
-sudo mkdir -p /var/run/tunmux
-sudo chgrp tunmux /var/run/tunmux
-sudo chmod 0750 /var/run/tunmux
+sudo mkdir -p "/Library/Application Support/tunmux/run"
+sudo chgrp tunmux "/Library/Application Support/tunmux/run"
+sudo chmod 0750 "/Library/Application Support/tunmux/run"
 ```
 
 The rest of `install/privileged` (group creation, binary install, log dir, plist
@@ -379,14 +386,14 @@ separately.
 
 - [ ] **`SockMode` is decimal in plist XML.** `<integer>` is base-10, so `0660` octal =
       `432`. Writing `<integer>0660</integer>` is wrong. After load, confirm with
-      `stat -f '%Sp %Sg %Su' /var/run/tunmux/ctl.sock` → expect `srw-rw---- tunmux root`.
+      `stat -f '%Sp %Sg %Su' "/Library/Application Support/tunmux/run/ctl.sock"` → expect `srw-rw---- tunmux root`.
 - [ ] **Key names.** Confirm `SockPathMode`/`SockPathGroup` vs `SockMode`/`SockGroup`
       against `man launchd.plist` on the target OS; the effective result must be
       `0660 root:tunmux`.
 - [ ] **launchd respawn throttle (~10s minimum).** Too-short `--idle-timeout-ms` makes a
       disconnect-then-reconnect within the throttle window add latency. Use ≥30–60s
       (spec uses 60000ms).
-- [ ] **`/var/run/tunmux` exists before first activation** (Makefile step 3).
+- [ ] **`/Library/Application Support/tunmux/run` exists before first activation** (Makefile step 3).
 - [ ] **`launch_activate_socket` returns `None` cleanly** in a sudo-spawned daemon →
       self-bind fallback still works.
 - [ ] **`libc::launch_activate_socket` links** on macOS (else add the `extern "C"`).
@@ -397,7 +404,7 @@ separately.
    (`launchctl print system/me.pansen.tunmux.privileged` shows loaded, not running).
    Run a client op that needs privilege → daemon spawns → op succeeds with no sudo
    prompt. After `--idle-timeout-ms`, confirm the daemon exits and the socket persists.
-2. **Permissions:** `stat -f '%Sp %Sg %Su' /var/run/tunmux/ctl.sock` → `srw-rw----`,
+2. **Permissions:** `stat -f '%Sp %Sg %Su' "/Library/Application Support/tunmux/run/ctl.sock"` → `srw-rw----`,
    group `tunmux`, owner `root`.
 3. **Group gating:** as a user **in** `tunmux`, a client connects; a user **not** in
    `tunmux` is denied at connect (`PermissionDenied`).

@@ -1,3 +1,7 @@
+# Path to the WireGuard profile the login autoconnect agent connects with.
+# Override on other machines/users: make install TUNMUX_PROFILE=/path/to/your.conf
+TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
+
 .PHONY: submodule
 submodule:
 	git submodule update --init --recursive
@@ -9,7 +13,7 @@ build.release: submodule
 .PHONY: install/privileged
 install/privileged:
 	sudo dseditgroup -o read tunmux >/dev/null 2>&1 || sudo dseditgroup -o create tunmux
-	sudo dseditgroup -o edit -a $$(id -F) -t user tunmux
+	sudo dseditgroup -o edit -a $$(id -un) -t user tunmux
 
 	sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
 	sudo mkdir -p /var/log/tunmux && sudo chmod 755 /var/log/tunmux
@@ -21,6 +25,8 @@ install/privileged:
 	sudo chown root:wheel /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 	sudo chmod 644 /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 	GID=$$(dscl . -read /Groups/tunmux PrimaryGroupID | awk '{print $$2}'); \
+	sudo /usr/libexec/PlistBuddy -c "Delete :Sockets:Listeners:SockPathGroup" \
+		/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist 2>/dev/null || true; \
 	sudo /usr/libexec/PlistBuddy -c "Add :Sockets:Listeners:SockPathGroup integer $$GID" \
 		/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
@@ -38,7 +44,7 @@ install/wrapper:
 .PHONY: install/autostart
 install/autostart:
 	mkdir -p $$HOME/Library/LaunchAgents
-	sed "s|__HOME__|$$HOME|g" etc/me.pansen.tunmux.autoconnect.plist > $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
+	sed -e "s|__HOME__|$$HOME|g" -e "s|__PROFILE__|$(TUNMUX_PROFILE)|g" etc/me.pansen.tunmux.autoconnect.plist > $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
 	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
 	launchctl bootstrap gui/$$(id -u) $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
 	@# test now
