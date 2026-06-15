@@ -421,6 +421,14 @@ pub fn direct_connection_active() -> anyhow::Result<DirectSlotStatus> {
     }
 }
 
+/// Returns the live [`ConnectionState`] for the direct slot, or `None` when no
+/// active tunnel exists. Does not prune stale state; callers that also need
+/// cleanup should call [`direct_connection_active`] first.
+pub fn live_direct_connection() -> anyhow::Result<Option<ConnectionState>> {
+    use crate::wireguard::connection::DIRECT_INSTANCE;
+    Ok(ConnectionState::load(DIRECT_INSTANCE)?.filter(|s| s.is_live()))
+}
+
 /// Connect via WgQuick or Userspace backend in direct (non-proxy) mode.
 /// Handles generating the WG config, bringing the interface up, saving state, and running hooks.
 pub fn connect_direct_wg(
@@ -513,6 +521,7 @@ fn build_direct_state(
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
+        source_path: None,
     }
 }
 
@@ -591,6 +600,7 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
+        source_path: None,
     };
     state.save()?;
     hooks::run_ifup(config, provider, &state);
@@ -661,6 +671,7 @@ pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Resu
         local_public_key,
         virtual_ips: virtual_ips.clone(),
         keepalive_secs: cfg.keepalive,
+        source_path: None,
     };
     state.save()?;
     hooks::run_ifup(config, provider, &state);

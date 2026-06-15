@@ -35,12 +35,6 @@ install/privileged:
 	sudo launchctl bootstrap system /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 
 
-.PHONY: install/wrapper
-install/wrapper:
-	mkdir -p $$HOME/.local/bin
-	cp scripts/tunmux-autoconnect.sh $$HOME/.local/bin/tunmux-autoconnect.sh
-	chmod 0755 $$HOME/.local/bin/tunmux-autoconnect.sh
-
 .PHONY: install/autostart
 install/autostart:
 	mkdir -p $$HOME/Library/LaunchAgents
@@ -54,16 +48,14 @@ install/autostart:
 
 
 .PHONY: install
-install: build.release install/privileged install/wrapper install/autostart
+install: build.release install/privileged install/autostart
 
 
 .PHONY: uninstall/autostart
 uninstall/autostart:
 	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
 	rm -f $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
-
-.PHONY: uninstall/wrapper
-uninstall/wrapper:
+	@# Clean up the retired wrapper script from earlier installs.
 	rm -f $$HOME/.local/bin/tunmux-autoconnect.sh
 
 .PHONY: uninstall/privileged
@@ -78,7 +70,7 @@ uninstall/privileged:
 	sudo dseditgroup -o delete tunmux 2>/dev/null || true
 
 .PHONY: uninstall
-uninstall: uninstall/autostart uninstall/wrapper uninstall/privileged
+uninstall: uninstall/autostart uninstall/privileged
 
 
 .PHONY: check/privileged

@@ -946,6 +946,7 @@ mod tests {
             local_public_key: None,
             virtual_ips: vec![],
             keepalive_secs: None,
+            source_path: None,
         };
 
         let ifup = super::debug_ifup_env(Provider::Proton, &state);
@@ -995,6 +996,7 @@ mod tests {
             local_public_key: None,
             virtual_ips: vec![],
             keepalive_secs: None,
+            source_path: None,
         };
 
         let runtime = super::HookRuntime::from_state(&state);

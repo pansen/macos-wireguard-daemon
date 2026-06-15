@@ -41,6 +41,11 @@ pub struct ConnectionState {
     /// WireGuard persistent keepalive interval in seconds (local-proxy mode).
     #[serde(default)]
     pub keepalive_secs: Option<u16>,
+    /// Canonicalized path of the source `.conf` this tunnel was brought up from
+    /// (wgconf direct mode only). Lets a repeat `connect --if-missing` recognize
+    /// that the same source is already live and no-op instead of erroring.
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 impl ConnectionState {
@@ -160,6 +165,7 @@ mod tests {
             local_public_key: None,
             virtual_ips: vec![],
             keepalive_secs: None,
+            source_path: None,
         }
     }
 

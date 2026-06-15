@@ -85,6 +85,7 @@ pub fn up(
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
+        source_path: None,
     };
     state.save()?;
 
@@ -567,6 +568,7 @@ fn up_macos(
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
+        source_path: None,
     };
     state.save()?;
 

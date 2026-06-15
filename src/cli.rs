@@ -348,6 +348,12 @@ pub struct WgconfConnectArgs {
     /// Set WireGuard interface MTU (direct kernel or userspace mode)
     #[arg(long)]
     pub mtu: Option<u16>,
+
+    /// Exit 0 without reconnecting if this same source is already the live tunnel
+    /// (direct mode). A different live source still errors. Checks presence only,
+    /// not whether the config changed on disk.
+    #[arg(long)]
+    pub if_missing: bool,
 }
 
 #[derive(Subcommand)]

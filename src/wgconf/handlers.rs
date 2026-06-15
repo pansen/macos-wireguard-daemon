@@ -20,6 +20,9 @@ struct ConfigSource {
     display_name: String,
     instance_seed: String,
     config_text: String,
+    /// Canonicalized path of the source `.conf` (both `--file` and `--profile`
+    /// resolve to a concrete file). Used as the identity key for `--if-missing`.
+    source_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -75,6 +78,9 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if let Some(mtu) = args.mtu {
         wireguard::config::validate_mtu(mtu)?;
     }
+    if args.if_missing && (args.proxy || args.local_proxy) {
+        anyhow::bail!("--if-missing is only supported for direct mode");
+    }
 
     let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
 
@@ -119,6 +125,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
             routed.as_ref(),
             args.disable_ipv6,
             args.mtu,
+            args.if_missing,
             config,
         )?;
     }
@@ -203,13 +210,25 @@ fn connect_direct(
     routed: Option<&RoutedConfig>,
     disable_ipv6: bool,
     mtu: Option<u16>,
+    if_missing: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
     match connection_ops::direct_connection_active()? {
         connection_ops::DirectSlotStatus::Active => {
-            anyhow::bail!("Already connected via direct VPN. Disconnect first.")
+            // --if-missing: a no-op success only when the *same* source is already
+            // live. A different (or unidentifiable) source still errors, so we never
+            // silently mask a failed profile switch.
+            if if_missing && source.source_path.is_some() {
+                if let Some(live) = connection_ops::live_direct_connection()? {
+                    if live.source_path == source.source_path {
+                        println!("Already connected to {}.", live.server_display_name);
+                        return Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("Already connected via direct VPN. Disconnect first.");
         }
         connection_ops::DirectSlotStatus::ClearedStale(message) => println!("{}", message),
         connection_ops::DirectSlotStatus::Free => {}
@@ -252,6 +271,7 @@ fn connect_direct(
                 local_public_key: None,
                 virtual_ips: vec![],
                 keepalive_secs: None,
+                source_path: source.source_path.clone(),
             };
             state.save()?;
         }
@@ -281,6 +301,7 @@ fn connect_direct(
                 local_public_key: None,
                 virtual_ips: vec![],
                 keepalive_secs: None,
+                source_path: source.source_path.clone(),
             };
             state.save()?;
         }
@@ -315,6 +336,16 @@ fn connect_direct(
                 &source.display_name,
                 disable_ipv6,
             )?;
+            // kernel::up builds and saves the _direct state internally, so stamp
+            // the source path onto it afterwards to keep --if-missing working.
+            if source.source_path.is_some() {
+                if let Some(mut state) =
+                    wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?
+                {
+                    state.source_path = source.source_path.clone();
+                    state.save()?;
+                }
+            }
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
@@ -445,13 +476,16 @@ fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<C
                 display_name: file_name,
                 instance_seed,
                 config_text,
+                source_path: canonicalize_source(source_path),
             })
         }
         (None, Some(name)) => {
             let profile_name = validate_profile_name(name)?;
             let config_text = load_profile_content(&profile_name)?;
+            let profile_path = profile_path_in(&provider_dir(), &profile_name)?;
             Ok(ConfigSource {
                 display_name: format!("profile:{}", profile_name),
+                source_path: canonicalize_source(&profile_path),
                 instance_seed: profile_name,
                 config_text,
             })
@@ -459,6 +493,16 @@ fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<C
         (Some(_), Some(_)) => anyhow::bail!("use either --file or --profile, not both"),
         (None, None) => anyhow::bail!("one of --file or --profile is required"),
     }
+}
+
+/// Canonicalize a source `.conf` path to a stable identity key for `--if-missing`.
+/// Best-effort: a path that can't be resolved (e.g. removed after read) yields
+/// `None`, which simply means a later `--if-missing` can't match it and so will
+/// fall through to the normal already-connected guard rather than no-op.
+fn canonicalize_source(path: &Path) -> Option<String> {
+    fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {

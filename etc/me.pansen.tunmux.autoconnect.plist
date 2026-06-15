@@ -6,16 +6,19 @@
     <key>Label</key>
     <string>me.pansen.tunmux.autoconnect</string>
 
+    <!-- connect --if-missing is idempotent: it brings the tunnel up if down and
+         exits 0 (no-op) when this same profile is already live, so the agent can
+         call the binary directly with no wrapper script. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/.local/bin/tunmux-autoconnect.sh</string>
-    </array>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>TUNMUX_PROFILE</key>
+        <string>/usr/local/bin/tunmux</string>
+        <string>--debug</string>
+        <string>wgconf</string>
+        <string>connect</string>
+        <string>--file</string>
         <string>__PROFILE__</string>
-    </dict>
+        <string>--if-missing</string>
+    </array>
 
     <key>RunAtLoad</key>
     <true />
