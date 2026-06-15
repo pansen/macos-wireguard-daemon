@@ -2178,7 +2178,10 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
     let (mut applied, mut captured, mut restored, mut dropped, mut errors) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
 
-    // (a) Capture originals for services we are about to own.
+    // (a) Capture originals for services we are about to own. If a capture
+    // fails we must not overwrite that service's DNS below: with no saved
+    // original, teardown could never restore the user's settings.
+    let mut capture_failed: Vec<&str> = Vec::new();
     for svc in &actions.capture {
         match capture_macos_dns_service(svc, &inputs.dns_servers) {
             Ok(Some(saved)) => {
@@ -2186,30 +2189,42 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
                 captured += 1;
             }
             Ok(None) => {} // already showing tunnel DNS; nothing to capture
-            Err(_) => errors += 1,
+            Err(_) => {
+                errors += 1;
+                capture_failed.push(svc.as_str());
+            }
         }
     }
 
     // (b) Release services we no longer target: restore the ones still present,
-    // drop the ones whose host service has vanished.
+    // drop the ones whose host service has vanished. Keep the saved original if
+    // a restore fails so teardown (or a later tick) can retry; dropping it would
+    // strand the user's DNS settings.
     for svc in &actions.restore {
         let saved = dns.services.iter().find(|s| &s.service == svc).cloned();
-        if let Some(saved) = saved {
-            if restore_macos_dns_service(&saved).is_ok() {
-                restored += 1;
-            } else {
-                errors += 1;
+        match saved {
+            Some(saved) => {
+                if restore_macos_dns_service(&saved).is_ok() {
+                    restored += 1;
+                    dns.services.retain(|s| &s.service != svc);
+                } else {
+                    errors += 1; // keep saved state for a retry
+                }
             }
+            None => dns.services.retain(|s| &s.service != svc),
         }
-        dns.services.retain(|s| &s.service != svc);
     }
     for svc in &actions.drop {
         dropped += 1;
         dns.services.retain(|s| &s.service != svc);
     }
 
-    // (c) (Re-)assert tunnel DNS on every target whose observed DNS has drifted.
+    // (c) (Re-)assert tunnel DNS on every target whose observed DNS has drifted,
+    // except services whose original we failed to capture this tick.
     for svc in &actions.apply {
+        if capture_failed.iter().any(|s| *s == svc.as_str()) {
+            continue; // never overwrite DNS we couldn't back up
+        }
         if set_macos_dns_servers(svc, &inputs.dns_servers).is_ok()
             && set_macos_search_domains_empty(svc).is_ok()
         {
@@ -2219,7 +2234,15 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
         }
     }
 
-    dns.fingerprint = fingerprint;
+    // Re-snapshot only when we actually changed system DNS, so the stored
+    // fingerprint matches reality and the next tick doesn't see a spurious diff.
+    // Captures and drops don't touch system DNS, so the pre-action snapshot is
+    // still accurate when nothing was applied or restored.
+    dns.fingerprint = if applied + restored > 0 {
+        macos_current_dns_fingerprint()
+    } else {
+        fingerprint
+    };
     info!(
         interface = inputs.interface,
         applied, captured, restored, dropped, errors, "userspace_helper_dns_reconcile_applied"
