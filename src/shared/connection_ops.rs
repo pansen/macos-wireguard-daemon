@@ -283,15 +283,24 @@ pub fn disconnect_one_provider_connection(
             WgBackend::LocalProxy => unreachable!(),
         };
         if let Err(error) = teardown {
-            // Don't let a failed teardown (an interface already gone after a
-            // reboot, or an unreachable privileged helper) leave the state file
-            // behind and wedge future connects -- warn and remove it anyway.
+            // A failed teardown shouldn't strand the state file and wedge future
+            // connects -- but only when the tunnel is genuinely gone (interface
+            // already removed after a reboot, an unreachable privileged helper for
+            // an already-dead tunnel, etc.). If the tunnel is still live, dropping
+            // the state would orphan it: the routes/DNS stay in place with no state
+            // file left to disconnect it. Surface the error and keep the state.
+            if state.is_live() {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to tear down still-live connection {:?}; leaving state intact",
+                    state.instance_name
+                )));
+            }
             tracing::warn!(
                 instance = %state.instance_name,
                 interface = %state.interface_name,
                 backend = ?state.backend,
                 error = %error,
-                "connection teardown failed; removing state anyway"
+                "connection teardown failed but tunnel is no longer live; removing stale state"
             );
         }
         ConnectionState::remove(&state.instance_name)?;
@@ -358,20 +367,33 @@ pub fn resolve_proxy_config(
     Ok(auto)
 }
 
+/// Outcome of probing the direct (`_direct`) connection slot.
+pub enum DirectSlotStatus {
+    /// A real, still-active tunnel occupies the slot; the caller should refuse
+    /// to start a new one.
+    Active,
+    /// The slot is free.
+    Free,
+    /// Stale state was found (a reboot/crash left it behind) and removed. Carries
+    /// a user-facing message the CLI layer may choose to print.
+    ClearedStale(String),
+}
+
 /// Detect whether a live direct (`_direct`) tunnel currently exists, clearing
 /// stale state left behind by a reboot or crash.
 ///
-/// Returns `Ok(true)` when a real, still-active tunnel occupies the direct slot
-/// (the caller should refuse to start a new one) and `Ok(false)` when the slot
-/// is free -- removing any orphaned `_direct` state file in the process so a
-/// dead connection can never permanently wedge `connect`.
-pub fn direct_connection_active() -> anyhow::Result<bool> {
+/// Returns [`DirectSlotStatus::Active`] when a real, still-active tunnel occupies
+/// the direct slot, and otherwise frees the slot -- removing any orphaned
+/// `_direct` state file so a dead connection can never permanently wedge
+/// `connect`. This is a shared helper with no stdout side-effects; callers decide
+/// whether and how to surface [`DirectSlotStatus::ClearedStale`] to the user.
+pub fn direct_connection_active() -> anyhow::Result<DirectSlotStatus> {
     use crate::wireguard::connection::DIRECT_INSTANCE;
 
     match ConnectionState::load(DIRECT_INSTANCE) {
         Ok(Some(state)) => {
             if state.is_live() {
-                return Ok(true);
+                return Ok(DirectSlotStatus::Active);
             }
             tracing::warn!(
                 interface = %state.interface_name,
@@ -379,19 +401,22 @@ pub fn direct_connection_active() -> anyhow::Result<bool> {
                 server = %state.server_display_name,
                 "clearing stale direct connection state (no live tunnel; likely a reboot or crash)"
             );
-            println!(
+            let message = format!(
                 "Clearing stale connection state for '{}' (previous tunnel no longer active).",
                 state.server_display_name
             );
             ConnectionState::remove(DIRECT_INSTANCE)?;
-            Ok(false)
+            Ok(DirectSlotStatus::ClearedStale(message))
         }
-        Ok(None) => Ok(false),
+        Ok(None) => Ok(DirectSlotStatus::Free),
         // A corrupt/unreadable state file would otherwise wedge connect forever.
         Err(error) => {
             tracing::warn!(error = %error, "removing unreadable direct connection state");
             ConnectionState::remove(DIRECT_INSTANCE)?;
-            Ok(false)
+            Ok(DirectSlotStatus::ClearedStale(
+                "Clearing unreadable connection state (previous tunnel no longer active)."
+                    .to_string(),
+            ))
         }
     }
 }
@@ -409,8 +434,12 @@ pub fn connect_direct_wg(
 ) -> anyhow::Result<()> {
     use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
 
-    if direct_connection_active()? {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
+    match direct_connection_active()? {
+        DirectSlotStatus::Active => {
+            anyhow::bail!("Already connected via direct VPN. Disconnect first.")
+        }
+        DirectSlotStatus::ClearedStale(message) => println!("{}", message),
+        DirectSlotStatus::Free => {}
     }
     if wireguard::wg_quick::is_interface_active(interface_name)
         || wireguard::userspace::is_interface_active(interface_name)

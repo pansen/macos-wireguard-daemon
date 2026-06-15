@@ -56,6 +56,12 @@ const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
 #[cfg(unix)]
 const MTU_OVERRIDE_ENV: &str = "TUNMUX_GOTATUN_MTU_OVERRIDE";
 
+/// How often the macOS shutdown loop reconciles routes against the current LAN.
+/// Reconciling re-snapshots the network fingerprint (running `ifconfig`), which is
+/// too heavy to do on every 1s tick, so it runs on this slower cadence instead.
+#[cfg(target_os = "macos")]
+const MACOS_RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+
 #[cfg(unix)]
 fn gotatun_pid_path(interface: &str) -> PathBuf {
     PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.pid"))
@@ -460,6 +466,8 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     let mut next_diag_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
+    let mut next_reconcile_at = std::time::Instant::now();
+    #[cfg(target_os = "macos")]
     let mut last_transfer: Option<(u64, u64)> = None;
 
     #[cfg(target_os = "macos")]
@@ -495,9 +503,13 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     // Adapt routing to network changes (roam, suspend/resume,
-                    // link up/down) live, without requiring a reconnect.
-                    if let CleanupState::Macos(state) = &running.cleanup {
-                        macos_reconcile_routes(state);
+                    // link up/down) live, without requiring a reconnect. Throttled
+                    // off the 1s tick so the `ifconfig` snapshot stays cheap.
+                    if std::time::Instant::now() >= next_reconcile_at {
+                        next_reconcile_at = std::time::Instant::now() + MACOS_RECONCILE_INTERVAL;
+                        if let CleanupState::Macos(state) = &running.cleanup {
+                            macos_reconcile_routes(state);
+                        }
                     }
 
                     if diag_enabled && std::time::Instant::now() >= next_diag_at {
@@ -891,9 +903,25 @@ fn cleanup_network(running: &RunningDevice) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn write_runtime_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
-    std::fs::write(path, contents)
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // This runs as the privileged helper, so a symlink planted under the runtime
+    // dir could otherwise redirect the write (and the chmod) to clobber an
+    // arbitrary file. O_NOFOLLOW makes open() fail rather than follow a final-
+    // component symlink, and mode(0o600) creates the file private from the start.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    // Pin permissions for the case where the file already existed (open() does not
+    // re-apply mode to an existing file).
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to chmod {}", path.display()))?;
     Ok(())
 }
@@ -1532,6 +1560,9 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
     if route.interface.is_some() && route.gateway.is_none() {
         let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
         delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
+        // Match del_macos_route: without -host/-net the delete can fail to match a
+        // CIDR destination, leaving the stale dev-bound route behind.
+        delete_args.push(macos_route_target_kind(route).into());
         delete_args.push(route.destination.clone());
         let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
         let _ = run_command("route", &delete_refs);

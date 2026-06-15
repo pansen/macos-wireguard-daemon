@@ -207,8 +207,12 @@ fn connect_direct(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    if connection_ops::direct_connection_active()? {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
+    match connection_ops::direct_connection_active()? {
+        connection_ops::DirectSlotStatus::Active => {
+            anyhow::bail!("Already connected via direct VPN. Disconnect first.")
+        }
+        connection_ops::DirectSlotStatus::ClearedStale(message) => println!("{}", message),
+        connection_ops::DirectSlotStatus::Free => {}
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)

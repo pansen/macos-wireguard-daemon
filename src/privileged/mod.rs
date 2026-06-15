@@ -453,15 +453,29 @@ fn read_log_tail(path: &std::path::Path, offset: u64) -> Vec<String> {
 /// fixed-width prefix so lexicographic order is chronological; a stable sort keeps same-second
 /// lines in insertion order (service lines first).
 fn merge_log_lines(service: Vec<String>, helper: Vec<String>) -> Vec<String> {
-    const TIMESTAMP_LEN: usize = "2026-06-14T08:18:02Z".len();
     let mut all = service;
     all.extend(helper);
-    all.sort_by(|a, b| {
-        let ta = a.get(0..TIMESTAMP_LEN).unwrap_or(a.as_str());
-        let tb = b.get(0..TIMESTAMP_LEN).unwrap_or(b.as_str());
-        ta.cmp(tb)
+    // Only reorder lines whose leading token actually looks like our timestamp.
+    // When either side has no parseable timestamp we treat the pair as equal so
+    // the stable sort leaves them in insertion order (service lines first) rather
+    // than trusting a brittle fixed-width slice of whatever the line happens to be.
+    all.sort_by(|a, b| match (leading_timestamp(a), leading_timestamp(b)) {
+        (Some(ta), Some(tb)) => ta.cmp(tb),
+        _ => std::cmp::Ordering::Equal,
     });
     all
+}
+
+/// Extract the leading RFC3339 timestamp token (e.g. `2026-06-14T08:18:02Z`) from a
+/// log line, or `None` if the first whitespace-delimited token isn't shaped like one.
+fn leading_timestamp(line: &str) -> Option<&str> {
+    const TIMESTAMP_LEN: usize = "2026-06-14T08:18:02Z".len();
+    let token = line.split_whitespace().next()?;
+    if token.len() == TIMESTAMP_LEN && token.ends_with('Z') {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
@@ -715,5 +729,107 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    /// Split the framed bytes into one JSON value per newline-delimited line.
+    fn parse_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+        let text = std::str::from_utf8(bytes).expect("frames must be valid utf-8");
+        // A trailing newline after the final frame must not yield an empty line.
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("each frame is one JSON line"))
+            .collect()
+    }
+
+    #[test]
+    fn encodes_response_with_zero_logs_as_single_frame() {
+        let bytes = encode_response_frames(&[], &PrivilegedResponse::Unit).unwrap();
+        let frames = parse_frames(&bytes);
+        assert_eq!(frames.len(), 1, "no log frames, just the response");
+        assert_eq!(frames[0], serde_json::json!({ "kind": "unit" }));
+    }
+
+    #[test]
+    fn encodes_logs_in_order_before_response() {
+        let logs = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let response = PrivilegedResponse::Bool(true);
+        let bytes = encode_response_frames(&logs, &response).unwrap();
+        let frames = parse_frames(&bytes);
+
+        assert_eq!(frames.len(), logs.len() + 1);
+        for (frame, expected) in frames.iter().zip(&logs) {
+            assert_eq!(frame, &serde_json::json!({ "log": expected }));
+        }
+        // The response frame trails the logs and is not a log frame.
+        let last = frames.last().unwrap();
+        assert!(last.get("log").is_none());
+        assert_eq!(last, &serde_json::json!({ "kind": "bool", "value": true }));
+    }
+
+    #[test]
+    fn log_frames_survive_quotes_and_newlines() {
+        // Embedded quotes/newlines must be JSON-escaped so each frame stays on a
+        // single line and round-trips back to the original content verbatim.
+        let logs = vec![
+            "has \"quotes\" inside".to_string(),
+            "line one\nline two".to_string(),
+            "tab\tand \\ backslash".to_string(),
+        ];
+        let bytes = encode_response_frames(&logs, &PrivilegedResponse::Unit).unwrap();
+        let frames = parse_frames(&bytes);
+
+        assert_eq!(frames.len(), logs.len() + 1);
+        for (frame, expected) in frames.iter().zip(&logs) {
+            assert_eq!(frame["log"], serde_json::json!(expected));
+        }
+    }
+
+    #[test]
+    fn merge_orders_by_timestamp_and_keeps_service_first_on_ties() {
+        let service = vec![
+            "2026-06-14T08:18:02Z service-a".to_string(),
+            "2026-06-14T08:18:04Z service-b".to_string(),
+        ];
+        let helper = vec![
+            "2026-06-14T08:18:01Z helper-a".to_string(),
+            "2026-06-14T08:18:02Z helper-b".to_string(),
+        ];
+        let merged = merge_log_lines(service, helper);
+        assert_eq!(
+            merged,
+            vec![
+                "2026-06-14T08:18:01Z helper-a".to_string(),
+                // Same second as helper-b: stable sort keeps the service line first.
+                "2026-06-14T08:18:02Z service-a".to_string(),
+                "2026-06-14T08:18:02Z helper-b".to_string(),
+                "2026-06-14T08:18:04Z service-b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_falls_back_to_insertion_order_for_untimestamped_lines() {
+        // Lines without a parseable timestamp must not be reordered against each
+        // other (no fixed-width slice of arbitrary text decides their order).
+        let service = vec!["no timestamp here".to_string(), "another bare line".to_string()];
+        let helper = vec!["also untimestamped".to_string()];
+        let merged = merge_log_lines(service.clone(), helper.clone());
+        assert_eq!(merged, [service, helper].concat());
+    }
+
+    #[test]
+    fn leading_timestamp_only_matches_well_formed_prefix() {
+        assert_eq!(
+            leading_timestamp("2026-06-14T08:18:02Z hello"),
+            Some("2026-06-14T08:18:02Z")
+        );
+        assert_eq!(leading_timestamp("hello world"), None);
+        assert_eq!(leading_timestamp(""), None);
+        // Right length but not a timestamp (no trailing Z).
+        assert_eq!(leading_timestamp("abcdefghijklmnopqrst rest"), None);
     }
 }
