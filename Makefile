@@ -55,8 +55,6 @@ install: build.release install/privileged install/autostart
 uninstall/autostart:
 	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
 	rm -f $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
-	@# Clean up the retired wrapper script from earlier installs.
-	rm -f $$HOME/.local/bin/tunmux-autoconnect.sh
 
 .PHONY: uninstall/privileged
 uninstall/privileged:
