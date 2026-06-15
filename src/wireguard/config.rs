@@ -180,11 +180,15 @@ pub fn parse_mtu(value: &str) -> Result<u16> {
     Ok(mtu)
 }
 
+/// Minimum MTU accepted anywhere in the codebase. The single source of truth for the
+/// threshold -- callers go through [`validate_mtu`] rather than re-checking this directly.
+pub const MIN_MTU: u16 = 576;
+
 pub fn validate_mtu(mtu: u16) -> Result<()> {
-    if mtu < 576 {
+    if mtu < MIN_MTU {
         return Err(AppError::WireGuard(format!(
-            "invalid MTU {} (must be >= 576)",
-            mtu
+            "invalid MTU {} (must be >= {})",
+            mtu, MIN_MTU
         )));
     }
     Ok(())

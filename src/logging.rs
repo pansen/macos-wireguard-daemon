@@ -95,24 +95,43 @@ pub fn init_terminal(verbose: bool) {
 // is synchronous and single-threaded per connection, so a thread-local buffer cleanly scopes the
 // captured lines to one request. The captured lines are then streamed back to the calling CLI.
 
+/// Hard cap on bytes captured per request. A verbose/debug session (or unexpected helper output)
+/// would otherwise grow this buffer without bound in the privileged daemon. Past the cap, capture
+/// stops and a truncation marker is appended when the buffer is drained.
+const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+struct CaptureBuffer {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 thread_local! {
-    static LOG_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static LOG_CAPTURE: RefCell<Option<CaptureBuffer>> = const { RefCell::new(None) };
 }
 
 /// Start capturing this thread's formatted log output into a buffer.
 pub fn begin_log_capture() {
-    LOG_CAPTURE.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    LOG_CAPTURE.with(|cell| {
+        *cell.borrow_mut() = Some(CaptureBuffer {
+            bytes: Vec::new(),
+            truncated: false,
+        })
+    });
 }
 
 /// Stop capturing and return the captured output split into lines (without trailing newlines).
 pub fn take_log_capture() -> Vec<String> {
     LOG_CAPTURE
         .with(|cell| cell.borrow_mut().take())
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
+        .map(|capture| {
+            let mut lines: Vec<String> = String::from_utf8_lossy(&capture.bytes)
                 .lines()
                 .map(str::to_string)
-                .collect()
+                .collect();
+            if capture.truncated {
+                lines.push("(log capture truncated)".to_string());
+            }
+            lines
         })
         .unwrap_or_default()
 }
@@ -125,8 +144,14 @@ impl Write for ServiceWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
         LOG_CAPTURE.with(|cell| {
-            if let Some(buffer) = cell.borrow_mut().as_mut() {
-                buffer.extend_from_slice(buf);
+            if let Some(capture) = cell.borrow_mut().as_mut() {
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.bytes.len());
+                if buf.len() <= remaining {
+                    capture.bytes.extend_from_slice(buf);
+                } else {
+                    capture.bytes.extend_from_slice(&buf[..remaining]);
+                    capture.truncated = true;
+                }
             }
         });
         Ok(buf.len())

@@ -1321,8 +1321,9 @@ fn configure_network_macos(
         }
 
         // Compute the initial desired routes the same way the reconciler will,
-        // so the LAN-exclusion is applied from the very first packet.
-        fingerprint = macos_current_fingerprint(&inputs);
+        // so the LAN-exclusion is applied from the very first packet. A missing
+        // gateway here is fatal: an unpinned endpoint would route into the tunnel.
+        fingerprint = macos_current_fingerprint(&inputs, GatewayFallback::Require)?;
         for route in macos_desired_routes(&inputs, &fingerprint) {
             add_macos_route(&route)?;
             routes_added.push(route);
@@ -1788,21 +1789,71 @@ fn macos_allowed_ips_cover_endpoint(allowed_ips: &[String], endpoint: IpAddr) ->
     })
 }
 
-/// Snapshot the current network environment that drives tunnel routing.
+/// How `macos_current_fingerprint` should treat a failed default-gateway lookup.
 #[cfg(target_os = "macos")]
-fn macos_current_fingerprint(inputs: &MacosReconcileInputs) -> MacosNetworkFingerprint {
+enum GatewayFallback {
+    /// Initial setup: a missing gateway is fatal. Without the pin the endpoint
+    /// would route into the tunnel and break connectivity, so propagate the error.
+    Require,
+    /// Reconcile tick: keep this previously resolved gateway on a transient
+    /// failure rather than silently dropping the endpoint pin.
+    Keep(Option<String>),
+}
+
+/// Snapshot the current network environment that drives tunnel routing.
+///
+/// When the endpoint must be pinned out of the tunnel the default gateway is
+/// required; `gateway_fallback` decides what happens if that lookup fails (see
+/// [`GatewayFallback`]). The lookup is skipped entirely when no pin is needed, so
+/// no-op reconcile ticks don't run `route get default`.
+#[cfg(target_os = "macos")]
+fn macos_current_fingerprint(
+    inputs: &MacosReconcileInputs,
+    gateway_fallback: GatewayFallback,
+) -> anyhow::Result<MacosNetworkFingerprint> {
     let local_subnets = macos_local_connected_subnets(&inputs.interface);
-    // Only the endpoint pin needs the gateway; skip the lookup otherwise so we
-    // do not run `route get default` on every (no-op) reconcile tick.
     let endpoint_gateway = if inputs.endpoint_needs_pin {
-        get_macos_default_gateway(inputs.endpoint_is_ipv6).unwrap_or(None)
+        match get_macos_default_gateway(inputs.endpoint_is_ipv6) {
+            Ok(Some(gateway)) => Some(gateway),
+            Ok(None) => match gateway_fallback {
+                GatewayFallback::Require => anyhow::bail!(
+                    "no default gateway available to pin endpoint {} out of the tunnel",
+                    inputs.endpoint
+                ),
+                GatewayFallback::Keep(previous) => {
+                    warn!(
+                        interface = inputs.interface,
+                        endpoint = %inputs.endpoint,
+                        "userspace_helper_reconcile_gateway_unresolved_keeping_previous"
+                    );
+                    previous
+                }
+            },
+            Err(error) => match gateway_fallback {
+                GatewayFallback::Require => {
+                    return Err(error.context(format!(
+                        "failed to resolve default gateway to pin endpoint {} out of the tunnel",
+                        inputs.endpoint
+                    )));
+                }
+                GatewayFallback::Keep(previous) => {
+                    warn!(
+                        interface = inputs.interface,
+                        endpoint = %inputs.endpoint,
+                        error = %error,
+                        "userspace_helper_reconcile_gateway_lookup_failed_keeping_previous"
+                    );
+                    previous
+                }
+            },
+        }
     } else {
         None
     };
-    MacosNetworkFingerprint {
+    Ok(MacosNetworkFingerprint {
         local_subnets,
         endpoint_gateway,
-    }
+    })
 }
 
 /// Re-apply routing when the host network changed (roam, suspend/resume, link
@@ -1810,12 +1861,30 @@ fn macos_current_fingerprint(inputs: &MacosReconcileInputs) -> MacosNetworkFinge
 #[cfg(target_os = "macos")]
 fn macos_reconcile_routes(state: &MacosCleanupState) {
     let inputs = &state.reconcile;
-    let fingerprint = macos_current_fingerprint(inputs);
 
     let mut routing = state
         .routing
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Reconcile is best-effort: if the gateway lookup fails transiently, keep the
+    // last known gateway rather than dropping the endpoint pin (which would route
+    // the endpoint into the tunnel until the next change).
+    let previous_gateway = routing.fingerprint.endpoint_gateway.clone();
+    let fingerprint =
+        match macos_current_fingerprint(inputs, GatewayFallback::Keep(previous_gateway)) {
+            Ok(fingerprint) => fingerprint,
+            // `Keep` mode does not propagate gateway errors, but stay defensive:
+            // skip this tick rather than acting on a half-built fingerprint.
+            Err(error) => {
+                warn!(
+                    interface = inputs.interface,
+                    error = %error,
+                    "userspace_helper_reconcile_fingerprint_failed"
+                );
+                return;
+            }
+        };
     if fingerprint == routing.fingerprint {
         return;
     }

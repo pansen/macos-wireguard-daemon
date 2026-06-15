@@ -600,15 +600,68 @@ fn read_framed_response<R: BufRead>(reader: &mut R) -> Result<super::PrivilegedR
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(trimmed)
+        // One deserialize per line: a log frame (`{"log":"…"}`) and a response frame
+        // (`{"kind":…}`) are structurally disjoint, so an untagged enum picks the right one.
+        match serde_json::from_str::<Frame>(trimmed)
+            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?
         {
-            if let Some(serde_json::Value::String(text)) = map.get("log") {
-                eprintln!("{text}");
-                continue;
-            }
+            Frame::Log { log } => eprintln!("{log}"),
+            Frame::Response(response) => return Ok(response),
         }
-        return serde_json::from_str::<super::PrivilegedResponse>(trimmed)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)));
+    }
+}
+
+/// One newline-delimited reply frame: either a streamed log line or the final response.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Frame {
+    Log { log: String },
+    Response(super::PrivilegedResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::PrivilegedResponse;
+    use super::{read_framed_response, Frame};
+    use std::io::Cursor;
+
+    fn reader(s: &str) -> Cursor<Vec<u8>> {
+        Cursor::new(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn reads_lone_response_frame() {
+        // Backward compatible: a server that sends only a response (no logs) still works.
+        let mut r = reader("{\"kind\":\"unit\"}\n");
+        assert!(matches!(
+            read_framed_response(&mut r).unwrap(),
+            PrivilegedResponse::Unit
+        ));
+    }
+
+    #[test]
+    fn skips_log_frames_then_returns_response() {
+        let input =
+            "{\"log\":\"first\"}\n{\"log\":\"second\"}\n{\"kind\":\"bool\",\"value\":true}\n";
+        let mut r = reader(input);
+        assert!(matches!(
+            read_framed_response(&mut r).unwrap(),
+            PrivilegedResponse::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn log_and_response_frames_are_disjoint() {
+        // The response frame must not be misread as a log frame, and vice versa.
+        let log: Frame = serde_json::from_str("{\"log\":\"hi\"}").unwrap();
+        assert!(matches!(log, Frame::Log { .. }));
+        let resp: Frame = serde_json::from_str("{\"kind\":\"unit\"}").unwrap();
+        assert!(matches!(resp, Frame::Response(PrivilegedResponse::Unit)));
+    }
+
+    #[test]
+    fn errors_when_closed_before_response() {
+        let mut r = reader("{\"log\":\"only a log\"}\n");
+        assert!(read_framed_response(&mut r).is_err());
     }
 }

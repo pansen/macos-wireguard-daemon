@@ -25,6 +25,10 @@ use managed_pids::{cleanup_stale_managed_pid_registry_entries, ensure_managed_pi
 
 const AUTH_GROUP_NAME: &str = "tunmux";
 
+/// Cap on bytes read from the helper log tail when finishing a capture, so a
+/// runaway/verbose helper log can't be slurped wholesale into the daemon's memory.
+const MAX_HELPER_TAIL_BYTES: usize = 256 * 1024;
+
 struct ControlState {
     leases: HashSet<String>,
     allow_shutdown: bool,
@@ -432,21 +436,64 @@ fn finish_gotatun_capture(capture: Option<(std::path::PathBuf, u64)>) -> Vec<Str
     merge_log_lines(service_lines, helper_lines)
 }
 
-/// Read a log file from `offset` to its end, returned as lines. Offsets are recorded at line
-/// boundaries (logs end with a newline), so no partial line is produced.
+/// Read a log file from `offset` to its end, returned as lines. The offset may land mid-line or
+/// even mid-UTF-8-codepoint (it can be derived from a raw `metadata.len()`), so the bytes are
+/// split on `\n` and decoded lossily -- a single bad byte can't discard the whole tail. A leading
+/// partial line is dropped only when `offset` is verified to fall inside a line. The read is capped
+/// at [`MAX_HELPER_TAIL_BYTES`]; past the cap a `(truncated)` marker is appended.
 fn read_log_tail(path: &std::path::Path, offset: u64) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    if offset > 0 && file.seek(SeekFrom::Start(offset)).is_err() {
+
+    // Peek at the byte just before `offset`: if it isn't a newline, `offset` sits inside a line and
+    // the first chunk we read is a partial line to be discarded. If it is a newline (or offset==0)
+    // the first chunk is a whole line and must be kept.
+    let starts_mid_line = match offset.checked_sub(1) {
+        Some(prev_offset) => {
+            if file.seek(SeekFrom::Start(prev_offset)).is_err() {
+                return Vec::new();
+            }
+            let mut prev = [0u8; 1];
+            file.read_exact(&mut prev).is_ok() && prev[0] != b'\n'
+        }
+        None => false,
+    };
+
+    if file.seek(SeekFrom::Start(offset)).is_err() {
         return Vec::new();
     }
-    let mut contents = String::new();
-    if file.read_to_string(&mut contents).is_err() {
+
+    // Read at most the cap (+1 byte to detect overflow) so the whole file can't be pulled in.
+    let mut buffer = Vec::new();
+    if Read::by_ref(&mut file)
+        .take(MAX_HELPER_TAIL_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
         return Vec::new();
     }
-    contents.lines().map(str::to_string).collect()
+    let truncated = buffer.len() > MAX_HELPER_TAIL_BYTES;
+    if truncated {
+        buffer.truncate(MAX_HELPER_TAIL_BYTES);
+    }
+
+    let mut lines: Vec<String> = buffer
+        .split(|&byte| byte == b'\n')
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    // `split` yields a trailing empty element after the file's final newline.
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    if starts_mid_line && !lines.is_empty() {
+        lines.remove(0);
+    }
+    if truncated {
+        lines.push("(helper log tail truncated)".to_string());
+    }
+    lines
 }
 
 /// Merge service and helper log lines, ordered by their leading timestamp. The timestamp is a
@@ -831,5 +878,53 @@ mod protocol_tests {
         assert_eq!(leading_timestamp(""), None);
         // Right length but not a timestamp (no trailing Z).
         assert_eq!(leading_timestamp("abcdefghijklmnopqrst rest"), None);
+    }
+
+    fn temp_log_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tunmux-tail-{}-{}.log", tag, std::process::id()))
+    }
+
+    #[test]
+    fn read_log_tail_keeps_whole_lines_from_boundary_offset() {
+        let path = temp_log_path("boundary");
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+        assert_eq!(
+            read_log_tail(&path, 0),
+            vec!["line one", "line two", "line three"]
+        );
+        // Offset 9 is the boundary right after "line one\n"; whole lines are kept.
+        assert_eq!(read_log_tail(&path, 9), vec!["line two", "line three"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_log_tail_drops_leading_partial_line() {
+        let path = temp_log_path("partial");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+        // Offset 3 lands inside "line one"; the partial prefix is discarded.
+        assert_eq!(read_log_tail(&path, 3), vec!["line two"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_log_tail_decodes_invalid_utf8_lossily() {
+        let path = temp_log_path("utf8");
+        // A lone 0xFF byte is invalid UTF-8; the surrounding lines must still survive.
+        std::fs::write(&path, b"good\n\xFFbad\n").unwrap();
+        let lines = read_log_tail(&path, 0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "good");
+        assert!(lines[1].contains("bad"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_log_tail_caps_oversize_input_with_marker() {
+        let path = temp_log_path("truncate");
+        let big = "x".repeat(MAX_HELPER_TAIL_BYTES + 1024);
+        std::fs::write(&path, format!("{big}\n")).unwrap();
+        let lines = read_log_tail(&path, 0);
+        assert_eq!(lines.last().unwrap(), "(helper log tail truncated)");
+        let _ = std::fs::remove_file(&path);
     }
 }
