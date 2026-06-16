@@ -352,10 +352,7 @@ pub fn validate_namespace_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_interface_name(interface: &str) -> Result<(), String> {
-    if matches!(
-        interface,
-        "proton0" | "airvpn0" | "mullvad0" | "ivpn0" | "wgconf0"
-    ) {
+    if interface == "wgconf0" {
         return Ok(());
     }
     // On macOS, WireGuard TUN interfaces are named utunN (kernel-assigned).
@@ -369,10 +366,7 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
         }
     }
     if !interface.starts_with("wg-") {
-        return Err(
-            "interface must be proton0, airvpn0, mullvad0, ivpn0, wgconf0, utun, utunN, or wg-*"
-                .into(),
-        );
+        return Err("interface must be wgconf0, utun, utunN, or wg-*".into());
     }
     let suffix = &interface["wg-".len()..];
     if suffix.is_empty() || suffix.len() > 12 {
@@ -403,13 +397,10 @@ fn validate_host_interface_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_provider(provider: &str) -> Result<(), String> {
-    if matches!(
-        provider,
-        "proton" | "airvpn" | "mullvad" | "ivpn" | "wgconf"
-    ) {
+    if provider == "wgconf" {
         Ok(())
     } else {
-        Err("provider must be proton, airvpn, mullvad, ivpn or wgconf".into())
+        Err("provider must be wgconf".into())
     }
 }
 
@@ -607,9 +598,7 @@ mod tests {
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
-        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0", "wgconf0"] {
-            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
-        }
+        assert!(validate_interface_name("wgconf0").is_ok());
     }
 
     #[test]
@@ -628,9 +617,8 @@ mod tests {
 
     #[test]
     fn known_providers_are_allowed() {
-        for provider in ["proton", "airvpn", "mullvad", "ivpn", "wgconf"] {
-            assert!(validate_provider(provider).is_ok(), "provider {}", provider);
-        }
+        assert!(validate_provider("wgconf").is_ok());
+        assert!(validate_provider("proton").is_err());
     }
 
     #[test]
@@ -641,13 +629,13 @@ mod tests {
     #[test]
     fn resolved_dns_request_validates_ip_entries() {
         let ok = PrivilegedRequest::HostResolvedSetDns {
-            interface: "proton0".to_string(),
+            interface: "wgconf0".to_string(),
             dns_servers: vec!["10.2.0.1".to_string(), "2606:4700:4700::1111".to_string()],
         };
         assert!(ok.validate().is_ok());
 
         let bad = PrivilegedRequest::HostResolvedSetDns {
-            interface: "proton0".to_string(),
+            interface: "wgconf0".to_string(),
             dns_servers: vec!["not-an-ip".to_string()],
         };
         assert!(bad.validate().is_err());

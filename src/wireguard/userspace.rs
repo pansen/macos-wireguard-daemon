@@ -7,14 +7,6 @@ use tracing::info;
 use super::handshake;
 
 /// Bring up a WireGuard tunnel using the embedded gotatun userspace backend.
-pub fn up(
-    config_content: &str,
-    interface_name: &str,
-    provider: config::Provider,
-) -> Result<String> {
-    up_with_mtu(config_content, interface_name, provider, None)
-}
-
 pub fn up_with_mtu(
     config_content: &str,
     interface_name: &str,

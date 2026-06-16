@@ -1,19 +1,10 @@
+.DS_Store
+/var
+
 # Rust
 /target
 .cargo/
-/var
-
-# Android Rust library
-android/rust-lib/target
-
-# Gradle
-android/.gradle
-android/build
-android/app/build
-android/local.properties
-android/gradle/wrapper/gradle-wrapper.jar
-android/gradlew
-android/gradlew.bat
+/.idea
 
 # Nix
 .data
@@ -29,7 +20,7 @@ __pycache__/
 *.pyd
 .Python
 env/
-venv/ 
+venv/
 
 # Direnv
 .envrc

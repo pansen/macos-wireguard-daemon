@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::unistd::Uid;
-#[cfg(not(target_os = "android"))]
 use nix::unistd::{Gid, Group};
 use tracing::debug;
 
@@ -63,7 +62,6 @@ pub(crate) fn resolve_client_authorized_group(configured_group: &str) -> String 
     current_user_primary_group_name().unwrap_or_else(|| FALLBACK_AUTH_GROUP.to_string())
 }
 
-#[cfg(not(target_os = "android"))]
 pub(crate) fn current_user_primary_group_name() -> Option<String> {
     Group::from_gid(Gid::current())
         .ok()
@@ -76,11 +74,6 @@ pub(crate) fn current_user_primary_group_name() -> Option<String> {
                 Some(name)
             }
         })
-}
-
-#[cfg(target_os = "android")]
-pub(crate) fn current_user_primary_group_name() -> Option<String> {
-    None
 }
 
 pub(crate) fn startup_lock_dir() -> PathBuf {

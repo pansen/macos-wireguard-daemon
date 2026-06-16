@@ -2303,8 +2303,7 @@ fn parse_scutil_primary_interface(text: &str) -> Option<String> {
 /// `networksetup -listnetworkserviceorder`.
 #[cfg(target_os = "macos")]
 fn macos_service_name_for_device(device: &str) -> Option<String> {
-    let output =
-        run_command_capture_output("networksetup", &["-listnetworkserviceorder"]).ok()?;
+    let output = run_command_capture_output("networksetup", &["-listnetworkserviceorder"]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2674,10 +2673,7 @@ mod tests {
 
     // --- DNS reconciler ---
 
-    fn dns_fp(
-        primary: Option<&str>,
-        observed: &[(&str, Option<&[&str]>)],
-    ) -> MacosDnsFingerprint {
+    fn dns_fp(primary: Option<&str>, observed: &[(&str, Option<&[&str]>)]) -> MacosDnsFingerprint {
         let observed: Vec<(String, Option<Vec<String>>)> = observed
             .iter()
             .map(|(svc, dns)| {
@@ -2701,7 +2697,10 @@ mod tests {
     fn dns_target_services_honours_policy_and_falls_back() {
         let fp = dns_fp(
             Some("Wi-Fi"),
-            &[("Ethernet", Some(&["1.1.1.1"])), ("Wi-Fi", Some(&["1.1.1.1"]))],
+            &[
+                ("Ethernet", Some(&["1.1.1.1"])),
+                ("Wi-Fi", Some(&["1.1.1.1"])),
+            ],
         );
 
         // AllServices targets every service.
@@ -2772,8 +2771,8 @@ mod tests {
         let fp = dns_fp(
             Some("Wi-Fi"),
             &[
-                ("Wi-Fi", Some(&["100.64.0.1"])),  // owned, already tunnel
-                ("Tether", Some(&["10.0.0.1"])),   // new service with native DNS
+                ("Wi-Fi", Some(&["100.64.0.1"])), // owned, already tunnel
+                ("Tether", Some(&["10.0.0.1"])),  // new service with native DNS
             ],
         );
         let targets = dns_target_services(DnsPolicy::AllServices, &fp);
@@ -2836,7 +2835,10 @@ mod tests {
             parse_scutil_primary_interface(output).as_deref(),
             Some("en0")
         );
-        assert_eq!(parse_scutil_primary_interface("No such key").as_deref(), None);
+        assert_eq!(
+            parse_scutil_primary_interface("No such key").as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -2877,7 +2879,10 @@ An asterisk (*) denotes that a network service is disabled.
             parse_device_from_hw_line(" Wi-Fi, Device: en0)").as_deref(),
             Some("en0")
         );
-        assert_eq!(parse_device_from_hw_line(" VPN (Cisco IPSec), Device: )"), None);
+        assert_eq!(
+            parse_device_from_hw_line(" VPN (Cisco IPSec), Device: )"),
+            None
+        );
         assert_eq!(parse_device_from_hw_line(" no device field here)"), None);
     }
 }

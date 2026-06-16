@@ -120,22 +120,15 @@ impl ConnectionState {
     /// interface and control socket no longer exist after boot).
     #[must_use]
     pub fn is_live(&self) -> bool {
-        #[cfg(not(target_os = "android"))]
-        {
-            use super::{userspace, wg_quick};
-            match self.backend {
-                WgBackend::Userspace => userspace::is_interface_active(&self.interface_name),
-                // Kernel and wg-quick both back a named interface (Linux) or a
-                // kernel-assigned utunN (macOS); the same probe applies.
-                WgBackend::WgQuick | WgBackend::Kernel => {
-                    wg_quick::is_interface_active(&self.interface_name)
-                }
-                WgBackend::LocalProxy => self.proxy_pid.is_some_and(crate::local_proxy::proc_alive),
+        use super::{userspace, wg_quick};
+        match self.backend {
+            WgBackend::Userspace => userspace::is_interface_active(&self.interface_name),
+            // Kernel and wg-quick both back a named interface (Linux) or a
+            // kernel-assigned utunN (macOS); the same probe applies.
+            WgBackend::WgQuick | WgBackend::Kernel => {
+                wg_quick::is_interface_active(&self.interface_name)
             }
-        }
-        #[cfg(target_os = "android")]
-        {
-            self.proxy_pid.is_some_and(crate::local_proxy::proc_alive)
+            WgBackend::LocalProxy => self.proxy_pid.is_some_and(crate::local_proxy::proc_alive),
         }
     }
 }
@@ -171,7 +164,6 @@ mod tests {
 
     // The reboot bug: a saved userspace tunnel whose control socket no longer
     // exists must be reported as not live (so the stale state gets pruned).
-    #[cfg(not(target_os = "android"))]
     #[test]
     fn userspace_state_with_missing_interface_is_not_live() {
         let state = sample(

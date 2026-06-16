@@ -929,8 +929,8 @@ mod tests {
     fn debug_env_contains_core_fields() {
         let state = ConnectionState {
             instance_name: "test-instance".to_string(),
-            provider: "proton".to_string(),
-            interface_name: "proton0".to_string(),
+            provider: "wgconf".to_string(),
+            interface_name: "wgconf0".to_string(),
             backend: WgBackend::Kernel,
             server_endpoint: "1.2.3.4:51820".to_string(),
             server_display_name: "US#1".to_string(),
@@ -949,8 +949,8 @@ mod tests {
             source_path: None,
         };
 
-        let ifup = super::debug_ifup_env(Provider::Proton, &state);
-        let ifdown = super::debug_ifdown_env(Provider::Proton, &state);
+        let ifup = super::debug_ifup_env(Provider::Wgconf, &state);
+        let ifdown = super::debug_ifdown_env(Provider::Wgconf, &state);
 
         assert!(ifup
             .iter()
@@ -960,7 +960,7 @@ mod tests {
             .any(|(k, v)| k == "TUNMUX_HOOK_EVENT" && v == "ifdown"));
         assert!(ifup
             .iter()
-            .any(|(k, v)| k == "TUNMUX_PROVIDER" && v == "proton"));
+            .any(|(k, v)| k == "TUNMUX_PROVIDER" && v == "wgconf"));
         assert!(ifup
             .iter()
             .any(|(k, v)| k == "TUNMUX_INSTANCE" && v == "test-instance"));
@@ -979,8 +979,8 @@ mod tests {
     fn hook_runtime_prefers_http_proxy_for_requests() {
         let state = ConnectionState {
             instance_name: "test-instance".to_string(),
-            provider: "proton".to_string(),
-            interface_name: "proton0".to_string(),
+            provider: "wgconf".to_string(),
+            interface_name: "wgconf0".to_string(),
             backend: WgBackend::Kernel,
             server_endpoint: "1.2.3.4:51820".to_string(),
             server_display_name: "US#1".to_string(),

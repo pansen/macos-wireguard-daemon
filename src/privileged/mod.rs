@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-#[cfg(not(target_os = "android"))]
 use nix::unistd::Group;
 use nix::unistd::{chown, Gid};
 use tracing::{debug, info, warn};
@@ -90,9 +89,13 @@ pub fn serve(
 
     let activated = {
         #[cfg(target_os = "macos")]
-        { launchd_activated_listener()? }
+        {
+            launchd_activated_listener()?
+        }
         #[cfg(not(target_os = "macos"))]
-        { systemd_activated_listener()? }
+        {
+            systemd_activated_listener()?
+        }
     };
 
     let listener = match activated {
@@ -393,8 +396,7 @@ fn handle_client(
         }
     };
 
-    let (logs, response) =
-        process_request_payload(&payload, control_state, Some((peer.0, peer.1)));
+    let (logs, response) = process_request_payload(&payload, control_state, Some((peer.0, peer.1)));
     ClientReadResult::Response { logs, response }
 }
 
@@ -672,17 +674,11 @@ fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -
     false
 }
 
-#[cfg(not(target_os = "android"))]
 fn read_group_gid(group_name: &str) -> Option<u32> {
     Group::from_name(group_name)
         .ok()
         .flatten()
         .map(|g| g.gid.as_raw())
-}
-
-#[cfg(target_os = "android")]
-fn read_group_gid(_group_name: &str) -> Option<u32> {
-    None
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -869,7 +865,11 @@ mod protocol_tests {
 
     #[test]
     fn encodes_logs_in_order_before_response() {
-        let logs = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let logs = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
         let response = PrivilegedResponse::Bool(true);
         let bytes = encode_response_frames(&logs, &response).unwrap();
         let frames = parse_frames(&bytes);
@@ -929,7 +929,10 @@ mod protocol_tests {
     fn merge_falls_back_to_insertion_order_for_untimestamped_lines() {
         // Lines without a parseable timestamp must not be reordered against each
         // other (no fixed-width slice of arbitrary text decides their order).
-        let service = vec!["no timestamp here".to_string(), "another bare line".to_string()];
+        let service = vec![
+            "no timestamp here".to_string(),
+            "another bare line".to_string(),
+        ];
         let helper = vec!["also untimestamped".to_string()];
         let merged = merge_log_lines(service.clone(), helper.clone());
         assert_eq!(merged, [service, helper].concat());

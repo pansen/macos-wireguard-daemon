@@ -188,14 +188,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_instance_name_proton() {
+    fn test_instance_name_with_hash_suffix() {
         assert_eq!(instance_name("US#1"), "us-1");
         assert_eq!(instance_name("CH#53"), "ch-53");
         assert_eq!(instance_name("US-FREE#7"), "us-free-7");
     }
 
     #[test]
-    fn test_instance_name_airvpn() {
+    fn test_instance_name_plain_words() {
         assert_eq!(instance_name("Castor"), "castor");
         assert_eq!(instance_name("Vega"), "vega");
     }

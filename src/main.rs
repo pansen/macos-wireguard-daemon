@@ -1,11 +1,8 @@
-mod airvpn;
 mod cli;
 mod config;
 mod error;
-mod ivpn;
 mod local_proxy;
 mod logging;
-mod mullvad;
 #[cfg(target_os = "linux")]
 mod netns;
 #[cfg(not(target_os = "linux"))]
@@ -14,7 +11,6 @@ mod netns;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
-mod proton;
 #[cfg(all(feature = "proxy", target_os = "linux"))]
 #[path = "proxy/mod.rs"]
 mod proxy;
@@ -154,10 +150,6 @@ fn init_logging(verbose: bool) {
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match command {
-        TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
-        TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
-        TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
-        TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
         TopCommand::Wgconf { command } => wgconf::handlers::dispatch(command, &config).await,
         TopCommand::Connect { provider } => run_connect(provider, &config).await,
         TopCommand::Disconnect {
@@ -306,18 +298,6 @@ async fn run_connect(
     config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
-        ConnectProviderCommand::Proton(args) => {
-            proton::handlers::dispatch(cli::ProtonCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Airvpn(args) => {
-            airvpn::handlers::dispatch(cli::AirVpnCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Mullvad(args) => {
-            mullvad::handlers::dispatch(cli::MullvadCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Ivpn(args) => {
-            ivpn::handlers::dispatch(cli::IvpnCommand::Connect(args), config).await
-        }
         ConnectProviderCommand::Wgconf(args) => {
             wgconf::handlers::dispatch(cli::WgconfCommand::Connect(args), config).await
         }
@@ -426,21 +406,6 @@ async fn dispatch_provider_disconnect(
     config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
-        ProviderArg::Proton => {
-            proton::handlers::dispatch(cli::ProtonCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::AirVpn => {
-            airvpn::handlers::dispatch(cli::AirVpnCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Mullvad => {
-            mullvad::handlers::dispatch(cli::MullvadCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Ivpn => {
-            ivpn::handlers::dispatch(cli::IvpnCommand::Disconnect { instance, all }, config).await
-        }
         ProviderArg::Wgconf => {
             wgconf::handlers::dispatch(cli::WgconfCommand::Disconnect { instance, all }, config)
                 .await

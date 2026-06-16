@@ -19,7 +19,6 @@ path = "src/main.rs"
 [features]
 default = ["proxy"]
 proxy = []
-keyring = ["dep:keyring"]
 
 [dependencies]
 # CLI
@@ -28,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 
-# HTTP
+# HTTP (hook helpers: connectivity / external-ip checks)
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies", "blocking"], default-features = false }
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 
@@ -45,17 +44,7 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 time = { version = "0.3", features = ["macros"] }
 
-# Crypto - SRP
-num-bigint = { version = "0.4", features = ["rand"] }
-num-traits = "0.2"
-num-integer = "0.1"
-sha2 = "0.10"
-bcrypt = "0.16"
-hmac = "0.12"
-
-# Crypto - Keys
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-curve25519-dalek = "4"
+# Randomness (hook instance suffixes)
 rand = "0.8"
 
 # Encoding
@@ -63,28 +52,9 @@ base64 = "0.22"
 bytes = "1"
 crossbeam-queue = "0.3"
 
-# Crypto - AirVPN API
-rsa = { version = "0.9", features = ["std"] }
-aes = "0.8"
-cbc = "0.1"
-
-# HTML parsing
-scraper = "0.22"
-
-# Cookie persistence
-reqwest_cookie_store = "0.8"
-cookie = "0.18"
-
-# XML parsing
-roxmltree = "0.20"
-x509-parser = "0.16"
-
 # Error handling
 thiserror = "2"
 anyhow = "1"
-
-# Keyring (optional)
-keyring = { version = "3", optional = true }
 
 # Userspace WireGuard crypto + virtual TCP/IP stack for local-proxy mode
 boringtun = "0.7"
@@ -97,14 +67,11 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "alloc",
 ] }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
-# Password input (terminal only)
-rpassword = "7"
-
+[target.'cfg(unix)'.dependencies]
 # Linux namespaces
 nix = { version = "0.29", features = ["sched", "net", "fs", "signal", "process", "user", "mount"] }
 
-# Daemonization and userspace WireGuard (unix, non-Android)
+# Daemonization and userspace WireGuard
 daemonize = "0.5"
 gotatun = { version = "0.7.1", features = ["device", "tun"] }
 
