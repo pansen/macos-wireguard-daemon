@@ -76,24 +76,6 @@ pub enum TopCommand {
         startup_status_file: String,
     },
 
-    /// Internal: userspace WireGuard local-proxy daemon (hidden)
-    #[command(hide = true)]
-    LocalProxyDaemon {
-        #[arg(long)]
-        socks_port: u16,
-        #[arg(long)]
-        http_port: u16,
-        #[arg(long)]
-        proxy_access_log: bool,
-        #[arg(long)]
-        pid_file: String,
-        #[arg(long)]
-        log_file: String,
-        /// base64(JSON(LocalProxyConfig))
-        #[arg(long)]
-        config_b64: String,
-    },
-
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
     Privileged {
@@ -182,12 +164,8 @@ pub struct WgconfConnectArgs {
     pub backend: Option<String>,
 
     /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long, conflicts_with = "local_proxy")]
+    #[arg(long)]
     pub proxy: bool,
-
-    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-    #[arg(long, conflicts_with = "proxy")]
-    pub local_proxy: bool,
 
     /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
     #[arg(long)]
@@ -368,20 +346,6 @@ mod tests {
             } => assert_eq!(args.mtu, Some(1360)),
             _ => panic!("expected wgconf connect provider"),
         }
-    }
-
-    #[test]
-    fn parse_connect_proxy_flags_are_mutually_exclusive() {
-        let parsed = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/test.conf",
-            "--proxy",
-            "--local-proxy",
-        ]);
-        assert!(parsed.is_err(), "expected conflict parse error for wgconf");
     }
 
     #[test]

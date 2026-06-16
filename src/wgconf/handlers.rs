@@ -54,20 +54,10 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         args.backend.as_deref(),
         &config.general.backend,
         args.proxy,
-        args.local_proxy,
     )?;
-    connection_ops::validate_disable_ipv6_direct_kernel(
-        args.disable_ipv6,
-        args.proxy,
-        args.local_proxy,
-        backend,
-    )?;
-    if args.mtu.is_some() && args.local_proxy {
-        anyhow::bail!("--mtu is not supported with --local-proxy");
-    }
+    connection_ops::validate_disable_ipv6_direct_kernel(args.disable_ipv6, args.proxy, backend)?;
     if args.mtu.is_some()
         && !args.proxy
-        && !args.local_proxy
         && !matches!(
             backend,
             wireguard::backend::WgBackend::Kernel | wireguard::backend::WgBackend::Userspace
@@ -78,7 +68,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if let Some(mtu) = args.mtu {
         wireguard::config::validate_mtu(mtu)?;
     }
-    if args.if_missing && (args.proxy || args.local_proxy) {
+    if args.if_missing && args.proxy {
         anyhow::bail!("--if-missing is only supported for direct mode");
     }
 
@@ -89,8 +79,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         println!("Saved profile {}", save_as);
     }
 
-    let needs_routed_parse =
-        args.proxy || args.local_proxy || backend == wireguard::backend::WgBackend::Kernel;
+    let needs_routed_parse = args.proxy || backend == wireguard::backend::WgBackend::Kernel;
     let routed = if needs_routed_parse {
         Some(parse_routed_config(&source.config_text)?)
     } else {
@@ -113,11 +102,6 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
         connect_proxy(&source, routed, args.mtu, config)?;
-    } else if args.local_proxy {
-        let routed = routed
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_local_proxy(&source, routed, config)?;
     } else {
         connect_direct(
             &source,
@@ -267,10 +251,6 @@ fn connect_direct(
                 socks_port: None,
                 http_port: None,
                 dns_servers: state_dns_servers.clone(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
                 source_path: source.source_path.clone(),
             };
             state.save()?;
@@ -297,10 +277,6 @@ fn connect_direct(
                 socks_port: None,
                 http_port: None,
                 dns_servers: state_dns_servers.clone(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
                 source_path: source.source_path.clone(),
             };
             state.save()?;
@@ -346,9 +322,6 @@ fn connect_direct(
                     state.save()?;
                 }
             }
-        }
-        wireguard::backend::WgBackend::LocalProxy => {
-            anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
     }
 
@@ -400,50 +373,6 @@ fn connect_proxy(
         connect_endpoint: &endpoint,
         state_endpoint: &endpoint,
         dns_servers: routed.dns_servers.clone(),
-        params: &params,
-        proxy_config: &proxy_config,
-        config,
-    })
-}
-
-fn connect_local_proxy(
-    source: &ConfigSource,
-    routed: &RoutedConfig,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
-    let instance = connection_ops::derive_instance_name(
-        &source.instance_seed,
-        "source",
-        &source.display_name,
-    )?;
-    connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
-
-    let proxy_config =
-        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
-
-    let (addresses, dns_servers) = routed_param_refs(routed);
-    let params = wireguard::config::WgConfigParams {
-        private_key: &routed.private_key,
-        addresses: &addresses,
-        dns_servers: &dns_servers,
-        mtu: None,
-        server_public_key: &routed.server_public_key,
-        server_ip: &routed.server_ip,
-        server_port: routed.server_port,
-        preshared_key: routed.preshared_key.as_deref(),
-        allowed_ips: &routed.allowed_ips,
-    };
-
-    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_local_proxy_instance(&connection_ops::LocalProxyContext {
-        provider: PROVIDER,
-        instance: &instance,
-        display_name: &source.display_name,
-        connect_endpoint: &endpoint,
-        state_endpoint: &endpoint,
-        dns_servers: routed.dns_servers.clone(),
-        virtual_ips: routed.addresses.clone(),
-        peer_public_key: &routed.server_public_key,
         params: &params,
         proxy_config: &proxy_config,
         config,
@@ -507,7 +436,7 @@ fn canonicalize_source(path: &Path) -> Option<String> {
 
 fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     let parsed = wireguard::config::parse_config(config_text)
-        .context("invalid WireGuard configuration for kernel/proxy/local-proxy path")?;
+        .context("invalid WireGuard configuration for kernel/proxy path")?;
 
     if parsed.private_key.trim().is_empty() {
         anyhow::bail!("Interface.PrivateKey must not be empty");
@@ -517,7 +446,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     }
     if parsed.dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy/local-proxy mode (direct wg-quick/userspace can use as-is config)"
+            "Interface.DNS is required for kernel/proxy mode (direct wg-quick/userspace can use as-is config)"
         );
     }
 
@@ -539,7 +468,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
         .collect();
     if dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy/local-proxy mode (direct wg-quick/userspace can use as-is config)"
+            "Interface.DNS is required for kernel/proxy mode (direct wg-quick/userspace can use as-is config)"
         );
     }
 

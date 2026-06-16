@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use crate::config::{AppConfig, Provider};
-use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
 use crate::shared::hooks;
@@ -27,13 +26,8 @@ pub fn resolve_connect_backend(
     backend_arg: Option<&str>,
     default_backend: &str,
     use_proxy: bool,
-    use_local_proxy: bool,
 ) -> anyhow::Result<WgBackend> {
     let backend_str = backend_arg.unwrap_or(default_backend);
-
-    if use_proxy && use_local_proxy {
-        anyhow::bail!("--proxy and --local-proxy are mutually exclusive");
-    }
 
     #[cfg(not(target_os = "linux"))]
     if use_proxy {
@@ -57,13 +51,10 @@ pub fn resolve_connect_backend(
 pub fn validate_disable_ipv6_direct_kernel(
     disable_ipv6: bool,
     use_proxy: bool,
-    use_local_proxy: bool,
     backend: WgBackend,
 ) -> anyhow::Result<()> {
-    if disable_ipv6 && (use_proxy || use_local_proxy || backend != WgBackend::Kernel) {
-        anyhow::bail!(
-            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
-        );
+    if disable_ipv6 && (use_proxy || backend != WgBackend::Kernel) {
+        anyhow::bail!("--disable-ipv6 is supported only for direct kernel mode (no --proxy)");
     }
 
     Ok(())
@@ -155,12 +146,6 @@ pub fn disconnect_one_provider_connection(
     config: &AppConfig,
     remove_namespace_dir_if_exists: bool,
 ) -> anyhow::Result<()> {
-    if state.backend == WgBackend::LocalProxy {
-        local_proxy::disconnect(state, &state.instance_name)?;
-        hooks::run_ifdown(config, provider, state);
-        return Ok(());
-    }
-
     if let Some(pid) = state.proxy_pid {
         proxy::stop_daemon(pid)?;
     }
@@ -189,7 +174,6 @@ pub fn disconnect_one_provider_connection(
             WgBackend::Kernel => wireguard::kernel::down(state),
             WgBackend::WgQuick => wireguard::wg_quick::down(&state.interface_name, provider),
             WgBackend::Userspace => wireguard::userspace::down(&state.interface_name, provider),
-            WgBackend::LocalProxy => unreachable!(),
         };
         if let Err(error) = teardown {
             // A failed teardown shouldn't strand the state file and wedge future
@@ -397,81 +381,6 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
         dns_servers: dns_servers.clone(),
-        peer_public_key: None,
-        local_public_key: None,
-        virtual_ips: vec![],
-        keepalive_secs: None,
-        source_path: None,
-    };
-    state.save()?;
-    hooks::run_ifup(config, provider, &state);
-
-    println!(
-        "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
-        instance, display_name, proxy_config.socks_port, proxy_config.http_port
-    );
-    Ok(())
-}
-
-pub struct LocalProxyContext<'a> {
-    pub provider: Provider,
-    pub instance: &'a str,
-    pub display_name: &'a str,
-    pub connect_endpoint: &'a str,
-    pub state_endpoint: &'a str,
-    pub dns_servers: Vec<String>,
-    pub virtual_ips: Vec<String>,
-    pub peer_public_key: &'a str,
-    pub params: &'a wireguard::config::WgConfigParams<'a>,
-    pub proxy_config: &'a proxy::ProxyConfig,
-    pub config: &'a AppConfig,
-}
-
-pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Result<()> {
-    let LocalProxyContext {
-        provider,
-        instance,
-        display_name,
-        connect_endpoint,
-        state_endpoint,
-        ref dns_servers,
-        ref virtual_ips,
-        peer_public_key,
-        params,
-        proxy_config,
-        config,
-    } = *ctx;
-    let cfg = local_proxy::local_proxy_config_from_params(
-        params,
-        Some(25),
-        proxy_config.socks_port,
-        proxy_config.http_port,
-    )?;
-    let local_public_key = local_proxy::derive_public_key_b64(params.private_key).ok();
-
-    println!("Connecting to {} ({})...", display_name, connect_endpoint);
-
-    let pid = local_proxy::spawn_daemon(instance, &cfg, proxy_config.access_log)?;
-
-    let state = ConnectionState {
-        instance_name: instance.to_string(),
-        provider: provider.dir_name().to_string(),
-        interface_name: String::new(),
-        backend: WgBackend::LocalProxy,
-        server_endpoint: state_endpoint.to_string(),
-        server_display_name: display_name.to_string(),
-        original_gateway_ip: None,
-        original_gateway_iface: None,
-        original_resolv_conf: None,
-        namespace_name: None,
-        proxy_pid: Some(pid),
-        socks_port: Some(proxy_config.socks_port),
-        http_port: Some(proxy_config.http_port),
-        dns_servers: dns_servers.clone(),
-        peer_public_key: Some(peer_public_key.to_string()),
-        local_public_key,
-        virtual_ips: virtual_ips.clone(),
-        keepalive_secs: cfg.keepalive,
         source_path: None,
     };
     state.save()?;

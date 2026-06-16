@@ -81,10 +81,6 @@ pub fn up(
         socks_port: None,
         http_port: None,
         dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: None,
-        local_public_key: None,
-        virtual_ips: vec![],
-        keepalive_secs: None,
         source_path: None,
     };
     state.save()?;
@@ -564,10 +560,6 @@ fn up_macos(
         socks_port: None,
         http_port: None,
         dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: None,
-        local_public_key: None,
-        virtual_ips: vec![],
-        keepalive_secs: None,
         source_path: None,
     };
     state.save()?;

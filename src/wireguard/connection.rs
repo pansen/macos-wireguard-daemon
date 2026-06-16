@@ -29,18 +29,6 @@ pub struct ConnectionState {
     pub http_port: Option<u16>,
     #[serde(default)]
     pub dns_servers: Vec<String>,
-    /// Base64-encoded WireGuard public key of the remote peer (local-proxy mode).
-    #[serde(default)]
-    pub peer_public_key: Option<String>,
-    /// Base64-encoded WireGuard public key of this client (local-proxy mode).
-    #[serde(default)]
-    pub local_public_key: Option<String>,
-    /// Virtual IP/CIDR strings assigned to this client (local-proxy mode).
-    #[serde(default)]
-    pub virtual_ips: Vec<String>,
-    /// WireGuard persistent keepalive interval in seconds (local-proxy mode).
-    #[serde(default)]
-    pub keepalive_secs: Option<u16>,
     /// Canonicalized path of the source `.conf` this tunnel was brought up from
     /// (wgconf direct mode only). Lets a repeat `connect --if-missing` recognize
     /// that the same source is already live and no-op instead of erroring.
@@ -128,7 +116,6 @@ impl ConnectionState {
             WgBackend::WgQuick | WgBackend::Kernel => {
                 wg_quick::is_interface_active(&self.interface_name)
             }
-            WgBackend::LocalProxy => self.proxy_pid.is_some_and(crate::local_proxy::proc_alive),
         }
     }
 }
@@ -154,10 +141,6 @@ mod tests {
             socks_port: None,
             http_port: None,
             dns_servers: vec![],
-            peer_public_key: None,
-            local_public_key: None,
-            virtual_ips: vec![],
-            keepalive_secs: None,
             source_path: None,
         }
     }
@@ -171,12 +154,6 @@ mod tests {
             "__tunmux_nonexistent_test_iface__",
             None,
         );
-        assert!(!state.is_live());
-    }
-
-    #[test]
-    fn local_proxy_state_without_pid_is_not_live() {
-        let state = sample(WgBackend::LocalProxy, "wg0", None);
         assert!(!state.is_live());
     }
 }

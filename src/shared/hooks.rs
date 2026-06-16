@@ -942,10 +942,6 @@ mod tests {
             socks_port: Some(1080),
             http_port: Some(8118),
             dns_servers: vec!["10.2.0.1".to_string()],
-            peer_public_key: None,
-            local_public_key: None,
-            virtual_ips: vec![],
-            keepalive_secs: None,
             source_path: None,
         };
 
@@ -992,10 +988,6 @@ mod tests {
             socks_port: Some(1080),
             http_port: Some(8118),
             dns_servers: vec!["10.2.0.1".to_string()],
-            peer_public_key: None,
-            local_public_key: None,
-            virtual_ips: vec![],
-            keepalive_secs: None,
             source_path: None,
         };
 

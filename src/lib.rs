@@ -21,9 +21,6 @@ pub mod wireguard;
 // Privileged API types (portable serde types only, no unix deps)
 pub mod privileged_api;
 
-// Local-proxy helpers (spawn/stop user-owned daemon, signal handling)
-pub mod local_proxy;
-
 // Network namespaces: real implementation on Linux, stub on other platforms (macOS)
 #[cfg(target_os = "linux")]
 pub mod netns;

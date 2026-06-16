@@ -233,15 +233,6 @@ pub fn ensure_root_log_dir() -> Result<()> {
 /// macOS user-visible log directory: `~/Library/Logs` (what Console.app shows).
 /// Used for user-owned logs (the local proxy); root-owned logs go to
 /// [`root_log_dir`] instead. Callers run as the user, so `HOME` is already theirs.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn macos_user_log_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join("Library/Logs")
-}
-
 /// Log file the gotatun userspace helper writes and the privileged service tails.
 /// Single source of truth shared by the helper (writer) and the service
 /// (clear-at-connect + tail), which must agree on the path.
@@ -293,19 +284,9 @@ pub fn connections_dir() -> PathBuf {
 }
 
 /// User-owned proxy runtime directory: ~/.config/tunmux/proxy/
-/// Used by local-proxy daemon for pid/log files (no root needed).
 #[must_use]
 pub fn user_proxy_dir() -> PathBuf {
     app_config_dir().join("proxy")
-}
-
-pub fn ensure_user_proxy_dir() -> crate::error::Result<()> {
-    let dir = user_proxy_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 pub fn ensure_connections_dir() -> Result<()> {
