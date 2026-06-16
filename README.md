@@ -294,9 +294,7 @@ interface.
 
 Before testing the macOS userspace data plane, disable WireGuard.app On-Demand
 and deactivate matching tunnels. Verify `scutil --nc list` has no connected
-`com.wireguard.macos` entry. A remaining `utun` with MTU 1384 is typically a
-WireGuard.app tunnel rather than tunmux and can invalidate routing or traffic
-tests.
+`com.wireguard.macos` entry. 
 
 ## Linux Namespace Proxy Mode (`--proxy`)
 
