@@ -34,7 +34,7 @@ use gotatun::x25519::{PublicKey, StaticSecret};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 #[cfg(unix)]
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -957,7 +957,7 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
-    debug!(command = %format_command_for_log(name, args), "userspace_helper_command");
+    trace!(command = %format_command_for_log(name, args), "userspace_helper_command");
     Command::new(name)
         .args(args)
         .output()
