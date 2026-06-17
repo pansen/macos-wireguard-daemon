@@ -38,17 +38,11 @@ pub fn up(
 /// On macOS, TUN interfaces must be named `utunN`; the kernel assigns the number automatically.
 /// Any requested name that is not already a `utun*` name is mapped to `"utun"` so that
 /// wg-quick (or the WireGuard network extension) picks the next available slot.
-/// On other platforms the name is returned unchanged.
 fn platform_interface_name(name: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        if name == "utun" || name.starts_with("utun") {
-            return name.to_string();
-        }
-        "utun".to_string()
+    if name == "utun" || name.starts_with("utun") {
+        return name.to_string();
     }
-    #[cfg(not(target_os = "macos"))]
-    name.to_string()
+    "utun".to_string()
 }
 
 /// Bring down the WireGuard interface and remove the config.
@@ -69,29 +63,18 @@ pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
 }
 
 /// Check if a WireGuard interface is currently active.
+///
+/// On macOS the actual interface is named `utunN` (kernel-assigned), so use
+/// `wg show interfaces` to detect any active WireGuard tunnel.
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // On macOS, `ip` is not available and the actual interface is named utunN (kernel-assigned).
-        // Use `wg show interfaces` to detect any active WireGuard tunnel.
-        let _ = interface_name;
-        debug!(cmd = "wg show interfaces", "exec");
-        std::process::Command::new("wg")
-            .args(["show", "interfaces"])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        debug!(cmd = format!("ip link show {}", interface_name), "exec");
-        std::process::Command::new("ip")
-            .args(["link", "show", interface_name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+    let _ = interface_name;
+    debug!(cmd = "wg show interfaces", "exec");
+    std::process::Command::new("wg")
+        .args(["show", "interfaces"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+        .unwrap_or(false)
 }
 
 fn _provider_name(provider: config::Provider) -> &'static str {

@@ -20,13 +20,6 @@ pub struct ConnectionState {
     pub backend: WgBackend,
     pub server_endpoint: String,
     pub server_display_name: String,
-    pub original_gateway_ip: Option<String>,
-    pub original_gateway_iface: Option<String>,
-    pub original_resolv_conf: Option<String>,
-    pub namespace_name: Option<String>,
-    pub proxy_pid: Option<u32>,
-    pub socks_port: Option<u16>,
-    pub http_port: Option<u16>,
     #[serde(default)]
     pub dns_servers: Vec<String>,
     /// Canonicalized path of the source `.conf` this tunnel was brought up from
@@ -94,14 +87,6 @@ impl ConnectionState {
         Ok(())
     }
 
-    /// Check if an instance name is already in use.
-    #[must_use]
-    pub fn exists(instance: &str) -> bool {
-        config::connections_dir()
-            .join(format!("{}.json", instance))
-            .exists()
-    }
-
     /// Best-effort probe of whether this saved connection is still actually
     /// active on the system. Used to tell a real, live tunnel apart from stale
     /// state left behind by a reboot or crash (e.g. a `_direct.json` whose
@@ -125,7 +110,7 @@ mod tests {
     use super::*;
     use crate::wireguard::backend::WgBackend;
 
-    fn sample(backend: WgBackend, interface: &str, proxy_pid: Option<u32>) -> ConnectionState {
+    fn sample(backend: WgBackend, interface: &str) -> ConnectionState {
         ConnectionState {
             instance_name: DIRECT_INSTANCE.to_string(),
             provider: "wgconf".to_string(),
@@ -133,13 +118,6 @@ mod tests {
             backend,
             server_endpoint: "198.51.100.1:51820".to_string(),
             server_display_name: "test".to_string(),
-            original_gateway_ip: None,
-            original_gateway_iface: None,
-            original_resolv_conf: None,
-            namespace_name: None,
-            proxy_pid,
-            socks_port: None,
-            http_port: None,
             dns_servers: vec![],
             source_path: None,
         }
@@ -149,11 +127,7 @@ mod tests {
     // exists must be reported as not live (so the stale state gets pruned).
     #[test]
     fn userspace_state_with_missing_interface_is_not_live() {
-        let state = sample(
-            WgBackend::Userspace,
-            "__tunmux_nonexistent_test_iface__",
-            None,
-        );
+        let state = sample(WgBackend::Userspace, "__tunmux_nonexistent_test_iface__");
         assert!(!state.is_live());
     }
 }

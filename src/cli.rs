@@ -43,7 +43,7 @@ pub enum TopCommand {
         all: bool,
     },
 
-    /// Show active VPN connections and proxy instances
+    /// Show active VPN connections
     Status,
 
     /// Show WireGuard tunnel state for active direct connection(s)
@@ -53,27 +53,6 @@ pub enum TopCommand {
     Hook {
         #[command(subcommand)]
         command: HookCommand,
-    },
-
-    /// Internal: proxy daemon process (hidden)
-    #[command(hide = true)]
-    ProxyDaemon {
-        #[arg(long)]
-        netns: String,
-        #[arg(long)]
-        interface: String,
-        #[arg(long)]
-        socks_port: u16,
-        #[arg(long)]
-        http_port: u16,
-        #[arg(long)]
-        proxy_access_log: bool,
-        #[arg(long)]
-        pid_file: String,
-        #[arg(long)]
-        log_file: String,
-        #[arg(long)]
-        startup_status_file: String,
     },
 
     /// Internal privileged service mode (hidden)
@@ -162,10 +141,6 @@ pub struct WgconfConnectArgs {
     /// WireGuard backend: wg-quick, userspace, kernel
     #[arg(short = 'b', long)]
     pub backend: Option<String>,
-
-    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long)]
-    pub proxy: bool,
 
     /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
     #[arg(long)]

@@ -2,20 +2,9 @@ mod cli;
 mod config;
 mod error;
 mod logging;
-#[cfg(target_os = "linux")]
-mod netns;
-#[cfg(not(target_os = "linux"))]
-#[path = "netns_stub.rs"]
-mod netns;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
-#[cfg(all(feature = "proxy", target_os = "linux"))]
-#[path = "proxy/mod.rs"]
-mod proxy;
-#[cfg(not(all(feature = "proxy", target_os = "linux")))]
-#[path = "proxy_stub.rs"]
-mod proxy;
 mod shared;
 mod userspace_helper;
 mod wgconf;
@@ -65,33 +54,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        // ProxyDaemon runs its own single-threaded runtime and daemonizes.
-        // Do not initialize terminal logging here -- the daemon sets up file logging itself.
-        TopCommand::ProxyDaemon {
-            netns,
-            interface,
-            socks_port,
-            http_port,
-            proxy_access_log,
-            pid_file,
-            log_file,
-            startup_status_file,
-        } => {
-            if let Err(e) = proxy::daemon::run(
-                &netns,
-                &interface,
-                socks_port,
-                http_port,
-                proxy_access_log,
-                &pid_file,
-                &log_file,
-                &startup_status_file,
-            ) {
-                eprintln!("proxy-daemon error: {}", e);
-                std::process::exit(1);
-            }
-        }
-
         // Status and Wg are quick sync commands, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
@@ -140,10 +102,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             all,
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Hook { command } => run_hook_command(command),
-        TopCommand::Status
-        | TopCommand::Wg
-        | TopCommand::ProxyDaemon { .. }
-        | TopCommand::Privileged { .. } => {
+        TopCommand::Status | TopCommand::Wg | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }
@@ -362,13 +321,9 @@ async fn run_disconnect(
         _ => {
             println!("Multiple active connections. Specify which to disconnect:\n");
             for conn in &connections {
-                let ports = match (conn.socks_port, conn.http_port) {
-                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
-                    _ => "-".to_string(),
-                };
                 println!(
-                    "  {:<12} {:<9} {:<24} {}",
-                    conn.instance_name, conn.provider, conn.server_display_name, ports
+                    "  {:<12} {:<9} {}",
+                    conn.instance_name, conn.provider, conn.server_display_name
                 );
             }
             println!("\nUsage: tunmux disconnect <instance>");
@@ -403,10 +358,10 @@ fn cmd_status() -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} HTTP",
-        "Instance", "Provider", "Server", "Exit", "Backend", "SOCKS5"
+        "{:<12} {:<9} {:<10} {:<5} {:<9}",
+        "Instance", "Provider", "Server", "Exit", "Backend"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(50));
 
     for conn in &connections {
         let exit = conn
@@ -418,24 +373,9 @@ fn cmd_status() -> anyhow::Result<()> {
             .filter(|c| c.is_ascii_alphabetic())
             .collect::<String>();
 
-        let socks = conn
-            .socks_port
-            .map(|p| format!("127.0.0.1:{}", p))
-            .unwrap_or_else(|| "-".to_string());
-        let http = conn
-            .http_port
-            .map(|p| format!("127.0.0.1:{}", p))
-            .unwrap_or_else(|| "-".to_string());
-
         println!(
-            "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} {}",
-            conn.instance_name,
-            conn.provider,
-            conn.server_display_name,
-            exit,
-            conn.backend,
-            socks,
-            http,
+            "{:<12} {:<9} {:<10} {:<5} {:<9}",
+            conn.instance_name, conn.provider, conn.server_display_name, exit, conn.backend,
         );
     }
 

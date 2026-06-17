@@ -18,7 +18,6 @@ const PROFILE_DIR: &str = "profiles";
 
 struct ConfigSource {
     display_name: String,
-    instance_seed: String,
     config_text: String,
     /// Canonicalized path of the source `.conf` (both `--file` and `--profile`
     /// resolve to a concrete file). Used as the identity key for `--if-missing`.
@@ -50,14 +49,10 @@ pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Res
 }
 
 fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()> {
-    let backend = connection_ops::resolve_connect_backend(
-        args.backend.as_deref(),
-        &config.general.backend,
-        args.proxy,
-    )?;
-    connection_ops::validate_disable_ipv6_direct_kernel(args.disable_ipv6, args.proxy, backend)?;
+    let backend =
+        connection_ops::resolve_connect_backend(args.backend.as_deref(), &config.general.backend)?;
+    connection_ops::validate_disable_ipv6_direct_kernel(args.disable_ipv6, backend)?;
     if args.mtu.is_some()
-        && !args.proxy
         && !matches!(
             backend,
             wireguard::backend::WgBackend::Kernel | wireguard::backend::WgBackend::Userspace
@@ -68,9 +63,6 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if let Some(mtu) = args.mtu {
         wireguard::config::validate_mtu(mtu)?;
     }
-    if args.if_missing && args.proxy {
-        anyhow::bail!("--if-missing is only supported for direct mode");
-    }
 
     let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
 
@@ -79,7 +71,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         println!("Saved profile {}", save_as);
     }
 
-    let needs_routed_parse = args.proxy || backend == wireguard::backend::WgBackend::Kernel;
+    let needs_routed_parse = backend == wireguard::backend::WgBackend::Kernel;
     let routed = if needs_routed_parse {
         Some(parse_routed_config(&source.config_text)?)
     } else {
@@ -97,22 +89,15 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         }
     }
 
-    if args.proxy {
-        let routed = routed
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_proxy(&source, routed, args.mtu, config)?;
-    } else {
-        connect_direct(
-            &source,
-            backend,
-            routed.as_ref(),
-            args.disable_ipv6,
-            args.mtu,
-            args.if_missing,
-            config,
-        )?;
-    }
+    connect_direct(
+        &source,
+        backend,
+        routed.as_ref(),
+        args.disable_ipv6,
+        args.mtu,
+        args.if_missing,
+        config,
+    )?;
 
     Ok(())
 }
@@ -243,13 +228,6 @@ fn connect_direct(
                 backend,
                 server_endpoint: state_endpoint,
                 server_display_name: source.display_name.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
                 dns_servers: state_dns_servers.clone(),
                 source_path: source.source_path.clone(),
             };
@@ -269,13 +247,6 @@ fn connect_direct(
                 backend,
                 server_endpoint: state_endpoint,
                 server_display_name: source.display_name.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
                 dns_servers: state_dns_servers.clone(),
                 source_path: source.source_path.clone(),
             };
@@ -336,51 +307,8 @@ fn connect_direct(
     Ok(())
 }
 
-fn connect_proxy(
-    source: &ConfigSource,
-    routed: &RoutedConfig,
-    mtu: Option<u16>,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
-    let instance = connection_ops::derive_instance_name(
-        &source.instance_seed,
-        "source",
-        &source.display_name,
-    )?;
-    connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
-
-    let proxy_config =
-        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
-
-    let (addresses, dns_servers) = routed_param_refs(routed);
-    let params = wireguard::config::WgConfigParams {
-        private_key: &routed.private_key,
-        addresses: &addresses,
-        dns_servers: &dns_servers,
-        mtu: mtu.or(routed.mtu),
-        server_public_key: &routed.server_public_key,
-        server_ip: &routed.server_ip,
-        server_port: routed.server_port,
-        preshared_key: routed.preshared_key.as_deref(),
-        allowed_ips: &routed.allowed_ips,
-    };
-
-    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_proxy_via_netns(&connection_ops::ConnectContext {
-        provider: PROVIDER,
-        instance: &instance,
-        display_name: &source.display_name,
-        connect_endpoint: &endpoint,
-        state_endpoint: &endpoint,
-        dns_servers: routed.dns_servers.clone(),
-        params: &params,
-        proxy_config: &proxy_config,
-        config,
-    })
-}
-
 fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
-    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all, config, false)
+    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all, config)
 }
 
 fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<ConfigSource> {
@@ -395,15 +323,8 @@ fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<C
                 .filter(|v| !v.is_empty())
                 .unwrap_or(path)
                 .to_string();
-            let instance_seed = source_path
-                .file_stem()
-                .and_then(|v| v.to_str())
-                .filter(|v| !v.is_empty())
-                .unwrap_or(&file_name)
-                .to_string();
             Ok(ConfigSource {
                 display_name: file_name,
-                instance_seed,
                 config_text,
                 source_path: canonicalize_source(source_path),
             })
@@ -415,7 +336,6 @@ fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<C
             Ok(ConfigSource {
                 display_name: format!("profile:{}", profile_name),
                 source_path: canonicalize_source(&profile_path),
-                instance_seed: profile_name,
                 config_text,
             })
         }

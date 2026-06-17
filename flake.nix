@@ -1,5 +1,5 @@
 {
-  description = "tunmux - WireGuard config-file VPN CLI (Linux/macOS)";
+  description = "tunmux - WireGuard config-file VPN CLI (macOS)";
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-25.11";

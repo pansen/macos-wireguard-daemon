@@ -10,8 +10,6 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::Group;
 use nix::unistd::{chown, Gid};
 use tracing::{debug, info, warn};
@@ -20,7 +18,6 @@ use crate::config;
 use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
 
 use dispatch::dispatch;
-use managed_pids::{cleanup_stale_managed_pid_registry_entries, ensure_managed_pid_registry_dir};
 
 const AUTH_GROUP_NAME: &str = "tunmux";
 
@@ -69,8 +66,6 @@ pub fn serve(
         idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64, "privileged_service_start");
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
-    ensure_managed_pid_registry_dir()?;
-    cleanup_stale_managed_pid_registry_entries()?;
 
     // Resolve group GID for chown of socket dir and file.
     let group_gid = authorized_group
@@ -87,16 +82,7 @@ pub fn serve(
             gid = ?gid, "socket_dir_chowned");
     }
 
-    let activated = {
-        #[cfg(target_os = "macos")]
-        {
-            launchd_activated_listener()?
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            systemd_activated_listener()?
-        }
-    };
+    let activated = launchd_activated_listener()?;
 
     let listener = match activated {
         Some(listener) => {
@@ -200,8 +186,6 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         autostarted = ?cli_autostarted,
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     config::ensure_privileged_runtime_dir()?;
-    ensure_managed_pid_registry_dir()?;
-    cleanup_stale_managed_pid_registry_entries()?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -230,7 +214,6 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
     }
 }
 
-#[cfg(target_os = "macos")]
 extern "C" {
     fn launch_activate_socket(
         name: *const std::ffi::c_char,
@@ -239,11 +222,10 @@ extern "C" {
     ) -> std::ffi::c_int;
 }
 
-/// On macOS, retrieve a launchd socket-activation listener for the `Listeners` socket
+/// Retrieve a launchd socket-activation listener for the `Listeners` socket
 /// declared in the LaunchDaemon plist. Returns `Ok(None)` when this process was not
 /// launched by launchd with that socket (e.g. a sudo-spawned daemon), so the caller
 /// falls through to the self-bind path.
-#[cfg(target_os = "macos")]
 fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
     use nix::libc;
     use std::ffi::CString;
@@ -272,38 +254,6 @@ fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
     unsafe { libc::free(fds as *mut libc::c_void) };
 
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-    Ok(Some(listener))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
-    let Some(listen_pid) = std::env::var("LISTEN_PID").ok() else {
-        return Ok(None);
-    };
-    let listen_pid: u32 = match listen_pid.parse() {
-        Ok(pid) => pid,
-        Err(_) => return Ok(None),
-    };
-    if listen_pid != std::process::id() {
-        return Ok(None);
-    }
-
-    let listen_fds: usize = match std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-    {
-        Some(fds) if fds > 0 => fds,
-        _ => return Ok(None),
-    };
-    let _ = listen_fds;
-
-    // First inherited descriptor starts at fd 3 as defined by socket activation protocol.
-    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-
-    // Prevent reused descriptors by descendants from accidentally consuming this fd.
-    std::env::remove_var("LISTEN_FDS");
-    std::env::remove_var("LISTEN_PID");
-
     Ok(Some(listener))
 }
 
@@ -354,47 +304,10 @@ fn handle_client(
         }
     }
 
-    let peer = {
-        #[cfg(target_os = "linux")]
-        {
-            match getsockopt(&*stream, PeerCredentials) {
-                Ok(peer) => {
-                    let peer_uid = peer.uid();
-                    let peer_gid = peer.gid();
-                    if !is_authorized(peer_uid, peer_gid, authorized_group) {
-                        let message =
-                            format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
-                        warn!(
-                            uid = ?peer_uid,
-                            gid = ?peer_gid, "peer_not_authorized");
-                        return ClientReadResult::Response {
-                            logs: Vec::new(),
-                            response: PrivilegedResponse::Error {
-                                code: "Auth".into(),
-                                message,
-                            },
-                        };
-                    }
-                    (peer_uid, peer_gid)
-                }
-                Err(e) => {
-                    return ClientReadResult::Response {
-                        logs: Vec::new(),
-                        response: PrivilegedResponse::Error {
-                            code: "Auth".into(),
-                            message: format!("SO_PEERCRED failed: {}", e),
-                        },
-                    };
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = authorized_group;
-            (0u32, 0u32)
-        }
-    };
+    // macOS access control is enforced by the socket's group ownership and mode
+    // (0660, chowned to the authorized group), set when the listener is created.
+    let _ = authorized_group;
+    let peer = (0u32, 0u32);
 
     let (logs, response) = process_request_payload(&payload, control_state, Some((peer.0, peer.1)));
     ClientReadResult::Response { logs, response }
@@ -453,16 +366,6 @@ fn process_request_payload(
             PrivilegedResponse::Error {
                 code: "Validation".into(),
                 message: e,
-            },
-        );
-    }
-    if let Err(e) = cleanup_stale_managed_pid_registry_entries() {
-        let logs = finish_gotatun_capture(gotatun_capture);
-        return (
-            logs,
-            PrivilegedResponse::Error {
-                code: "IO".into(),
-                message: format!("managed pid cleanup failed: {}", e),
             },
         );
     }
@@ -595,29 +498,8 @@ fn leading_timestamp(line: &str) -> Option<&str> {
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
     match request {
-        PrivilegedRequest::NamespaceCreate { .. } => "NamespaceCreate",
-        PrivilegedRequest::NamespaceDelete { .. } => "NamespaceDelete",
-        PrivilegedRequest::NamespaceExists { .. } => "NamespaceExists",
-        PrivilegedRequest::InterfaceCreateWireguard { .. } => "InterfaceCreateWireguard",
-        PrivilegedRequest::InterfaceDelete { .. } => "InterfaceDelete",
-        PrivilegedRequest::InterfaceMoveToNetns { .. } => "InterfaceMoveToNetns",
-        PrivilegedRequest::NetnsExec { .. } => "NetnsExec",
-        PrivilegedRequest::HostIpAddrAdd { .. } => "HostIpAddrAdd",
-        PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
-        PrivilegedRequest::HostIpLinkSetMtu { .. } => "HostIpLinkSetMtu",
-        PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
-        PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
-        PrivilegedRequest::HostResolvedSetDns { .. } => "HostResolvedSetDns",
-        PrivilegedRequest::HostResolvedRevertDns { .. } => "HostResolvedRevertDns",
-        PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
-        PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
         PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
         PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
-        PrivilegedRequest::EnsureDir { .. } => "EnsureDir",
-        PrivilegedRequest::WriteFile { .. } => "WriteFile",
-        PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",
-        PrivilegedRequest::KillPid { .. } => "KillPid",
-        PrivilegedRequest::SpawnProxyDaemon { .. } => "SpawnProxyDaemon",
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
@@ -644,202 +526,11 @@ fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
     Some(AUTH_GROUP_NAME.to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -> bool {
-    if peer_uid == 0 {
-        return true;
-    }
-
-    if let Ok(uids) = std::env::var("TUNMUX_PRIVILEGED_UIDS") {
-        let allowed = uids
-            .split(',')
-            .filter_map(|value| value.parse::<u32>().ok())
-            .any(|uid| uid == peer_uid);
-        if allowed {
-            return true;
-        }
-    }
-
-    let allowed_gid = std::env::var("TUNMUX_PRIVILEGED_GID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .or_else(|| authorized_group.and_then(read_group_gid))
-        .or_else(|| read_group_gid(AUTH_GROUP_NAME));
-    if let Some(gid) = allowed_gid {
-        if gid == peer_gid {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn read_group_gid(group_name: &str) -> Option<u32> {
     Group::from_name(group_name)
         .ok()
         .flatten()
         .map(|g| g.gid.as_raw())
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use crate::privileged_api::KillSignal;
-    use managed_pids::{
-        managed_pid_entry_path, managed_pid_registry_dir, process_start_ticks, register_managed_pid,
-    };
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn shutdown_if_idle_rejected_when_control_disabled() {
-        let mut state = ControlState::new(false);
-        let response = dispatch(PrivilegedRequest::ShutdownIfIdle, &mut state);
-        match response {
-            PrivilegedResponse::Error { code, .. } => assert_eq!(code, "Control"),
-            other => panic!("expected control error, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn lease_refcount_blocks_then_allows_shutdown() {
-        let mut state = ControlState::new(true);
-        let token = live_token();
-
-        let acquired = dispatch(
-            PrivilegedRequest::LeaseAcquire {
-                token: token.clone(),
-            },
-            &mut state,
-        );
-        assert!(matches!(acquired, PrivilegedResponse::Unit));
-
-        let shutdown_while_leased = dispatch(PrivilegedRequest::ShutdownIfIdle, &mut state);
-        assert!(matches!(
-            shutdown_while_leased,
-            PrivilegedResponse::Bool(false)
-        ));
-        assert!(!state.should_exit_now());
-
-        let released = dispatch(PrivilegedRequest::LeaseRelease { token }, &mut state);
-        assert!(matches!(released, PrivilegedResponse::Unit));
-        assert!(state.should_exit_now());
-    }
-
-    #[test]
-    fn lease_token_liveness_checks_pid_start_ticks() {
-        let token = live_token();
-        assert!(managed_pids::lease_token_is_live(&token));
-        assert!(!managed_pids::lease_token_is_live("999999:1"));
-        assert!(!managed_pids::lease_token_is_live("invalid-token"));
-    }
-
-    #[test]
-    fn managed_pid_registry_round_trip_and_stale_cleanup() {
-        with_managed_pid_registry_dir(|| {
-            let pid = std::process::id();
-            register_managed_pid(pid).expect("register managed pid");
-            assert!(managed_pids::managed_pid_is_current(pid).expect("check managed pid"));
-
-            let stale = managed_pid_entry_path(999_999);
-            std::fs::write(&stale, "1\n").expect("write stale entry");
-            managed_pids::cleanup_stale_managed_pid_registry_entries()
-                .expect("cleanup stale entries");
-            assert!(!stale.exists());
-        });
-    }
-
-    #[test]
-    fn managed_pid_cleanup_removes_invalid_entry_names() {
-        with_managed_pid_registry_dir(|| {
-            managed_pids::ensure_managed_pid_registry_dir()
-                .expect("ensure managed pid registry dir");
-            let invalid = managed_pid_registry_dir().join("bad-entry");
-            std::fs::write(&invalid, "junk").expect("write invalid entry");
-            managed_pids::cleanup_stale_managed_pid_registry_entries()
-                .expect("cleanup invalid entries");
-            assert!(!invalid.exists());
-        });
-    }
-
-    #[test]
-    fn kill_pid_rejects_stale_registry_entry_and_cleans_file() {
-        with_managed_pid_registry_dir(|| {
-            let pid = std::process::id();
-            let stale_path = managed_pid_entry_path(pid);
-            std::fs::write(&stale_path, "1\n").expect("write stale managed entry");
-
-            let mut state = ControlState::new(false);
-            let response = dispatch(
-                PrivilegedRequest::KillPid {
-                    pid,
-                    signal: KillSignal::Term,
-                },
-                &mut state,
-            );
-
-            match response {
-                PrivilegedResponse::Error { code, message } => {
-                    assert_eq!(code, "Authorization");
-                    assert!(message.contains("not managed by privileged service"));
-                }
-                other => panic!("expected authorization error, got {:?}", other),
-            }
-            assert!(!stale_path.exists());
-        });
-    }
-
-    #[test]
-    fn route_add_conflict_detects_file_exists_case_insensitive() {
-        assert!(dispatch::route_add_conflicts_with_existing_route(
-            "RTNETLINK answers: File exists"
-        ));
-        assert!(dispatch::route_add_conflicts_with_existing_route(
-            "rtnetlink answers: file exists"
-        ));
-        assert!(!dispatch::route_add_conflicts_with_existing_route(
-            "network unreachable"
-        ));
-    }
-
-    fn live_token() -> String {
-        let pid = std::process::id();
-        let start = process_start_ticks(pid).expect("must read current process start ticks");
-        format!("{}:{}", pid, start)
-    }
-
-    fn with_managed_pid_registry_dir<F>(f: F)
-    where
-        F: FnOnce(),
-    {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock env mutex");
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "tunmux-managed-pids-test-{}-{}",
-            std::process::id(),
-            unique
-        ));
-        std::fs::create_dir_all(&dir).expect("create test registry dir");
-
-        let old = std::env::var_os("TUNMUX_MANAGED_PIDS_DIR");
-        std::env::set_var("TUNMUX_MANAGED_PIDS_DIR", &dir);
-        f();
-        if let Some(value) = old {
-            std::env::set_var("TUNMUX_MANAGED_PIDS_DIR", value);
-        } else {
-            std::env::remove_var("TUNMUX_MANAGED_PIDS_DIR");
-        }
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }
 
 #[cfg(test)]

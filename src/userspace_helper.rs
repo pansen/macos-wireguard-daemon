@@ -1,8 +1,3 @@
-#[cfg(not(unix))]
-pub fn maybe_run_from_env() -> bool {
-    false
-}
-
 #[cfg(unix)]
 use base64::Engine;
 #[cfg(unix)]
@@ -17,8 +12,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
-#[cfg(all(unix, target_os = "linux"))]
-use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
@@ -87,9 +80,8 @@ fn gotatun_log_path(interface: &str) -> PathBuf {
 
 #[cfg(unix)]
 struct RunningDevice {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[allow(dead_code)]
     interface_name: String,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     control_interface_name: String,
     control_socket_path: PathBuf,
     device: Device<DefaultDeviceTransports>,
@@ -99,24 +91,8 @@ struct RunningDevice {
 #[cfg(unix)]
 enum CleanupState {
     None,
-    #[cfg(target_os = "linux")]
-    Linux(LinuxCleanupState),
     #[cfg(target_os = "macos")]
-    Macos(MacosCleanupState),
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxCleanupState {
-    routes_added: Vec<LinuxRoute>,
-    original_resolv_conf: Option<String>,
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxRoute {
-    is_ipv6: bool,
-    destination: String,
-    via: Option<String>,
-    dev: Option<String>,
+    Macos(Box<MacosCleanupState>),
 }
 
 #[cfg(target_os = "macos")]
@@ -235,7 +211,6 @@ const DNS_POLICY: DnsPolicy = DnsPolicy::PrimaryOnly;
 struct ParsedUserspaceConfig {
     private_key: [u8; 32],
     addresses: Vec<String>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     dns_servers: Vec<String>,
     mtu: Option<u16>,
     peer_public_key: [u8; 32],
@@ -537,14 +512,6 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                 if !running.control_socket_path.exists() {
                     debug!(interface = running.control_interface_name, trigger = "control_socket_removed", "userspace_helper_shutdown_requested");
                     break;
-                }
-
-                #[cfg(target_os = "linux")]
-                {
-                    let iface_path = Path::new("/sys/class/net").join(&running.interface_name);
-                    if !iface_path.exists() {
-                        break;
-                    }
                 }
 
                 #[cfg(target_os = "macos")]
@@ -900,18 +867,10 @@ async fn apply_wireguard_config(
 
 #[cfg(unix)]
 fn helper_tun_name(interface: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        if interface == "utun" || interface.starts_with("utun") {
-            return interface.to_string();
-        }
-        "utun".to_string()
+    if interface == "utun" || interface.starts_with("utun") {
+        return interface.to_string();
     }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        interface.to_string()
-    }
+    "utun".to_string()
 }
 
 #[cfg(unix)]
@@ -919,31 +878,14 @@ fn configure_network(
     interface: &str,
     config: &ParsedUserspaceConfig,
 ) -> anyhow::Result<CleanupState> {
-    #[cfg(target_os = "linux")]
-    {
-        let cleanup = configure_network_linux(interface, config)?;
-        Ok(CleanupState::Linux(cleanup))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let cleanup = configure_network_macos(interface, config)?;
-        Ok(CleanupState::Macos(cleanup))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (interface, config);
-        Ok(CleanupState::None)
-    }
+    let cleanup = configure_network_macos(interface, config)?;
+    Ok(CleanupState::Macos(Box::new(cleanup)))
 }
 
 #[cfg(unix)]
 fn cleanup_network(running: &RunningDevice) -> anyhow::Result<()> {
     match &running.cleanup {
         CleanupState::None => Ok(()),
-        #[cfg(target_os = "linux")]
-        CleanupState::Linux(state) => cleanup_network_linux(state),
         #[cfg(target_os = "macos")]
         CleanupState::Macos(state) => cleanup_network_macos(state),
     }
@@ -1028,269 +970,6 @@ fn format_command_for_log(name: &str, args: &[&str]) -> String {
         return name.to_string();
     }
     format!("{} {}", name, args.join(" "))
-}
-
-#[cfg(target_os = "linux")]
-fn configure_network_linux(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-) -> anyhow::Result<LinuxCleanupState> {
-    let mut routes_added = Vec::new();
-    let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
-
-    if let Some(mtu) = config.mtu {
-        let mtu = mtu.to_string();
-        run_command("ip", &["link", "set", "dev", interface, "mtu", &mtu])?;
-    }
-    for address in &config.addresses {
-        run_command("ip", &["addr", "add", address, "dev", interface])?;
-    }
-    run_command("ip", &["link", "set", "up", "dev", interface])?;
-
-    let endpoint_route = match config.endpoint.ip() {
-        IpAddr::V4(_) => {
-            let default = get_linux_default_route_v4()?;
-            Some(LinuxRoute {
-                is_ipv6: false,
-                destination: format!("{}/32", config.endpoint.ip()),
-                via: Some(default.gateway),
-                dev: Some(default.dev),
-            })
-        }
-        IpAddr::V6(_) => get_linux_default_route_v6().map(|default| LinuxRoute {
-            is_ipv6: true,
-            destination: format!("{}/128", config.endpoint.ip()),
-            via: Some(default.gateway),
-            dev: Some(default.dev),
-        }),
-    };
-
-    if let Some(route) = endpoint_route {
-        if add_linux_route(&route)? {
-            routes_added.push(route);
-        }
-    }
-
-    for route in linux_allowed_routes(interface, config, has_ipv6_address) {
-        if add_linux_route(&route)? {
-            routes_added.push(route);
-        }
-    }
-
-    let original_resolv_conf = if should_manage_global_resolv_conf() {
-        let original = std::fs::read_to_string("/etc/resolv.conf").ok();
-        if !config.dns_servers.is_empty() {
-            let contents: String = config
-                .dns_servers
-                .iter()
-                .map(|dns| format!("nameserver {}\n", dns))
-                .collect();
-            std::fs::write("/etc/resolv.conf", contents)
-                .context("failed to update /etc/resolv.conf for userspace tunnel")?;
-        }
-        original
-    } else {
-        None
-    };
-
-    Ok(LinuxCleanupState {
-        routes_added,
-        original_resolv_conf,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn cleanup_network_linux(state: &LinuxCleanupState) -> anyhow::Result<()> {
-    debug!(
-        routes = state.routes_added.len(),
-        restore_resolv_conf = state.original_resolv_conf.is_some(),
-        "userspace_helper_network_cleanup_begin"
-    );
-    let mut errors = Vec::new();
-    for route in state.routes_added.iter().rev() {
-        if let Err(error) = del_linux_route(route) {
-            errors.push(error.to_string());
-        }
-    }
-    if let Some(original) = &state.original_resolv_conf {
-        if let Err(error) = std::fs::write("/etc/resolv.conf", original) {
-            errors.push(format!("restore /etc/resolv.conf failed: {error}"));
-        }
-    }
-    finish_cleanup(errors)
-}
-
-#[cfg(target_os = "linux")]
-fn add_linux_route(route: &LinuxRoute) -> anyhow::Result<bool> {
-    let mut args: Vec<String> = if route.is_ipv6 {
-        vec![
-            "-6".into(),
-            "route".into(),
-            "add".into(),
-            route.destination.clone(),
-        ]
-    } else {
-        vec!["route".into(), "add".into(), route.destination.clone()]
-    };
-    if let Some(via) = &route.via {
-        args.push("via".into());
-        args.push(via.clone());
-    }
-    if let Some(dev) = &route.dev {
-        args.push("dev".into());
-        args.push(dev.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_with_exists_ok("ip", &arg_refs)
-}
-
-#[cfg(target_os = "linux")]
-fn del_linux_route(route: &LinuxRoute) -> anyhow::Result<()> {
-    let mut args: Vec<String> = if route.is_ipv6 {
-        vec![
-            "-6".into(),
-            "route".into(),
-            "del".into(),
-            route.destination.clone(),
-        ]
-    } else {
-        vec!["route".into(), "del".into(), route.destination.clone()]
-    };
-    if let Some(via) = &route.via {
-        args.push("via".into());
-        args.push(via.clone());
-    }
-    if let Some(dev) = &route.dev {
-        args.push("dev".into());
-        args.push(dev.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command("ip", &arg_refs)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_allowed_routes(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-    has_ipv6_address: bool,
-) -> Vec<LinuxRoute> {
-    let mut routes = Vec::new();
-    for allowed in &config.allowed_ips {
-        match allowed.as_str() {
-            "0.0.0.0/0" => {
-                routes.push(LinuxRoute {
-                    is_ipv6: false,
-                    destination: "0.0.0.0/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-                routes.push(LinuxRoute {
-                    is_ipv6: false,
-                    destination: "128.0.0.0/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-            "::/0" => {
-                if !has_ipv6_address {
-                    continue;
-                }
-                routes.push(LinuxRoute {
-                    is_ipv6: true,
-                    destination: "::/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-                routes.push(LinuxRoute {
-                    is_ipv6: true,
-                    destination: "8000::/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-            other => {
-                let is_ipv6 = other.contains(':');
-                if is_ipv6 && !has_ipv6_address {
-                    continue;
-                }
-                routes.push(LinuxRoute {
-                    is_ipv6,
-                    destination: other.to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-        }
-    }
-    routes
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxDefaultRoute {
-    gateway: String,
-    dev: String,
-}
-
-#[cfg(target_os = "linux")]
-fn get_linux_default_route_v4() -> anyhow::Result<LinuxDefaultRoute> {
-    let output = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .context("failed to run ip route show default")?;
-    if !output.status.success() {
-        anyhow::bail!("ip route show default failed");
-    }
-    parse_linux_default_route(std::str::from_utf8(&output.stdout).unwrap_or_default())
-}
-
-#[cfg(target_os = "linux")]
-fn get_linux_default_route_v6() -> Option<LinuxDefaultRoute> {
-    let output = Command::new("ip")
-        .args(["-6", "route", "show", "default"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_linux_default_route(std::str::from_utf8(&output.stdout).ok()?).ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_default_route(output: &str) -> anyhow::Result<LinuxDefaultRoute> {
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("default"))
-        .ok_or_else(|| anyhow::anyhow!("no default route found"))?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-
-    let via = fields
-        .iter()
-        .position(|value| *value == "via")
-        .and_then(|index| fields.get(index + 1))
-        .ok_or_else(|| anyhow::anyhow!("default route missing gateway"))?;
-    let dev = fields
-        .iter()
-        .position(|value| *value == "dev")
-        .and_then(|index| fields.get(index + 1))
-        .ok_or_else(|| anyhow::anyhow!("default route missing interface"))?;
-
-    Ok(LinuxDefaultRoute {
-        gateway: (*via).to_string(),
-        dev: (*dev).to_string(),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn should_manage_global_resolv_conf() -> bool {
-    !is_systemd_resolved_managed_resolv_conf("/etc/resolv.conf")
-}
-
-#[cfg(target_os = "linux")]
-fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
-    match std::fs::canonicalize(path) {
-        Ok(real_path) => real_path.starts_with("/run/systemd/resolve/"),
-        Err(_) => false,
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2222,7 +1901,7 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
     // (c) (Re-)assert tunnel DNS on every target whose observed DNS has drifted,
     // except services whose original we failed to capture this tick.
     for svc in &actions.apply {
-        if capture_failed.iter().any(|s| *s == svc.as_str()) {
+        if capture_failed.contains(&svc.as_str()) {
             continue; // never overwrite DNS we couldn't back up
         }
         if set_macos_dns_servers(svc, &inputs.dns_servers).is_ok()

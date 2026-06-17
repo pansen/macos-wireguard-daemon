@@ -11,39 +11,6 @@ use crate::error::{AppError, Result};
 
 use super::daemon::self_executable_for_spawn;
 
-pub(super) fn run(args: &[&str]) -> Result<()> {
-    debug!(cmd = args.join(" "), "exec");
-    let status = Command::new(args[0]).args(&args[1..]).status()?;
-    if !status.success() {
-        return Err(AppError::Other(format!(
-            "command {} failed: {}",
-            args[0], status
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn run_output(args: &[&str]) -> Result<std::process::Output> {
-    debug!(cmd = args.join(" "), "exec");
-    Command::new(args[0])
-        .args(&args[1..])
-        .output()
-        .map_err(|error| AppError::Other(format!("command {} failed to start: {}", args[0], error)))
-}
-
-pub(super) fn run_resolved_set_dns(interface: &str, dns_servers: &[String]) -> Result<()> {
-    let mut dns_command = vec!["resolvectl", "dns", interface];
-    dns_command.extend(dns_servers.iter().map(String::as_str));
-    run(&dns_command)?;
-    run(&["resolvectl", "domain", interface, "~."])?;
-    run(&["resolvectl", "default-route", interface, "yes"])?;
-    Ok(())
-}
-
-pub(super) fn run_resolved_revert_dns(interface: &str) -> Result<()> {
-    run(&["resolvectl", "revert", interface])
-}
-
 pub(super) fn run_wg_quick_up(
     path: &std::path::Path,
     config_content: &[u8],
@@ -138,16 +105,11 @@ fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<St
     format_wg_show(&raw, interface)
 }
 
-#[cfg(target_os = "linux")]
-fn run_wg_show_kernel(interface: &str) -> Result<String> {
-    let uapi_text = crate::wireguard::netlink::wg_get_uapi(interface)?;
-    format_wg_show(&uapi_text, interface)
-}
-
-#[cfg(not(target_os = "linux"))]
 fn run_wg_show_kernel(_interface: &str) -> Result<String> {
+    // macOS has no in-kernel WireGuard; userspace tunnels always expose a UAPI
+    // socket, so this path (no socket present) means the interface is not up.
     Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
+        "no WireGuard UAPI socket for interface (tunnel not active)".to_string(),
     ))
 }
 
@@ -378,10 +340,7 @@ pub(super) fn run_gotatun_up(
     if debug_enabled {
         command.env("TUNMUX_DEBUG", "1");
     }
-    #[cfg(target_os = "macos")]
-    {
-        command.env("TUNMUX_GOTATUN_DIAG", "1");
-    }
+    command.env("TUNMUX_GOTATUN_DIAG", "1");
     let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
@@ -491,7 +450,6 @@ pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
         }
     }
 
-    #[cfg(target_os = "macos")]
     if let Some(actual_interface) = actual_interface.as_deref() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while macos_interface_exists(actual_interface) && Instant::now() < deadline {
@@ -540,7 +498,6 @@ fn wait_for_cleanup_status(path: &std::path::Path, timeout: Duration) -> Option<
     }
 }
 
-#[cfg(target_os = "macos")]
 fn macos_interface_exists(interface: &str) -> bool {
     Command::new("ifconfig")
         .arg(interface)
@@ -603,12 +560,6 @@ fn ensure_gotatun_process_identity(pid: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-#[cfg(target_os = "macos")]
 fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -626,11 +577,6 @@ fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
         &buffer[..length as usize],
     )))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_executable(_pid: u32) -> Option<std::path::PathBuf> {
-    None
 }
 
 fn gotatun_pid_path(interface: &str) -> std::path::PathBuf {
@@ -657,52 +603,6 @@ pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
 
 fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.tunmux.{suffix}"))
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn wg_set(
-    interface: &str,
-    private_key: &str,
-    peer_public_key: &str,
-    endpoint: &str,
-    allowed_ips: &str,
-) -> Result<()> {
-    crate::wireguard::netlink::wg_set_device(
-        interface,
-        private_key,
-        peer_public_key,
-        endpoint,
-        allowed_ips,
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn wg_set(
-    _interface: &str,
-    _private_key: &str,
-    _peer_public_key: &str,
-    _endpoint: &str,
-    _allowed_ips: &str,
-) -> Result<()> {
-    Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
-    crate::wireguard::netlink::wg_set_psk(interface, peer_public_key, psk)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn set_preshared_key(
-    _interface: &str,
-    _peer_public_key: &str,
-    _psk: &str,
-) -> Result<()> {
-    Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
-    ))
 }
 
 #[cfg(test)]

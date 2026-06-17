@@ -1,11 +1,10 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Once};
 
 use time::macros::format_description;
 use tracing::level_filters::LevelFilter;
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::time::UtcTime;
 
 const LOG_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -183,8 +182,7 @@ pub fn init_service(verbose: bool) {
 }
 
 /// Writer over a shared append-mode file handle. Each write is an O_APPEND syscall with no
-/// userspace buffering, so log lines are durable and readable by another process immediately
-/// (unlike the async `tracing_appender::non_blocking` writer used by `init_file`).
+/// userspace buffering, so log lines are durable and readable by another process immediately.
 struct SharedFileWriter(Arc<File>);
 
 impl Write for SharedFileWriter {
@@ -212,28 +210,6 @@ pub fn init_file_sync(path: &str, verbose: bool) -> anyhow::Result<()> {
         .with_timer(UtcTime::new(LOG_TIMESTAMP_FORMAT))
         .with_max_level(level)
         .with_writer(move || SharedFileWriter(file.clone()))
-        .finish();
-    install_subscriber(subscriber, level);
-    Ok(())
-}
-
-pub fn init_file(path: &str, verbose: bool) -> anyhow::Result<()> {
-    let default = if verbose {
-        LevelFilter::DEBUG
-    } else {
-        LevelFilter::INFO
-    };
-    let level = level_from_env_or_default(default);
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let (writer, guard) = tracing_appender::non_blocking(file);
-    static FILE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
-    let _ = FILE_GUARD.set(guard);
-
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_timer(UtcTime::new(LOG_TIMESTAMP_FORMAT))
-        .with_max_level(level)
-        .with_writer(writer)
         .finish();
     install_subscriber(subscriber, level);
     Ok(())

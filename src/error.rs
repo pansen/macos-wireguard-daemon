@@ -17,12 +17,6 @@ pub enum AppError {
     #[error("WireGuard error: {0}")]
     WireGuard(String),
 
-    #[error("Namespace error: {0}")]
-    Namespace(String),
-
-    #[error("Proxy error: {0}")]
-    Proxy(String),
-
     #[error("{0}")]
     Other(String),
 }

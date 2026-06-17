@@ -31,7 +31,6 @@ impl AppConfig {
 pub struct GeneralConfig {
     pub backend: String,
     pub credential_store: CredentialStore,
-    pub proxy_access_log: bool,
     pub privileged_transport: PrivilegedTransport,
     pub privileged_autostart: bool,
     pub privileged_autostart_timeout_ms: u64,
@@ -46,7 +45,6 @@ impl Default for GeneralConfig {
         Self {
             backend: default_backend().to_string(),
             credential_store: default_credential_store(),
-            proxy_access_log: false,
             privileged_transport: PrivilegedTransport::Socket,
             privileged_autostart: true,
             privileged_autostart_timeout_ms: 5000,
@@ -75,18 +73,7 @@ pub enum CredentialStore {
 }
 
 fn default_backend() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "userspace"
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        "kernel"
-    }
-    #[cfg(not(unix))]
-    {
-        "wg-quick"
-    }
+    "userspace"
 }
 
 fn default_credential_store() -> CredentialStore {
@@ -190,10 +177,7 @@ pub fn privileged_socket_path() -> PathBuf {
 
 #[must_use]
 pub fn privileged_socket_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    return PathBuf::from("/Library/Application Support/tunmux/run");
-    #[cfg(not(target_os = "macos"))]
-    return PathBuf::from("/var/run/tunmux");
+    PathBuf::from("/Library/Application Support/tunmux/run")
 }
 
 pub fn ensure_privileged_socket_dir() -> Result<()> {
@@ -207,38 +191,21 @@ pub fn ensure_privileged_socket_dir() -> Result<()> {
 
 #[must_use]
 pub fn privileged_runtime_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    return PathBuf::from("/Library/Application Support/tunmux");
-    #[cfg(not(target_os = "macos"))]
-    return PathBuf::from("/var/lib/tunmux");
+    PathBuf::from("/Library/Application Support/tunmux")
 }
 
-/// Root-owned log directory for privileged services (gotatun helper on Linux, the
-/// privileged proxy daemon): `/var/log/tunmux`.
+/// Root-owned log directory for the privileged gotatun helper: `/var/log/tunmux`.
 #[must_use]
 pub fn root_log_dir() -> PathBuf {
     PathBuf::from("/var/log/tunmux")
 }
 
-pub fn ensure_root_log_dir() -> Result<()> {
-    let dir = root_log_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-        // World-readable so the user can tail the root service's logs.
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
-}
-
-/// macOS user-visible log directory: `~/Library/Logs` (what Console.app shows).
-/// Used for user-owned logs (the local proxy); root-owned logs go to
-/// [`root_log_dir`] instead. Callers run as the user, so `HOME` is already theirs.
 /// Log file the gotatun userspace helper writes and the privileged service tails.
 /// Single source of truth shared by the helper (writer) and the service
 /// (clear-at-connect + tail), which must agree on the path.
 ///
-/// The helper runs as root (the privileged daemon spawns it), so its log is a
-/// root service and lives under `/var/log/tunmux/<interface>.log` on all platforms.
+/// The helper runs as root (the privileged daemon spawns it), so its log lives
+/// under `/var/log/tunmux/<interface>.log`.
 #[must_use]
 pub fn gotatun_helper_log_path(interface: &str) -> PathBuf {
     root_log_dir().join(format!("{interface}.log"))
@@ -256,11 +223,6 @@ pub fn ensure_privileged_runtime_dir() -> Result<()> {
 #[must_use]
 pub fn privileged_wg_dir() -> PathBuf {
     privileged_runtime_dir().join("wg")
-}
-
-#[must_use]
-pub fn privileged_proxy_dir() -> PathBuf {
-    privileged_runtime_dir().join("proxy")
 }
 
 pub fn ensure_privileged_directory(path: &Path) -> Result<()> {
@@ -281,12 +243,6 @@ pub fn config_dir(provider: Provider) -> PathBuf {
 #[must_use]
 pub fn connections_dir() -> PathBuf {
     app_config_dir().join("connections")
-}
-
-/// User-owned proxy runtime directory: ~/.config/tunmux/proxy/
-#[must_use]
-pub fn user_proxy_dir() -> PathBuf {
-    app_config_dir().join("proxy")
 }
 
 pub fn ensure_connections_dir() -> Result<()> {

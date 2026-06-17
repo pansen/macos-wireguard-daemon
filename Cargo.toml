@@ -16,10 +16,6 @@ path = "src/lib.rs"
 name = "tunmux"
 path = "src/main.rs"
 
-[features]
-default = ["proxy"]
-proxy = []
-
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -39,7 +35,6 @@ toml = "0.8"
 # Logging
 log = "0.4"
 tracing = "0.1"
-tracing-appender = "0.2"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 time = { version = "0.3", features = ["macros"] }
@@ -55,8 +50,8 @@ thiserror = "2"
 anyhow = "1"
 
 [target.'cfg(unix)'.dependencies]
-# Linux namespaces
-nix = { version = "0.29", features = ["sched", "net", "fs", "signal", "process", "user", "mount"] }
+# Process/signal/user lookups for the privileged service and helper management.
+nix = { version = "0.29", features = ["fs", "signal", "process", "user"] }
 
 # Daemonization and userspace WireGuard
 daemonize = "0.5"

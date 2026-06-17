@@ -26,19 +26,11 @@ enum BuiltinHook {
 
 #[derive(Debug, Clone, Default)]
 struct HookRuntime {
-    http_proxy_url: Option<String>,
-    all_proxy_url: Option<String>,
     vpn_dns_servers: Vec<String>,
 }
 
 impl HookRuntime {
     fn from_state(state: &ConnectionState) -> Self {
-        let http_proxy_url = state
-            .http_port
-            .map(|port| format!("http://127.0.0.1:{}", port));
-        let all_proxy_url = state
-            .socks_port
-            .map(|port| format!("socks5h://127.0.0.1:{}", port));
         let vpn_dns_servers = state
             .dns_servers
             .iter()
@@ -46,17 +38,11 @@ impl HookRuntime {
             .filter(|s| !s.is_empty())
             .collect();
 
-        Self {
-            http_proxy_url,
-            all_proxy_url,
-            vpn_dns_servers,
-        }
+        Self { vpn_dns_servers }
     }
 
     fn request_proxy_url(&self) -> Option<&str> {
-        self.http_proxy_url
-            .as_deref()
-            .or(self.all_proxy_url.as_deref())
+        None
     }
 
     fn vpn_dns_servers(&self) -> &[String] {
@@ -184,28 +170,6 @@ fn build_hook_env(
         state.server_endpoint.to_string(),
     );
 
-    if let Some(namespace_name) = &state.namespace_name {
-        env.insert("TUNMUX_NAMESPACE".to_string(), namespace_name.to_string());
-    }
-    if let Some(socks_port) = state.socks_port {
-        let socks = socks_port.to_string();
-        let all_proxy = format!("socks5h://127.0.0.1:{}", socks_port);
-        env.insert("TUNMUX_SOCKS_PORT".to_string(), socks);
-        env.insert("ALL_PROXY".to_string(), all_proxy.clone());
-        env.insert("all_proxy".to_string(), all_proxy);
-    }
-    if let Some(http_port) = state.http_port {
-        let http = http_port.to_string();
-        let http_proxy = format!("http://127.0.0.1:{}", http_port);
-        env.insert("TUNMUX_HTTP_PORT".to_string(), http);
-        env.insert("HTTP_PROXY".to_string(), http_proxy.clone());
-        env.insert("HTTPS_PROXY".to_string(), http_proxy.clone());
-        env.insert("http_proxy".to_string(), http_proxy.clone());
-        env.insert("https_proxy".to_string(), http_proxy);
-    }
-    if let Some(proxy_pid) = state.proxy_pid {
-        env.insert("TUNMUX_PROXY_PID".to_string(), proxy_pid.to_string());
-    }
     if !state.dns_servers.is_empty() {
         env.insert(
             "TUNMUX_DNS_SERVERS".to_string(),
@@ -934,13 +898,6 @@ mod tests {
             backend: WgBackend::Kernel,
             server_endpoint: "1.2.3.4:51820".to_string(),
             server_display_name: "US#1".to_string(),
-            original_gateway_ip: None,
-            original_gateway_iface: None,
-            original_resolv_conf: None,
-            namespace_name: Some("tunmux_test".to_string()),
-            proxy_pid: Some(1234),
-            socks_port: Some(1080),
-            http_port: Some(8118),
             dns_servers: vec!["10.2.0.1".to_string()],
             source_path: None,
         };
@@ -962,37 +919,10 @@ mod tests {
             .any(|(k, v)| k == "TUNMUX_INSTANCE" && v == "test-instance"));
         assert!(ifup
             .iter()
-            .any(|(k, v)| k == "TUNMUX_PROXY_PID" && v == "1234"));
+            .any(|(k, v)| k == "TUNMUX_INTERFACE" && v == "wgconf0"));
         assert!(ifup
             .iter()
-            .any(|(k, v)| k == "HTTP_PROXY" && v == "http://127.0.0.1:8118"));
-        assert!(ifup
-            .iter()
-            .any(|(k, v)| k == "ALL_PROXY" && v == "socks5h://127.0.0.1:1080"));
-    }
-
-    #[test]
-    fn hook_runtime_prefers_http_proxy_for_requests() {
-        let state = ConnectionState {
-            instance_name: "test-instance".to_string(),
-            provider: "wgconf".to_string(),
-            interface_name: "wgconf0".to_string(),
-            backend: WgBackend::Kernel,
-            server_endpoint: "1.2.3.4:51820".to_string(),
-            server_display_name: "US#1".to_string(),
-            original_gateway_ip: None,
-            original_gateway_iface: None,
-            original_resolv_conf: None,
-            namespace_name: None,
-            proxy_pid: Some(1234),
-            socks_port: Some(1080),
-            http_port: Some(8118),
-            dns_servers: vec!["10.2.0.1".to_string()],
-            source_path: None,
-        };
-
-        let runtime = super::HookRuntime::from_state(&state);
-        assert_eq!(runtime.request_proxy_url(), Some("http://127.0.0.1:8118"));
+            .any(|(k, v)| k == "TUNMUX_DNS_SERVERS" && v == "10.2.0.1"));
     }
 
     #[test]

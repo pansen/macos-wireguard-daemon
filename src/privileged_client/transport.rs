@@ -482,8 +482,11 @@ impl PrivilegedClient {
             }
         };
 
-        let probe = PrivilegedRequest::NamespaceExists {
-            name: "tunmux_probe".to_string(),
+        // A cheap, always-available probe: ask whether a tunnel control socket
+        // exists. The answer is irrelevant; a successful round-trip means the
+        // daemon is up and authorized us.
+        let probe = PrivilegedRequest::InterfaceActive {
+            interface: "wgconf0".to_string(),
         };
         match self.send_on_stream(&mut stream, &probe) {
             Ok(_) => Ok(true),
