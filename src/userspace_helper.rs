@@ -522,8 +522,11 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                     if std::time::Instant::now() >= next_reconcile_at {
                         next_reconcile_at = std::time::Instant::now() + MACOS_RECONCILE_INTERVAL;
                         if let CleanupState::Macos(state) = &running.cleanup {
-                            macos_reconcile_routes(state);
-                            macos_reconcile_dns(state);
+                            let routes_changed = macos_reconcile_routes(state);
+                            let dns_changed = macos_reconcile_dns(state);
+                            if routes_changed || dns_changed {
+                                log_macos_network_overview("reconcile", state);
+                            }
                         }
                     }
 
@@ -1059,8 +1062,6 @@ fn configure_network_macos(
             add_macos_route(&route)?;
             routes_added.push(route);
         }
-        log_macos_routing_overview("connect", &inputs, &routes_added, &fingerprint);
-
         // Apply DNS the same way the reconciler will, then seed the DNS
         // fingerprint so the first reconcile tick is a no-op.
         dns_fingerprint = configure_macos_dns(config, &mut dns_services)?;
@@ -1093,7 +1094,7 @@ fn configure_network_macos(
         };
     }
 
-    Ok(MacosCleanupState {
+    let cleanup = MacosCleanupState {
         routing: std::sync::Mutex::new(MacosRoutingState {
             routes_added,
             fingerprint,
@@ -1103,7 +1104,9 @@ fn configure_network_macos(
             fingerprint: dns_fingerprint,
         }),
         reconcile: inputs,
-    })
+    };
+    log_macos_network_overview("connect", &cleanup);
+    Ok(cleanup)
 }
 
 #[cfg(target_os = "macos")]
@@ -1607,7 +1610,7 @@ fn macos_current_fingerprint(
 /// Re-apply routing when the host network changed (roam, suspend/resume, link
 /// up/down). Cheap and silent when nothing changed; expressive when it acts.
 #[cfg(target_os = "macos")]
-fn macos_reconcile_routes(state: &MacosCleanupState) {
+fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
     let inputs = &state.reconcile;
 
     let mut routing = state
@@ -1630,11 +1633,11 @@ fn macos_reconcile_routes(state: &MacosCleanupState) {
                     error = %error,
                     "userspace_helper_reconcile_fingerprint_failed"
                 );
-                return;
+                return false;
             }
         };
     if fingerprint == routing.fingerprint {
-        return;
+        return false;
     }
 
     let previous = routing.fingerprint.clone();
@@ -1702,7 +1705,7 @@ fn macos_reconcile_routes(state: &MacosCleanupState) {
         errors,
         "userspace_helper_reconcile_applied"
     );
-    log_macos_routing_overview("reconcile", inputs, &routing.routes_added, &fingerprint);
+    true
 }
 
 /// The services that should carry tunnel DNS under `policy`. `PrimaryOnly`
@@ -1827,10 +1830,10 @@ fn capture_macos_dns_service(
 /// or vanished service, a primary-service change). Cheap and silent when nothing
 /// changed; expressive when it acts. Mirrors `macos_reconcile_routes`.
 #[cfg(target_os = "macos")]
-fn macos_reconcile_dns(state: &MacosCleanupState) {
+fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     let inputs = &state.reconcile;
     if inputs.dns_servers.is_empty() {
-        return; // VPN promotes no DNS → nothing to own.
+        return false; // VPN promotes no DNS -> nothing to own.
     }
 
     let fingerprint = macos_current_dns_fingerprint();
@@ -1840,7 +1843,7 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if fingerprint == dns.fingerprint {
-        return; // cheap identity check, same guard as routes.
+        return false; // cheap identity check, same guard as routes.
     }
 
     let previous = dns.fingerprint.clone();
@@ -1929,6 +1932,7 @@ fn macos_reconcile_dns(state: &MacosCleanupState) {
         interface = inputs.interface,
         applied, captured, restored, dropped, errors, "userspace_helper_dns_reconcile_applied"
     );
+    true
 }
 
 /// The human-readable network service name that currently owns the default
@@ -2033,29 +2037,208 @@ fn parse_device_from_hw_line(hw: &str) -> Option<String> {
     }
 }
 
-/// Emit a full route + DNS overview. Called once at connect and after every
-/// reconcile action, so the log always shows the resulting tunnel state.
+/// Emit a full route + DNS overview. Called once after connect setup and after
+/// route/DNS reconciliation work, so the log shows the resulting tunnel state.
 #[cfg(target_os = "macos")]
-fn log_macos_routing_overview(
-    reason: &str,
+fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
+    let inputs = &state.reconcile;
+    let (routes, route_fingerprint) = {
+        let routing = state
+            .routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (routing.routes_added.clone(), routing.fingerprint.clone())
+    };
+    let (owned_dns, dns_fingerprint) = {
+        let dns = state
+            .dns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (dns.services.clone(), dns.fingerprint.clone())
+    };
+    let table = format_macos_network_overview_table(
+        inputs,
+        &routes,
+        &route_fingerprint,
+        &owned_dns,
+        &dns_fingerprint,
+    );
+    info!(reason, interface = inputs.interface, "\n{table}");
+}
+
+#[cfg(target_os = "macos")]
+fn format_macos_network_overview_table(
     inputs: &MacosReconcileInputs,
     routes: &[MacosRoute],
-    fingerprint: &MacosNetworkFingerprint,
-) {
-    info!(
-        reason,
-        interface = inputs.interface,
-        endpoint = %inputs.endpoint,
-        endpoint_pinned = inputs.endpoint_needs_pin,
-        endpoint_gateway = ?fingerprint.endpoint_gateway,
-        local_subnets = %format_subnets(&fingerprint.local_subnets),
-        tunnel_routes = %format_routes(routes),
-        // The configured server list; live per-service DNS state is reported by
-        // the DNS reconciler's own `userspace_helper_dns_*` events.
-        dns_servers = %format_list(&inputs.dns_servers),
-        dns_reconciled = true,
-        "userspace_helper_routing_overview"
+    route_fingerprint: &MacosNetworkFingerprint,
+    owned_dns: &[MacosDnsServiceState],
+    dns_fingerprint: &MacosDnsFingerprint,
+) -> String {
+    let mut lines = vec![
+        "tunmux network overview".to_string(),
+        format!(
+            "interface={} endpoint={} endpoint_pin={} gateway={} local_subnets={}",
+            inputs.interface,
+            inputs.endpoint,
+            if inputs.endpoint_needs_pin {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            route_fingerprint
+                .endpoint_gateway
+                .as_deref()
+                .unwrap_or("none"),
+            format_subnets(&route_fingerprint.local_subnets)
+        ),
+        String::new(),
+        "Routes".to_string(),
+    ];
+    lines.extend(format_table(
+        &["DESTINATION", "VIA", "FAMILY", "STATUS"],
+        &macos_route_overview_rows(routes),
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "DNS tunnel_servers={} primary_service={}",
+        format_list(&inputs.dns_servers),
+        dns_fingerprint.primary_service.as_deref().unwrap_or("none")
+    ));
+    lines.extend(format_table(
+        &[
+            "SERVICE",
+            "ROLE",
+            "LIVE DNS",
+            "OWNED",
+            "ORIGINAL DNS",
+            "STATUS",
+        ],
+        &macos_dns_overview_rows(inputs, owned_dns, dns_fingerprint),
+    ));
+    lines.join("\n")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_overview_rows(routes: &[MacosRoute]) -> Vec<Vec<String>> {
+    if routes.is_empty() {
+        return vec![vec![
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "no routes owned".to_string(),
+        ]];
+    }
+    routes
+        .iter()
+        .map(|route| {
+            vec![
+                route.destination.clone(),
+                match (&route.gateway, &route.interface) {
+                    (Some(gateway), _) => format!("gateway {gateway}"),
+                    (None, Some(interface)) => format!("interface {interface}"),
+                    (None, None) => "system".to_string(),
+                },
+                if route.is_ipv6 { "IPv6" } else { "IPv4" }.to_string(),
+                "owned".to_string(),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dns_overview_rows(
+    inputs: &MacosReconcileInputs,
+    owned_dns: &[MacosDnsServiceState],
+    dns_fingerprint: &MacosDnsFingerprint,
+) -> Vec<Vec<String>> {
+    if dns_fingerprint.services.is_empty() {
+        return vec![vec![
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "no".to_string(),
+            "-".to_string(),
+            "no services observed".to_string(),
+        ]];
+    }
+
+    let targets = dns_target_services(DNS_POLICY, dns_fingerprint);
+    dns_fingerprint
+        .services
+        .iter()
+        .map(|service| {
+            let live_dns = dns_fingerprint
+                .observed
+                .iter()
+                .find(|(observed_service, _)| observed_service == service)
+                .and_then(|(_, servers)| servers.as_ref());
+            let owned = owned_dns.iter().find(|state| &state.service == service);
+            let targeted = targets.iter().any(|target| target == service);
+            let live_matches_tunnel =
+                live_dns.map(Vec::as_slice) == Some(inputs.dns_servers.as_slice());
+            vec![
+                service.clone(),
+                if dns_fingerprint.primary_service.as_ref() == Some(service) {
+                    "primary"
+                } else {
+                    "secondary"
+                }
+                .to_string(),
+                live_dns.map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
+                if owned.is_some() { "yes" } else { "no" }.to_string(),
+                owned
+                    .and_then(|state| state.dns_servers.as_ref())
+                    .map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
+                match (targeted, owned.is_some(), live_matches_tunnel) {
+                    (true, true, true) => "tunnel DNS active",
+                    (true, true, false) => "owned; pending reapply",
+                    (true, false, true) => "already tunnel DNS",
+                    (true, false, false) => "target; not owned",
+                    (false, true, _) => "owned; pending restore",
+                    (false, false, _) => "not targeted",
+                }
+                .to_string(),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn format_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(value.len());
+            }
+        }
+    }
+
+    let header = format_table_row(
+        &headers
+            .iter()
+            .map(|header| header.to_string())
+            .collect::<Vec<_>>(),
+        &widths,
     );
+    let separator = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let mut lines = vec![header, separator];
+    lines.extend(rows.iter().map(|row| format_table_row(row, &widths)));
+    lines
+}
+
+#[cfg(target_os = "macos")]
+fn format_table_row(values: &[String], widths: &[usize]) -> String {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Directly-connected subnets of up, non-loopback, non-point-to-point
@@ -2143,22 +2326,6 @@ fn format_subnets(subnets: &[(IpAddr, u8)]) -> String {
     subnets
         .iter()
         .map(|(ip, prefix)| format!("{ip}/{prefix}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-#[cfg(target_os = "macos")]
-fn format_routes(routes: &[MacosRoute]) -> String {
-    if routes.is_empty() {
-        return "none".to_string();
-    }
-    routes
-        .iter()
-        .map(|route| match (&route.gateway, &route.interface) {
-            (Some(gateway), _) => format!("{}->gw {}", route.destination, gateway),
-            (None, Some(interface)) => format!("{}->{}", route.destination, interface),
-            (None, None) => route.destination.clone(),
-        })
         .collect::<Vec<_>>()
         .join(", ")
 }
