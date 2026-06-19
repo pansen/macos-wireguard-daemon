@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
 use time::macros::format_description;
@@ -10,6 +11,33 @@ use tracing_subscriber::fmt::time::UtcTime;
 const LOG_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 const DEBUG_ENV: &str = "TUNMUX_DEBUG";
+const GOTATUN_UAPI_CONNECTION_TARGET: &str = "gotatun::device::uapi";
+const GOTATUN_UAPI_CONNECTION_MESSAGE: &str = "New UAPI connection on unix socket";
+
+static SUPPRESS_GOTATUN_UAPI_CONNECTION_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+pub struct GotatunUapiConnectionLogSuppression;
+
+impl Drop for GotatunUapiConnectionLogSuppression {
+    fn drop(&mut self) {
+        SUPPRESS_GOTATUN_UAPI_CONNECTION_LOGS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn suppress_gotatun_uapi_connection_logs() -> GotatunUapiConnectionLogSuppression {
+    SUPPRESS_GOTATUN_UAPI_CONNECTION_LOGS.fetch_add(1, Ordering::Relaxed);
+    GotatunUapiConnectionLogSuppression
+}
+
+fn should_suppress_log_write(buf: &[u8]) -> bool {
+    if SUPPRESS_GOTATUN_UAPI_CONNECTION_LOGS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let Ok(line) = std::str::from_utf8(buf) else {
+        return false;
+    };
+    line.contains(GOTATUN_UAPI_CONNECTION_TARGET) && line.contains(GOTATUN_UAPI_CONNECTION_MESSAGE)
+}
 
 fn level_from_env_or_default(default: LevelFilter) -> LevelFilter {
     if debug_enabled() {
@@ -141,6 +169,9 @@ struct ServiceWriter;
 
 impl Write for ServiceWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if should_suppress_log_write(buf) {
+            return Ok(buf.len());
+        }
         let _ = std::io::stderr().write_all(buf);
         LOG_CAPTURE.with(|cell| {
             if let Some(capture) = cell.borrow_mut().as_mut() {
@@ -187,6 +218,9 @@ struct SharedFileWriter(Arc<File>);
 
 impl Write for SharedFileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if should_suppress_log_write(buf) {
+            return Ok(buf.len());
+        }
         (&*self.0).write(buf)
     }
 

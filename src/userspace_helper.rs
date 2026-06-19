@@ -612,20 +612,23 @@ async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, 
     // the task that `wg` is waiting on). Run it on a blocking thread, bounded by a timeout, so
     // the runtime stays free to answer the UAPI request and a stuck `wg` can never wedge us.
     let owned_interface = interface.to_string();
-    let output = match tokio::time::timeout(
-        Duration::from_secs(4),
-        tokio::task::spawn_blocking(move || {
-            Command::new("wg")
-                .args(["show", &owned_interface, "transfer"])
-                .output()
-        }),
-    )
-    .await
-    {
-        Ok(join_result) => join_result
-            .context("wg show transfer task panicked")?
-            .context("failed to run wg show transfer")?,
-        Err(_) => anyhow::bail!("wg show {} transfer timed out", interface),
+    let output = {
+        let _suppress_probe_uapi_log = crate::logging::suppress_gotatun_uapi_connection_logs();
+        match tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || {
+                Command::new("wg")
+                    .args(["show", &owned_interface, "transfer"])
+                    .output()
+            }),
+        )
+        .await
+        {
+            Ok(join_result) => join_result
+                .context("wg show transfer task panicked")?
+                .context("failed to run wg show transfer")?,
+            Err(_) => anyhow::bail!("wg show {} transfer timed out", interface),
+        }
     };
     if !output.status.success() {
         anyhow::bail!("wg show {} transfer failed", interface);
