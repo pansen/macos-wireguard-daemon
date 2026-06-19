@@ -51,6 +51,23 @@ install/autostart:
 install: build.release install/privileged install/autostart
 
 
+.PHONY: reload/privileged
+reload/privileged:
+	sudo launchctl kickstart -k system/me.pansen.tunmux.privileged
+
+.PHONY: reload/connections
+reload/connections:
+	/usr/local/bin/tunmux --debug disconnect --provider wgconf --all
+
+.PHONY: reload/autostart
+reload/autostart:
+	launchctl kickstart -k gui/$$(id -u)/me.pansen.tunmux.autoconnect
+	launchctl print gui/$$(id -u)/me.pansen.tunmux.autoconnect
+
+.PHONY: reload
+reload: reload/privileged reload/connections reload/autostart
+
+
 .PHONY: uninstall/autostart
 uninstall/autostart:
 	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
