@@ -123,6 +123,13 @@ tunmux --debug wgconf disconnect
 RUST_LOG=debug tunmux disconnect --all
 ```
 
+Force or disable ANSI color in logs:
+
+```bash
+TUNMUX_LOG_COLOR=always tunmux status
+TUNMUX_LOG_COLOR=never tunmux status
+```
+
 ## Flags
 
 `--disable-ipv6` is accepted only for the `kernel` backend, and only when the

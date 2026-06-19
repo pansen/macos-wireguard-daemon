@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,11 +7,16 @@ use std::sync::{Arc, Once};
 
 use time::macros::format_description;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::fmt::time::UtcTime;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::time::{FormatTime, UtcTime};
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::registry::LookupSpan;
 
 const LOG_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 const DEBUG_ENV: &str = "TUNMUX_DEBUG";
+pub(crate) const COLOR_ENV: &str = "TUNMUX_LOG_COLOR";
 const GOTATUN_UAPI_CONNECTION_TARGET: &str = "gotatun::device::uapi";
 const GOTATUN_UAPI_CONNECTION_MESSAGE: &str = "New UAPI connection on unix socket";
 
@@ -62,6 +68,17 @@ fn level_from_env_or_default(default: LevelFilter) -> LevelFilter {
     }
 }
 
+fn ansi_enabled(default: bool) -> bool {
+    let Some(value) = std::env::var_os(COLOR_ENV) else {
+        return default;
+    };
+    match value.to_string_lossy().to_ascii_lowercase().as_str() {
+        "always" | "1" | "true" | "yes" | "on" => true,
+        "never" | "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
 pub fn enable_debug() {
     std::env::set_var(DEBUG_ENV, "1");
 }
@@ -78,6 +95,105 @@ fn to_log_level_filter(level: LevelFilter) -> log::LevelFilter {
         LevelFilter::INFO => log::LevelFilter::Info,
         LevelFilter::DEBUG => log::LevelFilter::Debug,
         LevelFilter::TRACE => log::LevelFilter::Trace,
+    }
+}
+
+struct TunmuxLogFormat {
+    timer: UtcTime<&'static [time::format_description::FormatItem<'static>]>,
+}
+
+impl TunmuxLogFormat {
+    fn new() -> Self {
+        Self {
+            timer: UtcTime::new(LOG_TIMESTAMP_FORMAT),
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for TunmuxLogFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let meta = event.metadata();
+
+        self.format_timestamp(&mut writer)?;
+        write!(
+            writer,
+            "{} ",
+            FormattedLevel::new(meta.level(), writer.has_ansi_escapes())
+        )?;
+
+        ctx.format_fields(writer.by_ref(), event)?;
+        writer.write_char(' ')?;
+        write_dimmed(&mut writer, meta.target())?;
+        write_dimmed(&mut writer, ":")?;
+        writer.write_char(' ')?;
+        writeln!(writer)
+    }
+}
+
+impl TunmuxLogFormat {
+    fn format_timestamp(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        if writer.has_ansi_escapes() {
+            writer.write_str("\x1b[2m")?;
+            self.timer.format_time(writer)?;
+            writer.write_str("\x1b[0m ")?;
+        } else {
+            self.timer.format_time(writer)?;
+            writer.write_char(' ')?;
+        }
+        Ok(())
+    }
+}
+
+struct FormattedLevel<'a> {
+    level: &'a Level,
+    ansi: bool,
+}
+
+impl<'a> FormattedLevel<'a> {
+    fn new(level: &'a Level, ansi: bool) -> Self {
+        Self { level, ansi }
+    }
+}
+
+impl fmt::Display for FormattedLevel<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match *self.level {
+            Level::TRACE => "TRACE",
+            Level::DEBUG => "DEBUG",
+            Level::INFO => " INFO",
+            Level::WARN => " WARN",
+            Level::ERROR => "ERROR",
+        };
+
+        if !self.ansi {
+            return f.write_str(value);
+        }
+
+        let color = match *self.level {
+            Level::TRACE => "35",
+            Level::DEBUG => "34",
+            Level::INFO => "32",
+            Level::WARN => "33",
+            Level::ERROR => "31",
+        };
+        write!(f, "\x1b[{color}m{value}\x1b[0m")
+    }
+}
+
+fn write_dimmed(writer: &mut Writer<'_>, value: &str) -> fmt::Result {
+    if writer.has_ansi_escapes() {
+        write!(writer, "\x1b[2m{value}\x1b[0m")
+    } else {
+        writer.write_str(value)
     }
 }
 
@@ -107,8 +223,8 @@ pub fn init_terminal(verbose: bool) {
     };
     let level = level_from_env_or_default(default);
     let subscriber = tracing_subscriber::fmt()
-        .compact()
-        .with_timer(UtcTime::new(LOG_TIMESTAMP_FORMAT))
+        .with_ansi(ansi_enabled(true))
+        .event_format(TunmuxLogFormat::new())
         .with_max_level(level)
         .with_writer(std::io::stderr)
         .finish();
@@ -203,9 +319,8 @@ pub fn init_service(verbose: bool) {
     };
     let level = level_from_env_or_default(default);
     let subscriber = tracing_subscriber::fmt()
-        .compact()
-        .with_ansi(false)
-        .with_timer(UtcTime::new(LOG_TIMESTAMP_FORMAT))
+        .with_ansi(ansi_enabled(false))
+        .event_format(TunmuxLogFormat::new())
         .with_max_level(level)
         .with_writer(|| ServiceWriter)
         .finish();
@@ -240,8 +355,8 @@ pub fn init_file_sync(path: &str, verbose: bool) -> anyhow::Result<()> {
     let level = level_from_env_or_default(default);
     let file = Arc::new(OpenOptions::new().create(true).append(true).open(path)?);
     let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_timer(UtcTime::new(LOG_TIMESTAMP_FORMAT))
+        .with_ansi(ansi_enabled(false))
+        .event_format(TunmuxLogFormat::new())
         .with_max_level(level)
         .with_writer(move || SharedFileWriter(file.clone()))
         .finish();

@@ -23,6 +23,9 @@ pub(super) fn run_wg_quick_up(
     if prefer_userspace {
         command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
         command.env("TUNMUX_GOTATUN_HELPER", "1");
+        if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
+            command.env(crate::logging::COLOR_ENV, color);
+        }
         let helper_exe = self_executable_for_spawn()?;
         command.env("WG_QUICK_USERSPACE_IMPLEMENTATION", &helper_exe);
         debug!(
@@ -339,6 +342,9 @@ pub(super) fn run_gotatun_up(
     }
     if debug_enabled {
         command.env("TUNMUX_DEBUG", "1");
+    }
+    if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
+        command.env(crate::logging::COLOR_ENV, color);
     }
     command.env("TUNMUX_GOTATUN_DIAG", "1");
     let status = command
