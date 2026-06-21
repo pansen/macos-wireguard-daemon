@@ -1723,6 +1723,27 @@ fn dns_target_services(policy: DnsPolicy, fp: &MacosDnsFingerprint) -> Vec<Strin
     }
 }
 
+/// A configured tunnel DNS server whose address falls inside a directly-connected
+/// LAN subnet. When that happens the route covering the server is excluded from
+/// the tunnel (see [`macos_route_excluded_by_local_subnet`]), so the server is no
+/// longer reachable through the tunnel: queries would leak onto the LAN and hit
+/// whatever host happens to hold that address. Returns the offending server and
+/// the subnet it collides with so the reconciler can pull tunnel DNS back.
+#[cfg(target_os = "macos")]
+fn macos_dns_server_in_local_subnet(
+    dns_servers: &[String],
+    local_subnets: &[(IpAddr, u8)],
+) -> Option<(IpAddr, (IpAddr, u8))> {
+    dns_servers.iter().find_map(|server| {
+        let ip: IpAddr = server.parse().ok()?;
+        let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
+        local_subnets
+            .iter()
+            .find(|local| macos_subnet_contains(local, &(ip, host_prefix)))
+            .map(|local| (ip, *local))
+    })
+}
+
 /// The pure decision behind a DNS reconcile: given the tunnel's DNS, the freshly
 /// observed environment, the services we currently own, and the services we want
 /// to own, decide what to do. Kept free of I/O so it is unit-testable.
@@ -1838,11 +1859,21 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
 
     let fingerprint = macos_current_dns_fingerprint();
 
+    // If the tunnel's own DNS server now lives inside a directly-connected LAN,
+    // its route is excluded from the tunnel and the server is unreachable through
+    // it. We must pull tunnel DNS back, but joining such a LAN need not change the
+    // DNS fingerprint at all, so this is computed before the identity guard below.
+    let local_subnets = macos_local_connected_subnets(&inputs.interface);
+    let collision = macos_dns_server_in_local_subnet(&inputs.dns_servers, &local_subnets);
+
     let mut dns = state
         .dns
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if fingerprint == dns.fingerprint {
+    // Normally skip when the DNS environment is unchanged. But still act when a
+    // collision means we own services that now need restoring to their originals.
+    let must_pull_back = collision.is_some() && !dns.services.is_empty();
+    if fingerprint == dns.fingerprint && !must_pull_back {
         return false; // cheap identity check, same guard as routes.
     }
 
@@ -1856,7 +1887,21 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         "userspace_helper_dns_change_detected"
     );
 
-    let targets = dns_target_services(DNS_POLICY, &fingerprint);
+    // On a collision, target nothing so every owned service is restored to its
+    // original DNS rather than left pointing at an unreachable (or
+    // LAN-impersonatable) address.
+    let targets = match collision {
+        Some((server, (subnet_ip, subnet_prefix))) => {
+            warn!(
+                interface = inputs.interface,
+                dns_server = %server,
+                local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
+                "userspace_helper_dns_unreachable_local_lan"
+            );
+            Vec::new()
+        }
+        None => dns_target_services(DNS_POLICY, &fingerprint),
+    };
     let owned: Vec<String> = dns.services.iter().map(|s| s.service.clone()).collect();
     let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
 
@@ -2099,11 +2144,19 @@ fn format_macos_network_overview_table(
         &macos_route_overview_rows(routes),
     ));
     lines.push(String::new());
-    lines.push(format!(
+    let dns_collision =
+        macos_dns_server_in_local_subnet(&inputs.dns_servers, &route_fingerprint.local_subnets);
+    let mut dns_header = format!(
         "DNS tunnel_servers={} primary_service={}",
         format_list(&inputs.dns_servers),
         dns_fingerprint.primary_service.as_deref().unwrap_or("none")
-    ));
+    );
+    if let Some((server, (subnet_ip, subnet_prefix))) = dns_collision {
+        dns_header.push_str(&format!(
+            " UNREACHABLE: {server} is inside local LAN {subnet_ip}/{subnet_prefix}, tunnel DNS pulled back"
+        ));
+    }
+    lines.push(dns_header);
     lines.extend(format_table_with_dimmed_rows(
         &[
             "SERVICE",
@@ -2113,7 +2166,7 @@ fn format_macos_network_overview_table(
             "ORIGINAL DNS",
             "STATUS",
         ],
-        &macos_dns_overview_rows(inputs, owned_dns, dns_fingerprint),
+        &macos_dns_overview_rows(inputs, owned_dns, dns_fingerprint, dns_collision.is_some()),
         macos_log_table_ansi_enabled(),
     ));
     lines.join("\n")
@@ -2151,6 +2204,7 @@ fn macos_dns_overview_rows(
     inputs: &MacosReconcileInputs,
     owned_dns: &[MacosDnsServiceState],
     dns_fingerprint: &MacosDnsFingerprint,
+    dns_unreachable: bool,
 ) -> Vec<(Vec<String>, bool)> {
     if dns_fingerprint.services.is_empty() {
         return vec![(
@@ -2166,7 +2220,13 @@ fn macos_dns_overview_rows(
         )];
     }
 
-    let targets = dns_target_services(DNS_POLICY, dns_fingerprint);
+    // A collision pulls tunnel DNS back, so nothing is targeted; reflect that here
+    // too, otherwise the table contradicts the reconciler's actual decision.
+    let targets = if dns_unreachable {
+        Vec::new()
+    } else {
+        dns_target_services(DNS_POLICY, dns_fingerprint)
+    };
     dns_fingerprint
         .services
         .iter()
@@ -2186,6 +2246,9 @@ fn macos_dns_overview_rows(
                 (true, false, true) => "already tunnel DNS",
                 (true, false, false) => "target; not owned",
                 (false, true, _) => "owned; pending restore",
+                // Live DNS still shows the tunnel server, but it now sits on the
+                // local LAN — that address is no longer the VPN resolver.
+                (false, false, true) if dns_unreachable => "stale tunnel DNS on LAN",
                 (false, false, _) => "not targeted",
             };
             (
@@ -2204,7 +2267,9 @@ fn macos_dns_overview_rows(
                         .map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
                     status.to_string(),
                 ],
-                status == "not targeted",
+                // Grey out inactive rows: everything when tunnel DNS is pulled
+                // back (the whole block is dormant), else just untargeted services.
+                dns_unreachable || status == "not targeted",
             )
         })
         .collect()
@@ -2552,6 +2617,72 @@ mod tests {
             gateway: Some("10.0.0.1".to_string()),
         };
         assert!(macos_route_excluded_by_local_subnet(&gatewayed, &[local]).is_none());
+    }
+
+    #[test]
+    fn dns_server_collision_with_local_subnet_is_detected() {
+        let lan = subnet("55.56.57.0/24");
+
+        // Tunnel DNS sits inside the joined LAN -> unreachable through the tunnel.
+        let hit = macos_dns_server_in_local_subnet(&["55.56.57.2".to_string()], &[lan]);
+        assert_eq!(hit, Some(("55.56.57.2".parse().unwrap(), lan)));
+
+        // A DNS server outside every connected subnet is fine.
+        assert!(
+            macos_dns_server_in_local_subnet(&["9.9.9.9".to_string()], &[lan]).is_none(),
+            "off-LAN DNS must not be treated as a collision"
+        );
+
+        // No connected subnets at all -> never a collision.
+        assert!(macos_dns_server_in_local_subnet(&["55.56.57.2".to_string()], &[]).is_none());
+
+        // Any colliding server in the list triggers pull-back; reports the first.
+        let mixed = macos_dns_server_in_local_subnet(
+            &["9.9.9.9".to_string(), "55.56.57.2".to_string()],
+            &[lan],
+        );
+        assert_eq!(mixed, Some(("55.56.57.2".parse().unwrap(), lan)));
+    }
+
+    #[test]
+    fn overview_relabels_unreachable_dns_instead_of_claiming_it_is_active() {
+        let mut inputs = split_inputs();
+        inputs.dns_servers = vec!["55.56.57.2".to_string()];
+        // Every service shows the tunnel DNS; none captured (owned) by us.
+        let fp = dns_fp(
+            Some("Wi-Fi"),
+            &[
+                ("Wi-Fi", Some(&["55.56.57.2"])),
+                ("Thunderbolt Bridge", Some(&["55.56.57.2"])),
+            ],
+        );
+        let status = |rows: &[(Vec<String>, bool)], svc: &str| -> (String, bool) {
+            rows.iter()
+                .find(|(cols, _)| cols[0] == svc)
+                .map(|(cols, dimmed)| (cols[5].clone(), *dimmed))
+                .expect("service row present")
+        };
+
+        // Reachable: the primary genuinely shows tunnel DNS; a secondary is just
+        // untargeted (and dimmed) under PrimaryOnly.
+        let healthy = macos_dns_overview_rows(&inputs, &[], &fp, false);
+        assert_eq!(status(&healthy, "Wi-Fi"), ("already tunnel DNS".into(), false));
+        assert_eq!(
+            status(&healthy, "Thunderbolt Bridge"),
+            ("not targeted".into(), true)
+        );
+
+        // Collision: the same address is now a LAN host, so no row may claim the
+        // tunnel DNS is in use, and the whole dormant block is dimmed.
+        let pulled_back = macos_dns_overview_rows(&inputs, &[], &fp, true);
+        assert_eq!(
+            status(&pulled_back, "Wi-Fi"),
+            ("stale tunnel DNS on LAN".into(), true)
+        );
+        assert_eq!(
+            status(&pulled_back, "Thunderbolt Bridge"),
+            ("stale tunnel DNS on LAN".into(), true)
+        );
     }
 
     // --- DNS reconciler ---
