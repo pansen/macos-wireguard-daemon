@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
 use time::macros::format_description;
+use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::{Event, Level, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::{FormatTime, UtcTime};
 use tracing_subscriber::fmt::FmtContext;
@@ -121,7 +123,8 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let meta = event.metadata();
+        let normalized_meta = event.normalized_metadata();
+        let meta = normalized_meta.as_ref().unwrap_or_else(|| event.metadata());
 
         self.format_timestamp(&mut writer)?;
         write!(
@@ -130,7 +133,11 @@ where
             FormattedLevel::new(meta.level(), writer.has_ansi_escapes())
         )?;
 
-        ctx.format_fields(writer.by_ref(), event)?;
+        if let Some(message) = multiline_message(event) {
+            writer.write_str(&message)?;
+        } else {
+            ctx.format_fields(writer.by_ref(), event)?;
+        }
         writer.write_char(' ')?;
         write_dimmed(&mut writer, meta.target())?;
         write_dimmed(&mut writer, ":")?;
@@ -151,6 +158,28 @@ impl TunmuxLogFormat {
         }
         Ok(())
     }
+}
+
+struct MessageVisitor {
+    message: Option<String>,
+}
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+/// Multi-line messages (e.g. the macOS network overview table) are written
+/// verbatim. Reading the message straight off the raw event preserves real
+/// newlines and ANSI bytes — `ctx.format_fields` would escape control chars as
+/// a log-injection guard, mangling the table's colors.
+fn multiline_message(event: &Event<'_>) -> Option<String> {
+    let mut visitor = MessageVisitor { message: None };
+    event.record(&mut visitor);
+    visitor.message.filter(|message| message.contains('\n'))
 }
 
 struct FormattedLevel<'a> {

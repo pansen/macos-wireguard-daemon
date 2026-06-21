@@ -2063,7 +2063,7 @@ fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
         &owned_dns,
         &dns_fingerprint,
     );
-    info!(reason, interface = inputs.interface, "\n{table}");
+    info!(reason, interface = inputs.interface, "\n{table}\n");
 }
 
 #[cfg(target_os = "macos")]
@@ -2104,7 +2104,7 @@ fn format_macos_network_overview_table(
         format_list(&inputs.dns_servers),
         dns_fingerprint.primary_service.as_deref().unwrap_or("none")
     ));
-    lines.extend(format_table(
+    lines.extend(format_table_with_dimmed_rows(
         &[
             "SERVICE",
             "ROLE",
@@ -2114,6 +2114,7 @@ fn format_macos_network_overview_table(
             "STATUS",
         ],
         &macos_dns_overview_rows(inputs, owned_dns, dns_fingerprint),
+        macos_log_table_ansi_enabled(),
     ));
     lines.join("\n")
 }
@@ -2150,16 +2151,19 @@ fn macos_dns_overview_rows(
     inputs: &MacosReconcileInputs,
     owned_dns: &[MacosDnsServiceState],
     dns_fingerprint: &MacosDnsFingerprint,
-) -> Vec<Vec<String>> {
+) -> Vec<(Vec<String>, bool)> {
     if dns_fingerprint.services.is_empty() {
-        return vec![vec![
-            "none".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            "no".to_string(),
-            "-".to_string(),
-            "no services observed".to_string(),
-        ]];
+        return vec![(
+            vec![
+                "none".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "no".to_string(),
+                "-".to_string(),
+                "no services observed".to_string(),
+            ],
+            true,
+        )];
     }
 
     let targets = dns_target_services(DNS_POLICY, dns_fingerprint);
@@ -2176,31 +2180,61 @@ fn macos_dns_overview_rows(
             let targeted = targets.iter().any(|target| target == service);
             let live_matches_tunnel =
                 live_dns.map(Vec::as_slice) == Some(inputs.dns_servers.as_slice());
-            vec![
-                service.clone(),
-                if dns_fingerprint.primary_service.as_ref() == Some(service) {
-                    "primary"
-                } else {
-                    "secondary"
-                }
-                .to_string(),
-                live_dns.map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
-                if owned.is_some() { "yes" } else { "no" }.to_string(),
-                owned
-                    .and_then(|state| state.dns_servers.as_ref())
-                    .map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
-                match (targeted, owned.is_some(), live_matches_tunnel) {
-                    (true, true, true) => "tunnel DNS active",
-                    (true, true, false) => "owned; pending reapply",
-                    (true, false, true) => "already tunnel DNS",
-                    (true, false, false) => "target; not owned",
-                    (false, true, _) => "owned; pending restore",
-                    (false, false, _) => "not targeted",
-                }
-                .to_string(),
-            ]
+            let status = match (targeted, owned.is_some(), live_matches_tunnel) {
+                (true, true, true) => "tunnel DNS active",
+                (true, true, false) => "owned; pending reapply",
+                (true, false, true) => "already tunnel DNS",
+                (true, false, false) => "target; not owned",
+                (false, true, _) => "owned; pending restore",
+                (false, false, _) => "not targeted",
+            };
+            (
+                vec![
+                    service.clone(),
+                    if dns_fingerprint.primary_service.as_ref() == Some(service) {
+                        "primary"
+                    } else {
+                        "secondary"
+                    }
+                    .to_string(),
+                    live_dns.map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
+                    if owned.is_some() { "yes" } else { "no" }.to_string(),
+                    owned
+                        .and_then(|state| state.dns_servers.as_ref())
+                        .map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
+                    status.to_string(),
+                ],
+                status == "not targeted",
+            )
         })
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_log_table_ansi_enabled() -> bool {
+    let Some(value) = std::env::var_os(crate::logging::COLOR_ENV) else {
+        return false;
+    };
+    matches!(
+        value.to_string_lossy().to_ascii_lowercase().as_str(),
+        "always" | "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn format_table_with_dimmed_rows(
+    headers: &[&str],
+    rows: &[(Vec<String>, bool)],
+    ansi: bool,
+) -> Vec<String> {
+    let plain_rows = rows.iter().map(|(row, _)| row.clone()).collect::<Vec<_>>();
+    let mut lines = format_table(headers, &plain_rows);
+    for (line, (_, dimmed)) in lines.iter_mut().skip(2).zip(rows.iter()) {
+        if ansi && *dimmed {
+            *line = format!("\x1b[2m{line}\x1b[0m");
+        }
+    }
+    lines
 }
 
 #[cfg(target_os = "macos")]
