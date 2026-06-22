@@ -2257,6 +2257,10 @@ fn macos_dns_overview_rows(
     } else {
         dns_target_services(DNS_POLICY, dns_fingerprint)
     };
+    // No settled primary (a transient between networks) means the PrimaryOnly
+    // fallback targets every service, so there is no single active resolver to
+    // highlight — grey the whole block as unsettled, like the pull-back case.
+    let dormant = dns_unreachable || dns_fingerprint.primary_service.is_none();
     dns_fingerprint
         .services
         .iter()
@@ -2297,9 +2301,9 @@ fn macos_dns_overview_rows(
                         .map_or_else(|| "empty".to_string(), |servers| format_list(servers)),
                     status.to_string(),
                 ],
-                // Grey out inactive rows: everything when tunnel DNS is pulled
-                // back (the whole block is dormant), else just untargeted services.
-                dns_unreachable || status == "not targeted",
+                // Grey out inactive rows: the whole block when it is dormant
+                // (pulled back, or no settled primary), else untargeted services.
+                dormant || status == "not targeted",
             )
         })
         .collect()
@@ -2712,6 +2716,25 @@ mod tests {
         assert_eq!(
             status(&pulled_back, "Thunderbolt Bridge"),
             ("stale tunnel DNS on LAN".into(), true)
+        );
+
+        // Transient with no settled primary: PrimaryOnly falls back to all
+        // services, but with no active resolver the whole block is greyed.
+        let no_primary = dns_fp(
+            None,
+            &[
+                ("Wi-Fi", Some(&["55.56.57.2"])),
+                ("Thunderbolt Bridge", Some(&["55.56.57.2"])),
+            ],
+        );
+        let unsettled = macos_dns_overview_rows(&inputs, &[], &no_primary, false);
+        assert_eq!(
+            status(&unsettled, "Wi-Fi"),
+            ("already tunnel DNS".into(), true)
+        );
+        assert_eq!(
+            status(&unsettled, "Thunderbolt Bridge"),
+            ("already tunnel DNS".into(), true)
         );
     }
 
