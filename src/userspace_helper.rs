@@ -491,6 +491,8 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     let mut next_reconcile_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut last_transfer: Option<(u64, u64)> = None;
+    #[cfg(target_os = "macos")]
+    let mut last_probe_sent: Option<(bool, bool)> = None;
 
     #[cfg(target_os = "macos")]
     info!(
@@ -535,6 +537,7 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                         log_macos_dataplane_probe(
                             &running.control_interface_name,
                             &mut last_transfer,
+                            &mut last_probe_sent,
                         )
                         .await;
                     }
@@ -547,12 +550,21 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(u64, u64)>) {
+async fn log_macos_dataplane_probe(
+    interface: &str,
+    last_transfer: &mut Option<(u64, u64)>,
+    last_probe_sent: &mut Option<(bool, bool)>,
+) {
     let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
     let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
         Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
         53,
     )));
+
+    // A probe-send flag flipping (a send starting or stopping to work) is worth
+    // surfacing at INFO; an unchanged flag is not.
+    let probe_sent_changed = *last_probe_sent != Some((ipv4_probe_sent, ipv6_probe_sent));
+    *last_probe_sent = Some((ipv4_probe_sent, ipv6_probe_sent));
 
     match read_wg_transfer_bytes(interface).await {
         Ok(Some((rx_bytes, tx_bytes))) => {
@@ -565,16 +577,34 @@ async fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(
                 })
                 .unwrap_or((0, 0));
             *last_transfer = Some((rx_bytes, tx_bytes));
-            info!(
-                interface,
-                ipv4_probe_sent,
-                ipv6_probe_sent,
-                rx_bytes,
-                tx_bytes,
-                delta_rx_bytes,
-                delta_tx_bytes,
-                "userspace_helper_dataplane_probe"
-            );
+            // Steady idle tunnels probe every 5s with no movement; keep that
+            // heartbeat at DEBUG so default (INFO) logs stay quiet, and only
+            // surface probes that actually moved bytes or changed send state.
+            let noteworthy =
+                delta_rx_bytes != 0 || delta_tx_bytes != 0 || probe_sent_changed;
+            if noteworthy {
+                info!(
+                    interface,
+                    ipv4_probe_sent,
+                    ipv6_probe_sent,
+                    rx_bytes,
+                    tx_bytes,
+                    delta_rx_bytes,
+                    delta_tx_bytes,
+                    "userspace_helper_dataplane_probe"
+                );
+            } else {
+                debug!(
+                    interface,
+                    ipv4_probe_sent,
+                    ipv6_probe_sent,
+                    rx_bytes,
+                    tx_bytes,
+                    delta_rx_bytes,
+                    delta_tx_bytes,
+                    "userspace_helper_dataplane_probe"
+                );
+            }
         }
         Ok(None) => {
             info!(
