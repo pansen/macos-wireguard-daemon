@@ -73,6 +73,21 @@ uninstall/autostart:
 	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
 	rm -f $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
 
+.PHONY: uninstall/dns
+uninstall/dns:
+	@# Clear any tunnel DNS override back to DHCP. A graceful daemon teardown
+	@# already restores DNS; this is the fallback for a force-killed daemon
+	@# (bootout/pkill above) that skipped cleanup. tunmux only ever writes the
+	@# primary service's DNS, so clear that one — resolved dynamically instead
+	@# of assuming Wi-Fi. Falls back to Wi-Fi if the primary can't be determined.
+	@svc=$$(echo 'show State:/Network/Global/IPv4' | scutil | awk -F': ' '/PrimaryService/{print $$2; exit}'); \
+	name=$$(echo "show Setup:/Network/Service/$$svc" | scutil | awk -F': ' '/UserDefinedName/{print $$2; exit}'); \
+	name=$${name:-Wi-Fi}; \
+	echo "==> clearing DNS override on primary service: $$name"; \
+	networksetup -setdnsservers "$$name" Empty
+	dscacheutil -flushcache
+	sudo killall -HUP mDNSResponder
+
 .PHONY: uninstall/privileged
 uninstall/privileged:
 	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
@@ -85,7 +100,7 @@ uninstall/privileged:
 	sudo dseditgroup -o delete tunmux 2>/dev/null || true
 
 .PHONY: uninstall
-uninstall: uninstall/autostart uninstall/privileged
+uninstall: uninstall/autostart uninstall/privileged uninstall/dns
 
 
 .PHONY: check/privileged
