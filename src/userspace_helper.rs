@@ -2143,12 +2143,21 @@ fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (dns.services.clone(), dns.fingerprint.clone())
     };
+    // Snapshot the host's *foreign* tunnels and effective resolver so the
+    // overview shows what else is steering traffic/DNS (e.g. Tailscale). These
+    // are the parts that took a long debugging session to surface by hand.
+    let foreign = MacosForeignSnapshot {
+        tunnels: macos_foreign_tunnels(&inputs.interface),
+        global_resolvers: macos_global_resolvers(),
+        tailscaled_present: tailscaled_socket_present(),
+    };
     let table = format_macos_network_overview_table(
         inputs,
         &routes,
         &route_fingerprint,
         &owned_dns,
         &dns_fingerprint,
+        &foreign,
     );
     info!(reason, interface = inputs.interface, "\n{table}\n");
 }
@@ -2160,6 +2169,7 @@ fn format_macos_network_overview_table(
     route_fingerprint: &MacosNetworkFingerprint,
     owned_dns: &[MacosDnsServiceState],
     dns_fingerprint: &MacosDnsFingerprint,
+    foreign: &MacosForeignSnapshot,
 ) -> String {
     let mut lines = vec![
         "tunmux network overview".to_string(),
@@ -2211,7 +2221,235 @@ fn format_macos_network_overview_table(
         &macos_dns_overview_rows(inputs, owned_dns, dns_fingerprint, dns_collision.is_some()),
         macos_log_table_ansi_enabled(),
     ));
+
+    // Effective system resolver: what macOS actually resolves through right now,
+    // independent of per-service config. Flags the case that stranded a whole
+    // debugging session — the global resolver is a tunnel DNS server that is no
+    // longer the tunnel's (a leak), or some other resolver has taken over.
+    lines.push(String::new());
+    lines.push(format_system_resolver_line(
+        &foreign.global_resolvers,
+        &inputs.dns_servers,
+    ));
+
+    // Foreign tunnels: other VPN/utun interfaces sharing the host, plus a
+    // userspace-Tailscale hint (it has no utun, so the socket is the only tell).
+    lines.push(String::new());
+    lines.push("Other tunnels (foreign VPN / utun interfaces)".to_string());
+    lines.extend(format_table(
+        &["INTERFACE", "MTU", "ADDRESSES", "NOTE"],
+        &foreign_tunnel_overview_rows(&foreign.tunnels),
+    ));
+    lines.push(format!(
+        "tailscaled={}",
+        if foreign.tailscaled_present {
+            "running (socket present; userspace mode has no utun of its own)"
+        } else {
+            "not detected"
+        }
+    ));
+
     lines.join("\n")
+}
+
+/// One-line summary of the effective system resolver and how it relates to the
+/// tunnel's DNS. The mismatch/leak cases are the ones worth eyeballing.
+#[cfg(target_os = "macos")]
+fn format_system_resolver_line(global_resolvers: &[String], tunnel_dns: &[String]) -> String {
+    let note = if global_resolvers.is_empty() {
+        "none (DHCP/unset)"
+    } else if global_resolvers == tunnel_dns {
+        "matches tunnel DNS"
+    } else if !tunnel_dns.is_empty() && global_resolvers.iter().any(|r| tunnel_dns.contains(r)) {
+        "partially tunnel DNS — another resolver is also active"
+    } else {
+        "NOT the tunnel resolver — a foreign VPN/DHCP owns resolution"
+    };
+    format!("System resolver={} ({note})", format_list(global_resolvers))
+}
+
+/// Snapshot of the host environment *outside* tunmux's own routes/DNS — the
+/// other VPNs and the effective resolver — bundled so the overview formatter
+/// stays a single, testable call.
+#[cfg(target_os = "macos")]
+struct MacosForeignSnapshot {
+    tunnels: Vec<ForeignTunnel>,
+    global_resolvers: Vec<String>,
+    tailscaled_present: bool,
+}
+
+/// A non-tunmux tunnel interface sharing the host (another VPN). Surfaced in the
+/// overview so an interfering peer (kernel-mode Tailscale, another WireGuard,
+/// IPSec, …) is visible instead of needing manual `ifconfig`/`netstat`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq)]
+struct ForeignTunnel {
+    interface: String,
+    mtu: Option<u32>,
+    /// Routable addresses (IPv4 + non-link-local IPv6). Empty == link-local only.
+    addresses: Vec<String>,
+    /// Carries a 100.64.0.0/10 (CGNAT) address — the Tailscale tailnet signature.
+    cgnat: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
+    let output = match Command::new("ifconfig").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_foreign_tunnels(&String::from_utf8_lossy(&output.stdout), own_interface)
+}
+
+/// True for interface names that belong to a tunnel/VPN (vs en0, lo0, bridge…).
+#[cfg(target_os = "macos")]
+fn is_tunnel_interface_name(name: &str) -> bool {
+    const PREFIXES: [&str; 6] = ["utun", "tun", "tap", "ppp", "ipsec", "wg"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// 100.64.0.0/10 — RFC 6598 CGNAT, which Tailscale claims wholesale for tailnets.
+#[cfg(target_os = "macos")]
+fn is_cgnat_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+/// Parse `ifconfig` into the foreign tunnel interfaces (UP, tunnel-named, not
+/// our own). Pure so it can be unit-tested against captured fixtures.
+#[cfg(target_os = "macos")]
+fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunnel> {
+    let mut tunnels: Vec<ForeignTunnel> = Vec::new();
+    let mut current: Option<ForeignTunnel> = None;
+
+    for line in ifconfig.lines() {
+        if !line.starts_with(|c: char| c.is_whitespace()) {
+            // Header for a new interface: flush the previous one first.
+            if let Some(tunnel) = current.take() {
+                tunnels.push(tunnel);
+            }
+            let Some((name, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name != own_interface && is_tunnel_interface_name(name) && rest.contains("UP") {
+                let mtu = rest
+                    .split_whitespace()
+                    .skip_while(|t| *t != "mtu")
+                    .nth(1)
+                    .and_then(|m| m.parse::<u32>().ok());
+                current = Some(ForeignTunnel {
+                    interface: name.to_string(),
+                    mtu,
+                    addresses: Vec::new(),
+                    cgnat: false,
+                });
+            }
+            continue;
+        }
+        let Some(tunnel) = current.as_mut() else {
+            continue; // indented line for a non-qualifying interface
+        };
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            if let Some(addr) = rest.split_whitespace().next() {
+                if let Ok(ip) = addr.parse::<Ipv4Addr>() {
+                    tunnel.addresses.push(addr.to_string());
+                    tunnel.cgnat |= is_cgnat_v4(ip);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
+            if let Some(addr) = rest.split_whitespace().next() {
+                let bare = addr.split('%').next().unwrap_or(addr);
+                if let Ok(ip) = bare.parse::<Ipv6Addr>() {
+                    // Skip link-local; it says nothing about what the tunnel routes.
+                    if !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80 {
+                        tunnel.addresses.push(bare.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tunnel) = current.take() {
+        tunnels.push(tunnel);
+    }
+    tunnels
+}
+
+#[cfg(target_os = "macos")]
+fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
+    if tunnels.is_empty() {
+        return vec![vec![
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "no other tunnels".to_string(),
+        ]];
+    }
+    tunnels
+        .iter()
+        .map(|t| {
+            vec![
+                t.interface.clone(),
+                t.mtu.map_or_else(|| "-".to_string(), |m| m.to_string()),
+                if t.addresses.is_empty() {
+                    "link-local only".to_string()
+                } else {
+                    t.addresses.join(", ")
+                },
+                if t.cgnat {
+                    "CGNAT 100.64/10 (Tailscale?)".to_string()
+                } else {
+                    "-".to_string()
+                },
+            ]
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_global_resolvers() -> Vec<String> {
+    let output = match Command::new("scutil").arg("--dns").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_scutil_global_resolvers(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Extract resolvers from the first (default) resolver block of `scutil --dns` —
+/// the ones macOS uses for un-scoped lookups. Pure for testability.
+#[cfg(target_os = "macos")]
+fn parse_scutil_global_resolvers(text: &str) -> Vec<String> {
+    let mut resolvers = Vec::new();
+    let mut in_first_resolver = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("resolver #") {
+            if in_first_resolver {
+                break; // past the default block; later blocks are scoped/secondary
+            }
+            in_first_resolver = trimmed == "resolver #1";
+            continue;
+        }
+        if in_first_resolver {
+            if let Some(value) = trimmed.strip_prefix("nameserver[") {
+                if let Some((_, addr)) = value.split_once("] : ") {
+                    let addr = addr.trim().to_string();
+                    if !resolvers.contains(&addr) {
+                        resolvers.push(addr);
+                    }
+                }
+            }
+        }
+    }
+    resolvers
+}
+
+/// tailscaled (kernel or userspace) registers this socket while running. Cheap
+/// presence check — userspace Tailscale has no utun, so this is the only tell.
+#[cfg(target_os = "macos")]
+fn tailscaled_socket_present() -> bool {
+    std::path::Path::new("/var/run/tailscaled.socket").exists()
 }
 
 #[cfg(target_os = "macos")]
@@ -2748,6 +2986,112 @@ mod tests {
             status(&unsettled, "Thunderbolt Bridge"),
             ("already tunnel DNS".into(), true)
         );
+    }
+
+    // --- foreign tunnels & system resolver overview ---
+
+    #[test]
+    fn parse_foreign_tunnels_excludes_self_and_non_tunnels_flags_cgnat() {
+        // utun4 is ours; utun5 is a foreign link-local-only tunnel; utun6 carries
+        // a CGNAT address (Tailscale-ish); en0/lo0 are not tunnels.
+        let ifconfig = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1384
+\tinet 100.64.1.2 --> 100.64.1.2 netmask 0xffffffff
+utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+\tinet6 fe80::b18c:30f5:afb3:2cfd%utun5 prefixlen 64 scopeid 0x1b
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.96.10.5 --> 100.96.10.5 netmask 0xffffffff
+\tinet6 fe80::dead%utun6 prefixlen 64 scopeid 0x1c
+utun7: flags=0<> mtu 1500
+\tinet 10.9.9.9 netmask 0xffffffff
+";
+        let tunnels = parse_foreign_tunnels(ifconfig, "utun4");
+
+        assert_eq!(
+            tunnels,
+            vec![
+                ForeignTunnel {
+                    interface: "utun5".to_string(),
+                    mtu: Some(1380),
+                    addresses: vec![], // link-local only
+                    cgnat: false,
+                },
+                ForeignTunnel {
+                    interface: "utun6".to_string(),
+                    mtu: Some(1280),
+                    addresses: vec!["100.96.10.5".to_string()],
+                    cgnat: true,
+                },
+            ]
+        );
+        // utun4 (self) excluded; en0/lo0 not tunnels; utun7 is DOWN (no UP flag).
+        assert!(!tunnels.iter().any(|t| t.interface == "utun4"));
+        assert!(!tunnels.iter().any(|t| t.interface == "utun7"));
+    }
+
+    #[test]
+    fn foreign_tunnel_rows_render_empty_and_cgnat() {
+        assert_eq!(
+            foreign_tunnel_overview_rows(&[]),
+            vec![vec![
+                "none".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "no other tunnels".to_string()
+            ]]
+        );
+        let rows = foreign_tunnel_overview_rows(&[ForeignTunnel {
+            interface: "utun6".to_string(),
+            mtu: Some(1280),
+            addresses: vec!["100.96.10.5".to_string()],
+            cgnat: true,
+        }]);
+        assert_eq!(rows[0][0], "utun6");
+        assert_eq!(rows[0][1], "1280");
+        assert_eq!(rows[0][3], "CGNAT 100.64/10 (Tailscale?)");
+    }
+
+    #[test]
+    fn parse_scutil_global_resolvers_takes_only_the_default_block() {
+        let text = "\
+DNS configuration
+
+resolver #1
+  nameserver[0] : 55.56.57.2
+  nameserver[1] : 55.56.57.3
+  flags    : Request A records
+
+resolver #2
+  domain   : local
+  nameserver[0] : 224.0.0.251
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 8.8.8.8
+";
+        assert_eq!(
+            parse_scutil_global_resolvers(text),
+            vec!["55.56.57.2".to_string(), "55.56.57.3".to_string()]
+        );
+    }
+
+    #[test]
+    fn system_resolver_line_flags_match_foreign_and_empty() {
+        let tunnel = vec!["55.56.57.2".to_string()];
+        assert!(format_system_resolver_line(&["55.56.57.2".to_string()], &tunnel)
+            .contains("matches tunnel DNS"));
+        assert!(format_system_resolver_line(&["1.1.1.1".to_string()], &tunnel)
+            .contains("NOT the tunnel resolver"));
+        assert!(
+            format_system_resolver_line(&["55.56.57.2".to_string(), "1.1.1.1".to_string()], &tunnel)
+                .contains("partially tunnel DNS")
+        );
+        assert!(format_system_resolver_line(&[], &tunnel).contains("none (DHCP/unset)"));
     }
 
     // --- DNS reconciler ---
