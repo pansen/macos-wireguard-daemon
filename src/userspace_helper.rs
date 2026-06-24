@@ -1205,9 +1205,7 @@ fn configure_macos_dns(
 
     let fingerprint = macos_current_dns_fingerprint();
     for service in dns_target_services(DNS_POLICY, &fingerprint) {
-        if let Some(state) = capture_macos_dns_service(&service, &config.dns_servers)? {
-            saved.push(state);
-        }
+        saved.push(capture_macos_dns_service(&service, &config.dns_servers)?);
         set_macos_dns_servers(&service, &config.dns_servers)?;
         set_macos_search_domains_empty(&service)?;
     }
@@ -1810,9 +1808,13 @@ fn plan_dns_actions(
 
     for svc in targets {
         let matches_tunnel = shows_tunnel(svc);
-        // Capture an original only when we are about to overwrite a value that
-        // isn't already the tunnel's — never record our own DNS as "original".
-        if !owned.iter().any(|s| s == svc) && !matches_tunnel {
+        // Capture whenever we don't already own the service — even if it already
+        // shows the tunnel DNS. A not-owned service at tunnel DNS is a leak from
+        // an earlier run whose real original is gone; capturing it (with an Empty
+        // original, see `capture_macos_dns_service`) lets teardown clear the stray
+        // instead of stranding an unreachable resolver. Owned services keep their
+        // real captured original and are never re-captured.
+        if !owned.iter().any(|s| s == svc) {
             actions.capture.push(svc.clone());
         }
         if !matches_tunnel {
@@ -1858,23 +1860,34 @@ fn macos_current_dns_fingerprint() -> MacosDnsFingerprint {
 }
 
 /// Read a service's current DNS + search domains and wrap them for later
-/// restore. Returns `Ok(None)` when the service already shows the tunnel's DNS,
-/// so we never capture our own values as "original" (`transparent_dns.md` §6.1).
+/// restore. When the service already shows the tunnel's DNS, its true original
+/// is gone — a prior run set it and never cleaned up (crash, kill, or
+/// `make uninstall`) — so adopt it with an **empty** original: teardown then
+/// clears the stray back to DHCP instead of stranding an unreachable tunnel
+/// resolver. We still never record the tunnel's own servers as the "original"
+/// (`transparent_dns.md` §6.1); the recovery target is Empty, not tunnel DNS.
+/// The tunnel resolver is only reachable through the tunnel, so a service
+/// pinned to it without a tunnel is broken by definition — Empty is the only
+/// safe restore.
 #[cfg(target_os = "macos")]
 fn capture_macos_dns_service(
     service: &str,
     tunnel_dns: &[String],
-) -> anyhow::Result<Option<MacosDnsServiceState>> {
+) -> anyhow::Result<MacosDnsServiceState> {
     let dns = get_macos_dns_servers(service)?;
     if dns.as_deref() == Some(tunnel_dns) {
-        return Ok(None);
+        return Ok(MacosDnsServiceState {
+            service: service.to_string(),
+            dns_servers: None,
+            search_domains: None,
+        });
     }
     let search = get_macos_search_domains(service)?;
-    Ok(Some(MacosDnsServiceState {
+    Ok(MacosDnsServiceState {
         service: service.to_string(),
         dns_servers: dns,
         search_domains: search,
-    }))
+    })
 }
 
 /// Re-apply DNS when the host DNS environment changed (roam, DHCP renewal, a new
@@ -1944,11 +1957,10 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     let mut capture_failed: Vec<&str> = Vec::new();
     for svc in &actions.capture {
         match capture_macos_dns_service(svc, &inputs.dns_servers) {
-            Ok(Some(saved)) => {
+            Ok(saved) => {
                 dns.services.push(saved);
                 captured += 1;
             }
-            Ok(None) => {} // already showing tunnel DNS; nothing to capture
             Err(_) => {
                 errors += 1;
                 capture_failed.push(svc.as_str());
@@ -2876,6 +2888,23 @@ mod tests {
         let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
         assert_eq!(actions, DnsActions::default());
+    }
+
+    #[test]
+    fn plan_dns_adopts_leaked_tunnel_dns_on_unowned_target() {
+        // A prior run left tunnel DNS on the primary but we don't own it (its
+        // saved original was lost to a crash/kill/uninstall). Capture it so
+        // teardown can restore it to Empty — otherwise the unreachable tunnel
+        // resolver is stranded forever. Differs from the owned steady state:
+        // here `owned` is empty.
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(&tunnel(), &fp, &[], &targets);
+
+        assert_eq!(actions.capture, vec!["Wi-Fi".to_string()]); // adopt the leak
+        assert!(actions.apply.is_empty()); // already tunnel DNS; nothing to re-assert
+        assert!(actions.restore.is_empty());
+        assert!(actions.drop.is_empty());
     }
 
     #[test]
