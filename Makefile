@@ -6,6 +6,10 @@ TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
 submodule:
 	git submodule update --init --recursive
 
+.PHONY: hooks
+hooks:
+	git config core.hooksPath scripts/hooks
+
 .PHONY: build.release
 build.release: submodule
 	cargo build --release

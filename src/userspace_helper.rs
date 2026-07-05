@@ -580,8 +580,7 @@ async fn log_macos_dataplane_probe(
             // Steady idle tunnels probe every 5s with no movement; keep that
             // heartbeat at DEBUG so default (INFO) logs stay quiet, and only
             // surface probes that actually moved bytes or changed send state.
-            let noteworthy =
-                delta_rx_bytes != 0 || delta_tx_bytes != 0 || probe_sent_changed;
+            let noteworthy = delta_rx_bytes != 0 || delta_tx_bytes != 0 || probe_sent_changed;
             if noteworthy {
                 info!(
                     interface,
@@ -2950,7 +2949,10 @@ mod tests {
         // Reachable: the primary genuinely shows tunnel DNS; a secondary is just
         // untargeted (and dimmed) under PrimaryOnly.
         let healthy = macos_dns_overview_rows(&inputs, &[], &fp, false);
-        assert_eq!(status(&healthy, "Wi-Fi"), ("already tunnel DNS".into(), false));
+        assert_eq!(
+            status(&healthy, "Wi-Fi"),
+            ("already tunnel DNS".into(), false)
+        );
         assert_eq!(
             status(&healthy, "Thunderbolt Bridge"),
             ("not targeted".into(), true)
@@ -3083,14 +3085,19 @@ resolver #1
     #[test]
     fn system_resolver_line_flags_match_foreign_and_empty() {
         let tunnel = vec!["55.56.57.2".to_string()];
-        assert!(format_system_resolver_line(&["55.56.57.2".to_string()], &tunnel)
-            .contains("matches tunnel DNS"));
-        assert!(format_system_resolver_line(&["1.1.1.1".to_string()], &tunnel)
-            .contains("NOT the tunnel resolver"));
         assert!(
-            format_system_resolver_line(&["55.56.57.2".to_string(), "1.1.1.1".to_string()], &tunnel)
-                .contains("partially tunnel DNS")
+            format_system_resolver_line(&["55.56.57.2".to_string()], &tunnel)
+                .contains("matches tunnel DNS")
         );
+        assert!(
+            format_system_resolver_line(&["1.1.1.1".to_string()], &tunnel)
+                .contains("NOT the tunnel resolver")
+        );
+        assert!(format_system_resolver_line(
+            &["55.56.57.2".to_string(), "1.1.1.1".to_string()],
+            &tunnel
+        )
+        .contains("partially tunnel DNS"));
         assert!(format_system_resolver_line(&[], &tunnel).contains("none (DHCP/unset)"));
     }
 

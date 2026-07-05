@@ -33,6 +33,14 @@ activation (see `etc/me.pansen.tunmux.privileged.plist`).
 cargo build
 ```
 
+To catch formatting issues before they hit CI, install the repo's git hooks once per clone:
+
+```bash
+make hooks
+```
+
+This points `core.hooksPath` at `scripts/hooks`, which runs `cargo fmt --all --check` on commit.
+
 ## Release CI (Tag-Based)
 
 Pushing a `v*` tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:

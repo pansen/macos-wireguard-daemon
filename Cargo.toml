@@ -25,7 +25,6 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP (hook helpers: connectivity / external-ip checks)
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies", "blocking"], default-features = false }
-hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
