@@ -54,4 +54,4 @@ nix = { version = "0.29", features = ["fs", "signal", "process", "user"] }
 
 # Daemonization and userspace WireGuard
 daemonize = "0.5"
-gotatun = { version = "0.7.1", features = ["device", "tun"] }
+gotatun = { version = "0.8.1", features = ["device", "tun"] }
