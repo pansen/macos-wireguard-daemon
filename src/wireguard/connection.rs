@@ -20,27 +20,13 @@ pub struct ConnectionState {
     pub backend: WgBackend,
     pub server_endpoint: String,
     pub server_display_name: String,
-    pub original_gateway_ip: Option<String>,
-    pub original_gateway_iface: Option<String>,
-    pub original_resolv_conf: Option<String>,
-    pub namespace_name: Option<String>,
-    pub proxy_pid: Option<u32>,
-    pub socks_port: Option<u16>,
-    pub http_port: Option<u16>,
     #[serde(default)]
     pub dns_servers: Vec<String>,
-    /// Base64-encoded WireGuard public key of the remote peer (local-proxy mode).
+    /// Canonicalized path of the source `.conf` this tunnel was brought up from
+    /// (wgconf direct mode only). Lets a repeat `connect --if-missing` recognize
+    /// that the same source is already live and no-op instead of erroring.
     #[serde(default)]
-    pub peer_public_key: Option<String>,
-    /// Base64-encoded WireGuard public key of this client (local-proxy mode).
-    #[serde(default)]
-    pub local_public_key: Option<String>,
-    /// Virtual IP/CIDR strings assigned to this client (local-proxy mode).
-    #[serde(default)]
-    pub virtual_ips: Vec<String>,
-    /// WireGuard persistent keepalive interval in seconds (local-proxy mode).
-    #[serde(default)]
-    pub keepalive_secs: Option<u16>,
+    pub source_path: Option<String>,
 }
 
 impl ConnectionState {
@@ -101,11 +87,47 @@ impl ConnectionState {
         Ok(())
     }
 
-    /// Check if an instance name is already in use.
+    /// Best-effort probe of whether this saved connection is still actually
+    /// active on the system. Used to tell a real, live tunnel apart from stale
+    /// state left behind by a reboot or crash (e.g. a `_direct.json` whose
+    /// interface and control socket no longer exist after boot).
     #[must_use]
-    pub fn exists(instance: &str) -> bool {
-        config::connections_dir()
-            .join(format!("{}.json", instance))
-            .exists()
+    pub fn is_live(&self) -> bool {
+        use super::{userspace, wg_quick};
+        match self.backend {
+            WgBackend::Userspace => userspace::is_interface_active(&self.interface_name),
+            // Kernel and wg-quick both back a named interface (Linux) or a
+            // kernel-assigned utunN (macOS); the same probe applies.
+            WgBackend::WgQuick | WgBackend::Kernel => {
+                wg_quick::is_interface_active(&self.interface_name)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wireguard::backend::WgBackend;
+
+    fn sample(backend: WgBackend, interface: &str) -> ConnectionState {
+        ConnectionState {
+            instance_name: DIRECT_INSTANCE.to_string(),
+            provider: "wgconf".to_string(),
+            interface_name: interface.to_string(),
+            backend,
+            server_endpoint: "198.51.100.1:51820".to_string(),
+            server_display_name: "test".to_string(),
+            dns_servers: vec![],
+            source_path: None,
+        }
+    }
+
+    // The reboot bug: a saved userspace tunnel whose control socket no longer
+    // exists must be reported as not live (so the stale state gets pruned).
+    #[test]
+    fn userspace_state_with_missing_interface_is_not_live() {
+        let state = sample(WgBackend::Userspace, "__tunmux_nonexistent_test_iface__");
+        assert!(!state.is_live());
     }
 }

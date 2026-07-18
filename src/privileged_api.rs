@@ -1,8 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use std::net::IpAddr;
-use std::path::{Component, Path};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WgQuickAction {
     Up,
@@ -16,82 +13,8 @@ pub enum GotaTunAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum KillSignal {
-    Term,
-    Kill,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrivilegedRequest {
-    NamespaceCreate {
-        name: String,
-    },
-    NamespaceDelete {
-        name: String,
-    },
-    NamespaceExists {
-        name: String,
-    },
-
-    InterfaceCreateWireguard {
-        name: String,
-    },
-    InterfaceDelete {
-        name: String,
-    },
-    InterfaceMoveToNetns {
-        interface: String,
-        namespace: String,
-    },
-
-    NetnsExec {
-        namespace: String,
-        args: Vec<String>,
-    },
-
-    HostIpAddrAdd {
-        interface: String,
-        cidr: String,
-    },
-    HostIpLinkSetUp {
-        interface: String,
-    },
-    HostIpLinkSetMtu {
-        interface: String,
-        mtu: u16,
-    },
-    HostIpRouteAdd {
-        destination: String,
-        via: Option<String>,
-        dev: String,
-    },
-    HostIpRouteDel {
-        destination: String,
-        via: Option<String>,
-        dev: String,
-    },
-    HostResolvedSetDns {
-        interface: String,
-        dns_servers: Vec<String>,
-    },
-    HostResolvedRevertDns {
-        interface: String,
-    },
-
-    WireguardSet {
-        interface: String,
-        private_key: String,
-        peer_public_key: String,
-        endpoint: String,
-        allowed_ips: String,
-    },
-    WireguardSetPsk {
-        interface: String,
-        peer_public_key: String,
-        psk: String,
-    },
-
     WgQuickRun {
         action: WgQuickAction,
         interface: String,
@@ -104,35 +27,12 @@ pub enum PrivilegedRequest {
         action: GotaTunAction,
         interface: String,
         config_content: String,
+        #[serde(default)]
+        mtu_override: Option<u16>,
+        #[serde(default)]
+        debug: bool,
     },
 
-    EnsureDir {
-        path: String,
-        mode: u32,
-    },
-    WriteFile {
-        path: String,
-        contents: Vec<u8>,
-        mode: u32,
-    },
-    RemoveDirAll {
-        path: String,
-    },
-
-    KillPid {
-        pid: u32,
-        signal: KillSignal,
-    },
-    SpawnProxyDaemon {
-        netns: String,
-        interface: String,
-        socks_port: u16,
-        http_port: u16,
-        proxy_access_log: bool,
-        pid_file: String,
-        log_file: String,
-        startup_status_file: String,
-    },
     LeaseAcquire {
         token: String,
     },
@@ -141,8 +41,16 @@ pub enum PrivilegedRequest {
     },
     ShutdownIfIdle,
 
-    /// Run `wg show <interface>` and return the output (works for kernel, wg-quick, and
-    /// userspace backends since the `wg` tool reads the UAPI socket at
+    /// Liveness probe for a userspace tunnel: returns whether the UAPI control
+    /// socket at `/var/run/wireguard/<interface>.sock` exists. Run by the
+    /// privileged service (root) because that directory is `0750 root:daemon`
+    /// and cannot be stat'd by an unprivileged caller — a local `exists()`
+    /// check there is permission-blind and always reports the tunnel as down.
+    InterfaceActive {
+        interface: String,
+    },
+
+    /// Run `wg show <interface>` and return the output (reads the UAPI socket at
     /// `/var/run/wireguard/<interface>.sock` for userspace interfaces).
     WgShow {
         interface: String,
@@ -162,100 +70,6 @@ pub enum PrivilegedResponse {
 impl PrivilegedRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::NamespaceCreate { name }
-            | Self::NamespaceDelete { name }
-            | Self::NamespaceExists { name } => validate_namespace_name(name),
-            Self::InterfaceCreateWireguard { name } | Self::InterfaceDelete { name } => {
-                validate_interface_name(name)
-            }
-            Self::InterfaceMoveToNetns {
-                interface,
-                namespace,
-            } => {
-                validate_interface_name(interface)?;
-                validate_namespace_name(namespace)?;
-                Ok(())
-            }
-            Self::NetnsExec { namespace, args } => {
-                validate_namespace_name(namespace)?;
-                validate_netns_exec_args(args)
-            }
-            Self::HostIpAddrAdd { interface, cidr } => {
-                validate_interface_name(interface)?;
-                validate_cidr(cidr)
-            }
-            Self::HostIpLinkSetUp { interface } => validate_interface_name(interface),
-            Self::HostIpLinkSetMtu { interface, mtu } => {
-                validate_interface_name(interface)?;
-                if *mtu < 576 {
-                    return Err("mtu must be >= 576".into());
-                }
-                Ok(())
-            }
-            Self::HostIpRouteAdd {
-                destination,
-                via,
-                dev,
-            }
-            | Self::HostIpRouteDel {
-                destination,
-                via,
-                dev,
-            } => {
-                // dev may be a physical uplink (eth0, wlan0, enp2s0, …) not just a VPN interface
-                validate_host_interface_name(dev)?;
-                validate_route_destination(destination)?;
-                if let Some(gateway) = via {
-                    validate_ipv4_like(gateway)?;
-                }
-                Ok(())
-            }
-            Self::HostResolvedSetDns {
-                interface,
-                dns_servers,
-            } => {
-                validate_interface_name(interface)?;
-                if dns_servers.is_empty() {
-                    return Err("dns_servers cannot be empty".into());
-                }
-                for dns in dns_servers {
-                    validate_ipv4_like(dns)?;
-                }
-                Ok(())
-            }
-            Self::HostResolvedRevertDns { interface } => validate_interface_name(interface),
-            Self::WireguardSet {
-                interface,
-                private_key,
-                peer_public_key,
-                endpoint,
-                allowed_ips,
-            } => {
-                validate_interface_name(interface)?;
-                if private_key.is_empty() {
-                    return Err("private_key cannot be empty".into());
-                }
-                if peer_public_key.is_empty() {
-                    return Err("peer_public_key cannot be empty".into());
-                }
-                validate_host_endpoint(endpoint)?;
-                validate_allowed_ips(allowed_ips)?;
-                Ok(())
-            }
-            Self::WireguardSetPsk {
-                interface,
-                peer_public_key,
-                psk,
-            } => {
-                validate_interface_name(interface)?;
-                if peer_public_key.is_empty() {
-                    return Err("peer_public_key cannot be empty".into());
-                }
-                if psk.is_empty() {
-                    return Err("psk cannot be empty".into());
-                }
-                Ok(())
-            }
             Self::WgQuickRun {
                 interface,
                 provider,
@@ -269,76 +83,30 @@ impl PrivilegedRequest {
                 action,
                 interface,
                 config_content,
+                mtu_override,
+                ..
             } => {
                 validate_interface_name(interface)?;
                 if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
                     return Err("config_content cannot be empty".into());
                 }
-                Ok(())
-            }
-            Self::EnsureDir { path, .. } => validate_ensure_dir_path(path),
-            Self::WriteFile { path, .. } => validate_write_path(path),
-            Self::RemoveDirAll { path } => validate_remove_dir_path(path),
-            Self::KillPid { pid, .. } => {
-                if *pid == 0 {
-                    return Err("pid cannot be zero".into());
+                if let Some(mtu) = mtu_override {
+                    crate::wireguard::config::validate_mtu(*mtu).map_err(|e| e.to_string())?;
                 }
-                Ok(())
-            }
-            Self::SpawnProxyDaemon {
-                netns,
-                interface,
-                socks_port,
-                http_port,
-                proxy_access_log: _,
-                pid_file,
-                log_file,
-                startup_status_file,
-            } => {
-                validate_namespace_name(netns)?;
-                validate_interface_name(interface)?;
-                if *socks_port == 0 || *http_port == 0 {
-                    return Err("ports must be non-zero".into());
-                }
-                validate_write_path(pid_file)?;
-                validate_write_path(log_file)?;
-                validate_write_path(startup_status_file)?;
                 Ok(())
             }
             Self::LeaseAcquire { token } | Self::LeaseRelease { token } => {
                 validate_lease_token(token)
             }
             Self::ShutdownIfIdle => Ok(()),
+            Self::InterfaceActive { interface } => validate_interface_name(interface),
             Self::WgShow { interface } => validate_interface_name(interface),
         }
     }
 }
 
-pub fn validate_namespace_name(name: &str) -> Result<(), String> {
-    if !name.starts_with("tunmux_") {
-        return Err("namespace must start with tunmux_".into());
-    }
-
-    let suffix = &name["tunmux_".len()..];
-    if suffix.is_empty() || suffix.len() > 32 {
-        return Err("namespace suffix must be 1..=32 chars".into());
-    }
-
-    if !suffix
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err("namespace may only contain lowercase letters, digits, and '-'".into());
-    }
-
-    Ok(())
-}
-
 fn validate_interface_name(interface: &str) -> Result<(), String> {
-    if matches!(
-        interface,
-        "proton0" | "airvpn0" | "mullvad0" | "ivpn0" | "wgconf0"
-    ) {
+    if interface == "wgconf0" {
         return Ok(());
     }
     // On macOS, WireGuard TUN interfaces are named utunN (kernel-assigned).
@@ -352,10 +120,7 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
         }
     }
     if !interface.starts_with("wg-") {
-        return Err(
-            "interface must be proton0, airvpn0, mullvad0, ivpn0, wgconf0, utun, utunN, or wg-*"
-                .into(),
-        );
+        return Err("interface must be wgconf0, utun, utunN, or wg-*".into());
     }
     let suffix = &interface["wg-".len()..];
     if suffix.is_empty() || suffix.len() > 12 {
@@ -370,29 +135,11 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepts any plausible Linux network interface name (eth0, wlan0, enp2s0, …).
-/// Used for route `dev` fields where the device may be a physical uplink.
-fn validate_host_interface_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.len() > 15 {
-        return Err("interface name must be 1..=15 chars".into());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err("interface name contains invalid characters".into());
-    }
-    Ok(())
-}
-
 fn validate_provider(provider: &str) -> Result<(), String> {
-    if matches!(
-        provider,
-        "proton" | "airvpn" | "mullvad" | "ivpn" | "wgconf"
-    ) {
+    if provider == "wgconf" {
         Ok(())
     } else {
-        Err("provider must be proton, airvpn, mullvad, ivpn or wgconf".into())
+        Err("provider must be wgconf".into())
     }
 }
 
@@ -409,190 +156,13 @@ fn validate_lease_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_netns_exec_args(args: &[String]) -> Result<(), String> {
-    let is_addr_add = |a: &[&str]| {
-        a.len() == 6
-            && a[0] == "ip"
-            && a[1] == "addr"
-            && a[2] == "add"
-            && a[4] == "dev"
-            && validate_interface_name(a[5]).is_ok()
-            && validate_cidr(a[3]).is_ok()
-    };
-    let is_link_up = |a: &[&str]| {
-        a.len() == 6
-            && a[0] == "ip"
-            && a[1] == "link"
-            && a[2] == "set"
-            && a[3] == "up"
-            && a[4] == "dev"
-            && validate_interface_name(a[5]).is_ok()
-    };
-    let is_route_default_v4 = |a: &[&str]| {
-        a.len() == 6
-            && a[0] == "ip"
-            && a[1] == "route"
-            && a[2] == "add"
-            && a[3] == "default"
-            && a[4] == "dev"
-            && validate_interface_name(a[5]).is_ok()
-    };
-    let is_route_default_v6 = |a: &[&str]| {
-        a.len() == 7
-            && a[0] == "ip"
-            && a[1] == "-6"
-            && a[2] == "route"
-            && a[3] == "add"
-            && a[4] == "default"
-            && a[5] == "dev"
-            && validate_interface_name(a[6]).is_ok()
-    };
-
-    let args_strs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if is_addr_add(&args_strs)
-        || is_link_up(&args_strs)
-        || is_route_default_v4(&args_strs)
-        || is_route_default_v6(&args_strs)
-    {
-        return Ok(());
-    }
-    Err("disallowed netns exec command".into())
-}
-
-fn validate_route_destination(destination: &str) -> Result<(), String> {
-    if destination == "default" {
-        return Ok(());
-    }
-    validate_cidr(destination)
-}
-
-fn validate_host_endpoint(endpoint: &str) -> Result<(), String> {
-    let mut parts = endpoint.rsplitn(2, ':');
-    let port = parts.next().ok_or("endpoint missing port")?;
-    let host = parts.next().ok_or("endpoint missing host")?;
-    let host = host.trim_matches(['[', ']']);
-    if host.is_empty() || port.is_empty() {
-        return Err("endpoint format invalid".into());
-    }
-    port.parse::<u16>()
-        .map_err(|_| "invalid endpoint port".to_string())?;
-    host.parse::<IpAddr>()
-        .map_err(|_| "invalid endpoint host".to_string())?;
-    Ok(())
-}
-
-fn validate_allowed_ips(allowed: &str) -> Result<(), String> {
-    if allowed.is_empty() {
-        return Err("allowed_ips cannot be empty".into());
-    }
-    for part in allowed.split(',') {
-        validate_cidr(part.trim())?;
-    }
-    Ok(())
-}
-
-fn validate_ipv4_like(addr: &str) -> Result<(), String> {
-    addr.parse::<IpAddr>()
-        .map_err(|_| format!("invalid IP: {}", addr))
-        .map(|_| ())
-}
-
-fn validate_cidr(cidr: &str) -> Result<(), String> {
-    let mut split = cidr.split('/');
-    let addr = split.next().ok_or("invalid cidr")?;
-    let prefix = split.next().ok_or("invalid cidr (missing /)")?;
-    if split.next().is_some() {
-        return Err("invalid cidr (too many segments)".into());
-    }
-    let _ = addr
-        .parse::<IpAddr>()
-        .map_err(|_| "invalid cidr address".to_string())?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| "invalid cidr prefix".to_string())?;
-    if prefix > 128 {
-        return Err("invalid cidr prefix".into());
-    }
-    Ok(())
-}
-
-fn validate_write_path(path: &str) -> Result<(), String> {
-    validate_no_parent_component(path)?;
-
-    if path == "/etc/resolv.conf" {
-        return Ok(());
-    }
-    if is_managed_netns_resolv(path)? {
-        return Ok(());
-    }
-    if path.starts_with("/var/lib/tunmux/") {
-        return Ok(());
-    }
-    Err("path is not allowed for file write".into())
-}
-
-fn validate_ensure_dir_path(path: &str) -> Result<(), String> {
-    validate_no_parent_component(path)?;
-    if let Some(suffix) = path.strip_prefix("/etc/netns/") {
-        validate_namespace_name(suffix)?;
-        return Ok(());
-    }
-    if path.starts_with("/var/lib/tunmux/") {
-        return Ok(());
-    }
-    Err("path is not allowed for directory creation".into())
-}
-
-fn validate_remove_dir_path(path: &str) -> Result<(), String> {
-    validate_no_parent_component(path)?;
-    if let Some(suffix) = path.strip_prefix("/etc/netns/") {
-        if suffix.contains('/') || suffix.is_empty() {
-            return Err("invalid namespace path".into());
-        }
-        validate_namespace_name(suffix)?;
-        return Ok(());
-    }
-    Err("remove dir is allowed only for /etc/netns/<namespace>".into())
-}
-
-fn is_managed_netns_resolv(path: &str) -> Result<bool, String> {
-    let prefix = "/etc/netns/";
-    if !path.starts_with(prefix) {
-        return Ok(false);
-    }
-    let suffix = &path[prefix.len()..];
-    let (ns, file) = suffix.split_once('/').ok_or("invalid /etc/netns path")?;
-    if file != "resolv.conf" {
-        return Err("only /etc/netns/<ns>/resolv.conf is allowed".into());
-    }
-    validate_namespace_name(ns)?;
-    Ok(true)
-}
-
-fn validate_no_parent_component(path: &str) -> Result<(), String> {
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        return Err("path must be absolute".into());
-    }
-    for c in path.components() {
-        if matches!(c, Component::ParentDir | Component::CurDir) {
-            return Err("path components cannot include .. or .".into());
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        validate_host_endpoint, validate_interface_name, validate_provider, PrivilegedRequest,
-    };
+    use super::{validate_interface_name, validate_provider};
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
-        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0", "wgconf0"] {
-            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
-        }
+        assert!(validate_interface_name("wgconf0").is_ok());
     }
 
     #[test]
@@ -611,28 +181,7 @@ mod tests {
 
     #[test]
     fn known_providers_are_allowed() {
-        for provider in ["proton", "airvpn", "mullvad", "ivpn", "wgconf"] {
-            assert!(validate_provider(provider).is_ok(), "provider {}", provider);
-        }
-    }
-
-    #[test]
-    fn bracketed_ipv6_endpoint_is_allowed() {
-        assert!(validate_host_endpoint("[2001:db8::1]:51820").is_ok());
-    }
-
-    #[test]
-    fn resolved_dns_request_validates_ip_entries() {
-        let ok = PrivilegedRequest::HostResolvedSetDns {
-            interface: "proton0".to_string(),
-            dns_servers: vec!["10.2.0.1".to_string(), "2606:4700:4700::1111".to_string()],
-        };
-        assert!(ok.validate().is_ok());
-
-        let bad = PrivilegedRequest::HostResolvedSetDns {
-            interface: "proton0".to_string(),
-            dns_servers: vec!["not-an-ip".to_string()],
-        };
-        assert!(bad.validate().is_err());
+        assert!(validate_provider("wgconf").is_ok());
+        assert!(validate_provider("proton").is_err());
     }
 }

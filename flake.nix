@@ -1,5 +1,5 @@
 {
-  description = "tunmux - Multi-Provider VPN CLI + Android App";
+  description = "tunmux - WireGuard config-file VPN CLI (macOS)";
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-25.11";
@@ -9,14 +9,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    android-nixpkgs = {
-      url = "github:tadfisher/android-nixpkgs";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
-    { nixpkgs, android-nixpkgs, rust-overlay, flake-utils, devshell, ... }:
+    { nixpkgs, rust-overlay, flake-utils, devshell, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -28,15 +24,12 @@
         };
 
         common-toolchain = import ./nix/common-toolchain.nix { inherit pkgs; };
-
-        android-toolchain = import ./nix/android-toolchain.nix {
-          inherit pkgs nixpkgs android-nixpkgs system common-toolchain;
-        };
       in
       {
         devShells = {
-          default = import ./nix/android-devshell.nix {
-            inherit pkgs android-toolchain;
+          default = pkgs.devshell.mkShell {
+            name = "tunmux";
+            packages = [ common-toolchain.rust-toolchain-base ] ++ common-toolchain.commonPackages;
           };
         };
       }

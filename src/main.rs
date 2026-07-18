@@ -1,35 +1,17 @@
-mod airvpn;
 mod cli;
 mod config;
 mod error;
-mod ivpn;
-mod local_proxy;
 mod logging;
-mod mullvad;
-#[cfg(target_os = "linux")]
-mod netns;
-#[cfg(not(target_os = "linux"))]
-#[path = "netns_stub.rs"]
-mod netns;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
-mod proton;
-#[cfg(all(feature = "proxy", target_os = "linux"))]
-#[path = "proxy/mod.rs"]
-mod proxy;
-#[cfg(not(all(feature = "proxy", target_os = "linux")))]
-#[path = "proxy_stub.rs"]
-mod proxy;
 mod shared;
 mod userspace_helper;
 mod wgconf;
 mod wireguard;
 
-use base64::Engine as _;
-
 use clap::Parser;
-use tracing::{error, info};
+use tracing::error;
 
 use cli::{
     Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
@@ -42,6 +24,9 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    if cli.verbose {
+        logging::enable_debug();
+    }
 
     match cli.command {
         // Privileged control server.
@@ -52,7 +37,9 @@ fn main() {
             idle_timeout_ms,
             autostarted,
         } => {
-            init_logging(cli.verbose);
+            // The privileged service captures per-request log output so it can be streamed back
+            // to the calling CLI (see logging::begin_log_capture / privileged::process_request).
+            logging::init_service(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
                 std::process::exit(1);
@@ -67,48 +54,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        // ProxyDaemon runs its own single-threaded runtime and daemonizes.
-        // Do not initialize terminal logging here -- the daemon sets up file logging itself.
-        TopCommand::ProxyDaemon {
-            netns,
-            interface,
-            socks_port,
-            http_port,
-            proxy_access_log,
-            pid_file,
-            log_file,
-            startup_status_file,
-        } => {
-            if let Err(e) = proxy::daemon::run(
-                &netns,
-                &interface,
-                socks_port,
-                http_port,
-                proxy_access_log,
-                &pid_file,
-                &log_file,
-                &startup_status_file,
-            ) {
-                eprintln!("proxy-daemon error: {}", e);
-                std::process::exit(1);
-            }
-        }
-
-        // LocalProxyDaemon: userspace WireGuard, no root/netns required.
-        TopCommand::LocalProxyDaemon {
-            socks_port: _,
-            http_port: _,
-            proxy_access_log: _,
-            pid_file,
-            log_file,
-            config_b64,
-        } => {
-            if let Err(e) = run_local_proxy_daemon(&pid_file, &log_file, &config_b64) {
-                eprintln!("local-proxy-daemon error: {}", e);
-                std::process::exit(1);
-            }
-        }
-
         // Status and Wg are quick sync commands, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
@@ -149,10 +94,6 @@ fn init_logging(verbose: bool) {
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match command {
-        TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
-        TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
-        TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
-        TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
         TopCommand::Wgconf { command } => wgconf::handlers::dispatch(command, &config).await,
         TopCommand::Connect { provider } => run_connect(provider, &config).await,
         TopCommand::Disconnect {
@@ -161,11 +102,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             all,
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Hook { command } => run_hook_command(command),
-        TopCommand::Status
-        | TopCommand::Wg
-        | TopCommand::ProxyDaemon { .. }
-        | TopCommand::LocalProxyDaemon { .. }
-        | TopCommand::Privileged { .. } => {
+        TopCommand::Status | TopCommand::Wg | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }
@@ -301,18 +238,6 @@ async fn run_connect(
     config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
-        ConnectProviderCommand::Proton(args) => {
-            proton::handlers::dispatch(cli::ProtonCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Airvpn(args) => {
-            airvpn::handlers::dispatch(cli::AirVpnCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Mullvad(args) => {
-            mullvad::handlers::dispatch(cli::MullvadCommand::Connect(args), config).await
-        }
-        ConnectProviderCommand::Ivpn(args) => {
-            ivpn::handlers::dispatch(cli::IvpnCommand::Connect(args), config).await
-        }
         ConnectProviderCommand::Wgconf(args) => {
             wgconf::handlers::dispatch(cli::WgconfCommand::Connect(args), config).await
         }
@@ -396,13 +321,9 @@ async fn run_disconnect(
         _ => {
             println!("Multiple active connections. Specify which to disconnect:\n");
             for conn in &connections {
-                let ports = match (conn.socks_port, conn.http_port) {
-                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
-                    _ => "-".to_string(),
-                };
                 println!(
-                    "  {:<12} {:<9} {:<24} {}",
-                    conn.instance_name, conn.provider, conn.server_display_name, ports
+                    "  {:<12} {:<9} {}",
+                    conn.instance_name, conn.provider, conn.server_display_name
                 );
             }
             println!("\nUsage: tunmux disconnect <instance>");
@@ -421,164 +342,11 @@ async fn dispatch_provider_disconnect(
     config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
-        ProviderArg::Proton => {
-            proton::handlers::dispatch(cli::ProtonCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::AirVpn => {
-            airvpn::handlers::dispatch(cli::AirVpnCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Mullvad => {
-            mullvad::handlers::dispatch(cli::MullvadCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Ivpn => {
-            ivpn::handlers::dispatch(cli::IvpnCommand::Disconnect { instance, all }, config).await
-        }
         ProviderArg::Wgconf => {
             wgconf::handlers::dispatch(cli::WgconfCommand::Disconnect { instance, all }, config)
                 .await
         }
     }
-}
-
-fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> anyhow::Result<()> {
-    // Decode config before daemonizing so errors surface to the shell.
-    let json = base64::engine::general_purpose::STANDARD.decode(config_b64)?;
-    let mut cfg: wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
-    let dns_override_source =
-        if let Some((source, dns_servers)) = local_proxy_dns_override_from_env() {
-            cfg.dns_servers = dns_servers;
-            Some(source)
-        } else {
-            None
-        };
-
-    // Ensure the user proxy dir exists before daemonizing.
-    config::ensure_user_proxy_dir()?;
-
-    let foreground = std::env::var_os("TUNMUX_LOCAL_PROXY_FOREGROUND").is_some();
-    if !foreground {
-        // Daemonize (double-fork).
-        daemonize_local()?;
-    }
-
-    if foreground {
-        logging::init_terminal(true);
-    } else {
-        // Init file logging -- all subsequent output goes to the log file.
-        logging::init_file(log_file, false)?;
-    }
-
-    if let Some(source) = dns_override_source {
-        info!(
-            source = source,
-            dns_servers = cfg.dns_servers.len(),
-            "local_proxy_dns_servers_overridden_from_env"
-        );
-    }
-
-    // Ensure panics are captured in logs instead of disappearing after daemonize.
-    std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            *s
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.as_str()
-        } else {
-            "non-string panic payload"
-        };
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        tracing::error!(
-            panic = %payload,
-            location = %location,
-            backtrace = %backtrace,
-            "local_proxy_daemon_panic"
-        );
-    }));
-
-    // Write PID file.
-    let pid = std::process::id();
-    std::fs::write(pid_file, pid.to_string())?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o600))?;
-    }
-    let startup_status_file = format!("{}.status", pid_file);
-    std::fs::write(&startup_status_file, "starting\n")?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&startup_status_file, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .clamp(2, 8);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()?;
-
-    rt.block_on(wireguard::proxy_tunnel::run_local_proxy(
-        cfg,
-        Some(startup_status_file.as_str()),
-    ))
-}
-
-fn local_proxy_dns_override_from_env() -> Option<(&'static str, Vec<String>)> {
-    for key in ["TUNMUX_LOCAL_PROXY_DNS_SERVERS", "TUNMUX_DNS_SERVERS"] {
-        let Some(raw_value) = std::env::var_os(key) else {
-            continue;
-        };
-
-        let dns_servers = parse_dns_servers_env_list(&raw_value.to_string_lossy());
-        if !dns_servers.is_empty() {
-            return Some((key, dns_servers));
-        }
-    }
-
-    None
-}
-
-fn parse_dns_servers_env_list(raw: &str) -> Vec<String> {
-    raw.split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-/// Double-fork daemonize for the local-proxy daemon.
-fn daemonize_local() -> anyhow::Result<()> {
-    use nix::unistd::{fork, setsid, ForkResult};
-
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
-        Ok(ForkResult::Child) => {}
-        Err(e) => anyhow::bail!("first fork failed: {}", e),
-    }
-
-    setsid().map_err(|e| anyhow::anyhow!("setsid failed: {}", e))?;
-
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
-        Ok(ForkResult::Child) => {}
-        Err(e) => anyhow::bail!("second fork failed: {}", e),
-    }
-
-    use std::os::unix::io::AsRawFd;
-    let devnull = std::fs::File::open("/dev/null")?;
-    let fd = devnull.as_raw_fd();
-    nix::unistd::dup2(fd, 0)?;
-    nix::unistd::dup2(fd, 1)?;
-    nix::unistd::dup2(fd, 2)?;
-
-    Ok(())
 }
 
 fn cmd_status() -> anyhow::Result<()> {
@@ -590,10 +358,10 @@ fn cmd_status() -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} HTTP",
-        "Instance", "Provider", "Server", "Exit", "Backend", "SOCKS5"
+        "{:<12} {:<9} {:<10} {:<5} {:<9}",
+        "Instance", "Provider", "Server", "Exit", "Backend"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(50));
 
     for conn in &connections {
         let exit = conn
@@ -605,24 +373,9 @@ fn cmd_status() -> anyhow::Result<()> {
             .filter(|c| c.is_ascii_alphabetic())
             .collect::<String>();
 
-        let socks = conn
-            .socks_port
-            .map(|p| format!("127.0.0.1:{}", p))
-            .unwrap_or_else(|| "-".to_string());
-        let http = conn
-            .http_port
-            .map(|p| format!("127.0.0.1:{}", p))
-            .unwrap_or_else(|| "-".to_string());
-
         println!(
-            "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} {}",
-            conn.instance_name,
-            conn.provider,
-            conn.server_display_name,
-            exit,
-            conn.backend,
-            socks,
-            http,
+            "{:<12} {:<9} {:<10} {:<5} {:<9}",
+            conn.instance_name, conn.provider, conn.server_display_name, exit, conn.backend,
         );
     }
 
@@ -630,7 +383,6 @@ fn cmd_status() -> anyhow::Result<()> {
 }
 
 fn cmd_wg() -> anyhow::Result<()> {
-    use wireguard::backend::WgBackend;
     use wireguard::connection::ConnectionState;
 
     let connections = ConnectionState::load_all()?;
@@ -646,70 +398,16 @@ fn cmd_wg() -> anyhow::Result<()> {
         }
         first = false;
 
-        match conn.backend {
-            WgBackend::LocalProxy => print_local_proxy_info(conn),
-            _ => match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
-                Ok(output) => print!("{}", output),
-                Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
-            },
+        match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
+            Ok(output) => print!("{}", output),
+            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
         }
     }
     Ok(())
 }
 
-fn print_local_proxy_info(conn: &wireguard::connection::ConnectionState) {
-    let running = conn
-        .proxy_pid
-        .map(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
-        .unwrap_or(false);
-
-    // ── interface block ──────────────────────────────────────────────────────
-    println!("interface: {}", conn.instance_name);
-    if let Some(ref k) = conn.local_public_key {
-        println!("  public key: {}", k);
-    }
-    println!("  private key: (hidden)");
-    println!("  listening port: n/a (userspace)");
-    if !conn.virtual_ips.is_empty() {
-        println!("  address: {}", conn.virtual_ips.join(", "));
-    }
-    let socks = conn
-        .socks_port
-        .map(|p| format!("127.0.0.1:{}", p))
-        .unwrap_or_else(|| "-".to_string());
-    let http = conn
-        .http_port
-        .map(|p| format!("127.0.0.1:{}", p))
-        .unwrap_or_else(|| "-".to_string());
-    println!("  socks5 proxy: {}", socks);
-    println!("  http proxy: {}", http);
-    match conn.proxy_pid {
-        Some(pid) => println!(
-            "  pid: {} ({})",
-            pid,
-            if running { "running" } else { "dead" }
-        ),
-        None => println!("  pid: unknown"),
-    }
-
-    // ── peer block ───────────────────────────────────────────────────────────
-    println!();
-    match conn.peer_public_key.as_deref() {
-        Some(k) => println!("peer: {}", k),
-        None => println!("peer: (unknown)"),
-    }
-    println!("  endpoint: {}", conn.server_endpoint);
-    println!("  allowed ips: 0.0.0.0/0, ::/0");
-    println!("  latest handshake: (userspace — not available)");
-    println!("  transfer: (userspace — not available)");
-    if let Some(ka) = conn.keepalive_secs {
-        println!("  persistent keepalive: every {} seconds", ka);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_dns_servers_env_list;
     use crate::config;
 
     #[test]
@@ -719,15 +417,5 @@ mod tests {
             Some(config::Provider::Wgconf)
         );
         assert_eq!(config::Provider::Wgconf.label(), "wgconf");
-    }
-
-    #[test]
-    fn parse_dns_servers_env_list_accepts_csv_and_whitespace() {
-        let parsed = parse_dns_servers_env_list("1.1.1.1, 9.9.9.9\n2606:4700:4700::1111\t8.8.8.8");
-
-        assert_eq!(
-            parsed,
-            vec!["1.1.1.1", "9.9.9.9", "2606:4700:4700::1111", "8.8.8.8"]
-        );
     }
 }

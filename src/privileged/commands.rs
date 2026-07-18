@@ -1,45 +1,15 @@
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use tracing::debug;
 
 use crate::error::{AppError, Result};
 
 use super::daemon::self_executable_for_spawn;
-
-pub(super) fn run(args: &[&str]) -> Result<()> {
-    debug!(cmd = args.join(" "), "exec");
-    let status = Command::new(args[0]).args(&args[1..]).status()?;
-    if !status.success() {
-        return Err(AppError::Other(format!(
-            "command {} failed: {}",
-            args[0], status
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn run_output(args: &[&str]) -> Result<std::process::Output> {
-    debug!(cmd = args.join(" "), "exec");
-    Command::new(args[0])
-        .args(&args[1..])
-        .output()
-        .map_err(|error| AppError::Other(format!("command {} failed to start: {}", args[0], error)))
-}
-
-pub(super) fn run_resolved_set_dns(interface: &str, dns_servers: &[String]) -> Result<()> {
-    let mut dns_command = vec!["resolvectl", "dns", interface];
-    dns_command.extend(dns_servers.iter().map(String::as_str));
-    run(&dns_command)?;
-    run(&["resolvectl", "domain", interface, "~."])?;
-    run(&["resolvectl", "default-route", interface, "yes"])?;
-    Ok(())
-}
-
-pub(super) fn run_resolved_revert_dns(interface: &str) -> Result<()> {
-    run(&["resolvectl", "revert", interface])
-}
 
 pub(super) fn run_wg_quick_up(
     path: &std::path::Path,
@@ -53,6 +23,9 @@ pub(super) fn run_wg_quick_up(
     if prefer_userspace {
         command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
         command.env("TUNMUX_GOTATUN_HELPER", "1");
+        if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
+            command.env(crate::logging::COLOR_ENV, color);
+        }
         let helper_exe = self_executable_for_spawn()?;
         command.env("WG_QUICK_USERSPACE_IMPLEMENTATION", &helper_exe);
         debug!(
@@ -135,16 +108,11 @@ fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<St
     format_wg_show(&raw, interface)
 }
 
-#[cfg(target_os = "linux")]
-fn run_wg_show_kernel(interface: &str) -> Result<String> {
-    let uapi_text = crate::wireguard::netlink::wg_get_uapi(interface)?;
-    format_wg_show(&uapi_text, interface)
-}
-
-#[cfg(not(target_os = "linux"))]
 fn run_wg_show_kernel(_interface: &str) -> Result<String> {
+    // macOS has no in-kernel WireGuard; userspace tunnels always expose a UAPI
+    // socket, so this path (no socket present) means the interface is not up.
     Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
+        "no WireGuard UAPI socket for interface (tunnel not active)".to_string(),
     ))
 }
 
@@ -322,11 +290,43 @@ pub(super) fn wg_format_bytes(bytes: u64) -> String {
     }
 }
 
-pub(super) fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {
+pub(super) fn run_gotatun_up(
+    interface: &str,
+    config_content: &str,
+    mtu_override: Option<u16>,
+    debug_enabled: bool,
+) -> Result<()> {
     use base64::Engine;
+
+    // Idempotency / anti-race: every helper shares the control-socket path
+    // `/var/run/wireguard/<interface>.sock` (keyed by the logical name). If a
+    // previous helper is still alive and we spawn a second one, the departing
+    // helper's cleanup deletes the new helper's socket out from under it and the
+    // new helper self-terminates on `control_socket_removed`. Tear any existing
+    // live helper down cleanly first so there is never more than one and the new
+    // socket can't be clobbered by a concurrent teardown.
+    if let Ok(Some(existing_pid)) = read_gotatun_pid(&gotatun_pid_path(interface)) {
+        if pid_is_alive(existing_pid) {
+            debug!(
+                interface,
+                pid = existing_pid,
+                "gotatun_up_replacing_existing_helper"
+            );
+            run_gotatun_down(interface)?;
+        }
+    }
 
     let exe = self_executable_for_spawn()?;
     let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_content);
+    for path in [
+        gotatun_pid_path(interface),
+        gotatun_name_path(interface),
+        gotatun_cleanup_status_path(interface),
+        // Start a fresh session log so the streamed connect output is just this session's.
+        gotatun_log_path(interface),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
 
     debug!(
         cmd = format!("{} {} [TUNMUX_GOTATUN_HELPER=1]", exe.display(), interface),
@@ -337,10 +337,16 @@ pub(super) fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()
         .env("TUNMUX_GOTATUN_HELPER", "1")
         .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
         .arg(interface);
-    #[cfg(target_os = "macos")]
-    {
-        command.env("TUNMUX_GOTATUN_DIAG", "1");
+    if let Some(mtu) = mtu_override {
+        command.env("TUNMUX_GOTATUN_MTU_OVERRIDE", mtu.to_string());
     }
+    if debug_enabled {
+        command.env("TUNMUX_DEBUG", "1");
+    }
+    if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
+        command.env(crate::logging::COLOR_ENV, color);
+    }
+    command.env("TUNMUX_GOTATUN_DIAG", "1");
     let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
@@ -348,13 +354,59 @@ pub(super) fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()
     if !status.success() {
         return Err(AppError::WireGuard(format!("gotatun up exited {}", status)));
     }
+    let pid_path = gotatun_pid_path(interface);
+    let pid = read_gotatun_pid(&pid_path)?.ok_or_else(|| {
+        AppError::WireGuard(format!(
+            "gotatun helper started without writing {}",
+            pid_path.display()
+        ))
+    })?;
+    if !pid_is_alive(pid) {
+        return Err(AppError::WireGuard(format!(
+            "gotatun helper process {} exited during startup",
+            pid
+        )));
+    }
+    ensure_gotatun_process_identity(pid)?;
     Ok(())
 }
 
 pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
     let socket_path =
         std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));
+    let pid_path = gotatun_pid_path(interface);
+    let name_path = gotatun_name_path(interface);
+    let cleanup_status_path = gotatun_cleanup_status_path(interface);
+    let actual_interface = std::fs::read_to_string(&name_path)
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+
+    let tracked_pid = read_gotatun_pid(&pid_path)?;
+    if let Some(pid) = tracked_pid.filter(|pid| pid_is_alive(*pid)) {
+        ensure_gotatun_process_identity(pid)?;
+    }
+
+    let started = Instant::now();
+    debug!(
+        interface,
+        pid = ?tracked_pid,
+        socket = %socket_path.display(),
+        actual_interface = ?actual_interface,
+        "gotatun_shutdown_begin"
+    );
+
+    if tracked_pid.is_none()
+        && actual_interface.is_none()
+        && !socket_path.exists()
+        && !cleanup_status_path.exists()
+    {
+        debug!(interface, "gotatun_shutdown_already_absent");
+        return Ok(());
+    }
+
     if socket_path.exists() {
+        // The helper treats removal of its UAPI socket as a cooperative shutdown request.
         std::fs::remove_file(&socket_path).map_err(|e| {
             AppError::Other(format!(
                 "failed to remove gotatun control socket {}: {}",
@@ -362,48 +414,262 @@ pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
                 e
             ))
         })?;
+        debug!(interface, "gotatun_shutdown_socket_removed");
+    }
+
+    let cleanup_status = wait_for_cleanup_status(&cleanup_status_path, Duration::from_secs(15));
+    let cleanup_status = match cleanup_status {
+        Some(status) => status,
+        None => {
+            if let Some(pid) = tracked_pid.filter(|pid| pid_is_alive(*pid)) {
+                debug!(pid, interface, "gotatun_shutdown_sigterm_fallback");
+                match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(error) => {
+                        return Err(AppError::Other(format!(
+                            "failed to signal gotatun helper {}: {}",
+                            pid, error
+                        )));
+                    }
+                }
+            }
+            wait_for_cleanup_status(&cleanup_status_path, Duration::from_secs(5)).ok_or_else(
+                || {
+                    AppError::WireGuard(format!(
+                        "gotatun helper did not confirm cleanup within {} seconds; pid={:?}, interface={:?}",
+                        started.elapsed().as_secs(),
+                        tracked_pid,
+                        actual_interface
+                    ))
+                },
+            )?
+        }
+    };
+
+    match cleanup_status.as_str() {
+        "ok" => {}
+        cleanup_status => {
+            return Err(AppError::WireGuard(format!(
+                "gotatun helper cleanup failed: {}",
+                cleanup_status
+            )));
+        }
+    }
+
+    if let Some(actual_interface) = actual_interface.as_deref() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while macos_interface_exists(actual_interface) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if macos_interface_exists(actual_interface) {
+            return Err(AppError::WireGuard(format!(
+                "userspace tunnel interface {} still exists after confirmed network cleanup",
+                actual_interface
+            )));
+        }
+    }
+
+    debug!(
+        interface,
+        pid = ?tracked_pid,
+        elapsed_ms = started.elapsed().as_millis(),
+        "gotatun_shutdown_complete"
+    );
+
+    for path in [pid_path, name_path, cleanup_status_path] {
+        let _ = std::fs::remove_file(path);
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn wg_set(
-    interface: &str,
-    private_key: &str,
-    peer_public_key: &str,
-    endpoint: &str,
-    allowed_ips: &str,
-) -> Result<()> {
-    crate::wireguard::netlink::wg_set_device(
-        interface,
-        private_key,
-        peer_public_key,
-        endpoint,
-        allowed_ips,
-    )
+fn wait_for_cleanup_status(path: &std::path::Path, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(status) if !status.trim().is_empty() => return Some(status.trim().to_string()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "gotatun_cleanup_status_read_failed"
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(super) fn wg_set(
-    _interface: &str,
-    _private_key: &str,
-    _peer_public_key: &str,
-    _endpoint: &str,
-    _allowed_ips: &str,
-) -> Result<()> {
-    Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
-    ))
+fn macos_interface_exists(interface: &str) -> bool {
+    Command::new("ifconfig")
+        .arg(interface)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
-    crate::wireguard::netlink::wg_set_psk(interface, peer_public_key, psk)
+fn read_gotatun_pid(path: &std::path::Path) -> Result<Option<u32>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let pid = raw.trim().parse::<u32>().map_err(|error| {
+        AppError::Other(format!(
+            "invalid gotatun pid in {}: {}",
+            path.display(),
+            error
+        ))
+    })?;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(AppError::Other(format!(
+            "invalid gotatun pid {} in {}",
+            pid,
+            path.display()
+        )));
+    }
+    Ok(Some(pid))
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(super) fn set_preshared_key(_interface: &str, _peer_public_key: &str, _psk: &str) -> Result<()> {
-    Err(AppError::WireGuard(
-        "kernel wireguard backend is only supported on linux".to_string(),
-    ))
+fn pid_is_alive(pid: u32) -> bool {
+    let result = unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM)
+}
+
+fn ensure_gotatun_process_identity(pid: u32) -> Result<()> {
+    let expected = std::env::current_exe()
+        .map_err(|error| AppError::Other(format!("cannot resolve current executable: {error}")))?;
+    let actual = process_executable(pid).ok_or_else(|| {
+        AppError::Other(format!(
+            "cannot resolve executable for gotatun helper pid {}",
+            pid
+        ))
+    })?;
+
+    let expected = std::fs::canonicalize(&expected).unwrap_or(expected);
+    let actual = std::fs::canonicalize(&actual).unwrap_or(actual);
+    if actual != expected {
+        return Err(AppError::Other(format!(
+            "refusing to signal pid {} because executable {} does not match {}",
+            pid,
+            actual.display(),
+            expected.display()
+        )));
+    }
+    Ok(())
+}
+
+fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = vec![0u8; nix::libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        nix::libc::proc_pidpath(
+            pid as nix::libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buffer[..length as usize],
+    )))
+}
+
+fn gotatun_pid_path(interface: &str) -> std::path::PathBuf {
+    gotatun_runtime_path(interface, "pid")
+}
+
+fn gotatun_name_path(interface: &str) -> std::path::PathBuf {
+    gotatun_runtime_path(interface, "name")
+}
+
+fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
+    gotatun_runtime_path(interface, "cleanup")
+}
+
+/// Log file the gotatun helper writes to. The service tails this to stream the
+/// helper's setup/teardown output back to the calling CLI. Shares the single
+/// source of truth in `config` with `userspace_helper` so the paths always match.
+///
+/// `/var/log/tunmux/<interface>.log` on all platforms (see
+/// `config::gotatun_helper_log_path`).
+pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
+    crate::config::gotatun_helper_log_path(interface)
+}
+
+fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.tunmux.{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ensure_gotatun_process_identity, gotatun_runtime_path, read_gotatun_pid,
+        wait_for_cleanup_status,
+    };
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tunmux-gotatun-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn gotatun_runtime_paths_are_scoped_to_interface() {
+        assert_eq!(
+            gotatun_runtime_path("wgconf0", "cleanup"),
+            std::path::PathBuf::from("/var/run/wireguard/wgconf0.tunmux.cleanup")
+        );
+    }
+
+    #[test]
+    fn read_gotatun_pid_handles_missing_valid_and_invalid_files() {
+        let path = temp_path("pid");
+        assert_eq!(read_gotatun_pid(&path).expect("missing pid"), None);
+
+        std::fs::write(&path, format!("{}\n", std::process::id())).expect("write valid pid");
+        assert_eq!(
+            read_gotatun_pid(&path).expect("valid pid"),
+            Some(std::process::id())
+        );
+
+        std::fs::write(&path, "0\n").expect("write invalid pid");
+        assert!(read_gotatun_pid(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_process_matches_gotatun_executable_identity_check() {
+        ensure_gotatun_process_identity(std::process::id()).expect("current executable identity");
+    }
+
+    #[test]
+    fn cleanup_status_waits_for_helper_confirmation() {
+        let path = temp_path("cleanup-status");
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(writer_path, "ok\n").expect("write cleanup status");
+        });
+
+        let status = wait_for_cleanup_status(&path, std::time::Duration::from_secs(1));
+        writer.join().expect("cleanup status writer");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(status.as_deref(), Some("ok"));
+    }
 }

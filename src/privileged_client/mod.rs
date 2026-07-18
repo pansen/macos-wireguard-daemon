@@ -11,9 +11,7 @@ use tracing::debug;
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
-use crate::privileged_api::{
-    GotaTunAction, KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction,
-};
+use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
 
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
@@ -144,130 +142,6 @@ impl PrivilegedClient {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn namespace_create(&self, name: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::NamespaceCreate {
-            name: name.to_string(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn namespace_delete(&self, name: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::NamespaceDelete {
-            name: name.to_string(),
-        })
-    }
-
-    pub fn interface_create_wireguard(&self, name: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::InterfaceCreateWireguard {
-            name: name.to_string(),
-        })
-    }
-
-    pub fn interface_delete(&self, name: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::InterfaceDelete {
-            name: name.to_string(),
-        })
-    }
-
-    pub fn interface_move_to_netns(&self, interface: &str, namespace: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::InterfaceMoveToNetns {
-            interface: interface.to_string(),
-            namespace: namespace.to_string(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn netns_exec(&self, namespace: &str, args: &[&str]) -> Result<()> {
-        self.send(PrivilegedRequest::NetnsExec {
-            namespace: namespace.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-        })
-        .map(|_| ())
-    }
-
-    pub fn host_ip_addr_add(&self, interface: &str, cidr: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostIpAddrAdd {
-            interface: interface.to_string(),
-            cidr: cidr.to_string(),
-        })
-    }
-
-    pub fn host_ip_link_set_up(&self, interface: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostIpLinkSetUp {
-            interface: interface.to_string(),
-        })
-    }
-
-    pub fn host_ip_link_set_mtu(&self, interface: &str, mtu: u16) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostIpLinkSetMtu {
-            interface: interface.to_string(),
-            mtu,
-        })
-    }
-
-    pub fn host_ip_route_add(&self, destination: &str, via: Option<&str>, dev: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostIpRouteAdd {
-            destination: destination.to_string(),
-            via: via.map(ToString::to_string),
-            dev: dev.to_string(),
-        })
-    }
-
-    pub fn host_ip_route_del(&self, destination: &str, via: Option<&str>, dev: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostIpRouteDel {
-            destination: destination.to_string(),
-            via: via.map(ToString::to_string),
-            dev: dev.to_string(),
-        })
-    }
-
-    pub fn host_resolved_set_dns(&self, interface: &str, dns_servers: &[&str]) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostResolvedSetDns {
-            interface: interface.to_string(),
-            dns_servers: dns_servers
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-        })
-    }
-
-    pub fn host_resolved_revert_dns(&self, interface: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::HostResolvedRevertDns {
-            interface: interface.to_string(),
-        })
-    }
-
-    pub fn wireguard_set(
-        &self,
-        interface: &str,
-        private_key: &str,
-        peer_public_key: &str,
-        endpoint: &str,
-        allowed_ips: &str,
-    ) -> Result<()> {
-        self.send_unit(PrivilegedRequest::WireguardSet {
-            interface: interface.to_string(),
-            private_key: private_key.to_string(),
-            peer_public_key: peer_public_key.to_string(),
-            endpoint: endpoint.to_string(),
-            allowed_ips: allowed_ips.to_string(),
-        })
-    }
-
-    pub fn wireguard_set_psk(
-        &self,
-        interface: &str,
-        peer_public_key: &str,
-        psk: &str,
-    ) -> Result<()> {
-        self.send_unit(PrivilegedRequest::WireguardSetPsk {
-            interface: interface.to_string(),
-            peer_public_key: peer_public_key.to_string(),
-            psk: psk.to_string(),
-        })
-    }
-
     pub fn wg_quick_run(
         &self,
         action: WgQuickAction,
@@ -290,11 +164,14 @@ impl PrivilegedClient {
         action: GotaTunAction,
         interface: &str,
         config_content: &str,
+        mtu_override: Option<u16>,
     ) -> Result<()> {
         self.send_unit(PrivilegedRequest::GotaTunRun {
             action,
             interface: interface.to_string(),
             config_content: config_content.to_string(),
+            mtu_override,
+            debug: crate::logging::debug_enabled(),
         })
     }
 
@@ -312,59 +189,17 @@ impl PrivilegedClient {
         }
     }
 
-    pub fn ensure_dir(&self, path: &str, mode: u32) -> Result<()> {
-        self.send_unit(PrivilegedRequest::EnsureDir {
-            path: path.to_string(),
-            mode,
-        })
-    }
-
-    pub fn write_file(&self, path: &str, contents: &[u8], mode: u32) -> Result<()> {
-        self.send_unit(PrivilegedRequest::WriteFile {
-            path: path.to_string(),
-            contents: contents.to_vec(),
-            mode,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn remove_dir_all(&self, path: &str) -> Result<()> {
-        self.send_unit(PrivilegedRequest::RemoveDirAll {
-            path: path.to_string(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn kill_pid(&self, pid: u32, signal: KillSignal) -> Result<()> {
-        self.send_unit(PrivilegedRequest::KillPid { pid, signal })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    pub fn spawn_proxy_daemon(
-        &self,
-        netns: &str,
-        interface: &str,
-        socks_port: u16,
-        http_port: u16,
-        proxy_access_log: bool,
-        pid_file: &str,
-        log_file: &str,
-        startup_status_file: &str,
-    ) -> Result<u32> {
-        match self.send(PrivilegedRequest::SpawnProxyDaemon {
-            netns: netns.to_string(),
+    /// Ask the privileged service whether the userspace UAPI control socket for
+    /// `interface` exists. Used for liveness checks that would otherwise be
+    /// permission-blind from an unprivileged caller (the socket dir is
+    /// `0750 root:daemon`).
+    pub fn interface_active(&self, interface: &str) -> Result<bool> {
+        match self.send(PrivilegedRequest::InterfaceActive {
             interface: interface.to_string(),
-            socks_port,
-            http_port,
-            proxy_access_log,
-            pid_file: pid_file.to_string(),
-            log_file: log_file.to_string(),
-            startup_status_file: startup_status_file.to_string(),
         })? {
-            PrivilegedResponse::Pid(pid) => Ok(pid),
+            PrivilegedResponse::Bool(active) => Ok(active),
             _ => Err(AppError::Other(
-                "invalid privileged response for SpawnProxyDaemon".into(),
+                "invalid privileged response for InterfaceActive".into(),
             )),
         }
     }
@@ -545,11 +380,8 @@ impl PrivilegedClient {
 fn map_privileged_error(response: PrivilegedResponse) -> Result<PrivilegedResponse> {
     match response {
         PrivilegedResponse::Error { code, message } => Err(match code.as_str() {
-            "Namespace" => AppError::Namespace(message),
             "WireGuard" => AppError::WireGuard(message),
-            "Proxy" => AppError::Proxy(message),
             "Auth" => AppError::Auth(message),
-            "Control" => AppError::Other(message),
             _ => AppError::Other(message),
         }),
         other => Ok(other),
