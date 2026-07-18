@@ -90,11 +90,7 @@ how the tunnel is set up.
 
 ## Configuration
 
-tunmux reads optional defaults from a config file in your user configuration
-directory. The file is optional; without it, sensible defaults apply. It
-covers the default backend, the optional checks, and how the privileged daemon
-is started and stopped. Anything set in the config can be overridden per
-command on the command line.
+tunmux reads optional defaults from `$XDG_CONFIG_HOME/tunmux/config.toml` (typically `~/.config/tunmux/config.toml`). The file is optional; without it, sensible defaults apply. It covers the default backend, the optional checks, and how the privileged daemon is started and stopped. Anything set in the config can be overridden per command on the command line.
 
 ## Running Alongside the WireGuard App
 
