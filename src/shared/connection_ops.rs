@@ -139,6 +139,10 @@ pub fn disconnect_one_provider_connection(
             error = %error,
             "connection teardown failed but tunnel is no longer live; removing stale state"
         );
+        eprintln!(
+            "Warning: teardown of {} ({}) reported errors; system DNS or routes may not be fully restored: {}",
+            state.instance_name, state.interface_name, error
+        );
     }
     ConnectionState::remove(&state.instance_name)?;
 

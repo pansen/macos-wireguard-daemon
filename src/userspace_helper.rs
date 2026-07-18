@@ -1202,7 +1202,7 @@ fn configure_macos_dns(
         return Ok(MacosDnsFingerprint::default());
     }
 
-    let fingerprint = macos_current_dns_fingerprint();
+    let fingerprint = macos_current_dns_fingerprint()?;
     for service in dns_target_services(DNS_POLICY, &fingerprint) {
         saved.push(capture_macos_dns_service(&service, &config.dns_servers)?);
         set_macos_dns_servers(&service, &config.dns_servers)?;
@@ -1210,8 +1210,14 @@ fn configure_macos_dns(
     }
 
     // Re-snapshot post-apply: the stored fingerprint must reflect the DNS we
-    // just wrote so the first reconcile tick detects no change.
-    Ok(macos_current_dns_fingerprint())
+    // just wrote so the first reconcile tick detects no change. DNS is already
+    // applied at this point, so a failed re-snapshot must not fail connect —
+    // fall back to the pre-apply fingerprint and let the first reconcile tick
+    // observe the resulting drift and self-correct.
+    Ok(macos_current_dns_fingerprint().unwrap_or_else(|error| {
+        warn!(error = %error, "userspace_helper_dns_fingerprint_resnapshot_failed");
+        fingerprint
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -1835,12 +1841,20 @@ fn plan_dns_actions(
     actions
 }
 
-/// Snapshot the current DNS-relevant environment. Any sub-call that fails
-/// degrades to empty/`None` rather than aborting the tick, mirroring
-/// `macos_local_connected_subnets`.
+/// Snapshot the current DNS-relevant environment. The service list itself
+/// must be trustworthy: a healthy macOS always reports at least one network
+/// service, so a failed or empty listing is a degraded read, not "all
+/// services vanished" — returning it as fact would make `plan_dns_actions`
+/// classify every owned service as vanished and drop (not restore) its saved
+/// original. So a failed or empty listing aborts the snapshot. Everything
+/// else — per-service DNS reads, the primary-service lookup — still degrades
+/// to empty/`None` rather than aborting, mirroring `macos_local_connected_subnets`.
 #[cfg(target_os = "macos")]
-fn macos_current_dns_fingerprint() -> MacosDnsFingerprint {
-    let mut services = list_macos_network_services().unwrap_or_default();
+fn macos_current_dns_fingerprint() -> anyhow::Result<MacosDnsFingerprint> {
+    let mut services = list_macos_network_services().context("listing macOS network services")?;
+    if services.is_empty() {
+        anyhow::bail!("networksetup -listallnetworkservices returned no services");
+    }
     services.sort();
     services.dedup();
 
@@ -1851,11 +1865,11 @@ fn macos_current_dns_fingerprint() -> MacosDnsFingerprint {
         observed.push((svc.clone(), dns));
     }
 
-    MacosDnsFingerprint {
+    Ok(MacosDnsFingerprint {
         primary_service: macos_primary_service(),
         services,
         observed,
-    }
+    })
 }
 
 /// Read a service's current DNS + search domains and wrap them for later
@@ -1899,7 +1913,20 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         return false; // VPN promotes no DNS -> nothing to own.
     }
 
-    let fingerprint = macos_current_dns_fingerprint();
+    let fingerprint = match macos_current_dns_fingerprint() {
+        Ok(fingerprint) => fingerprint,
+        // A degraded or failed listing must not be read as "all owned services
+        // vanished" (see `macos_current_dns_fingerprint`): skip this tick rather
+        // than acting on a half-built fingerprint, mirroring the route guard.
+        Err(error) => {
+            warn!(
+                interface = inputs.interface,
+                error = %error,
+                "userspace_helper_dns_fingerprint_failed"
+            );
+            return false;
+        }
+    };
 
     // If the tunnel's own DNS server now lives inside a directly-connected LAN,
     // its route is excluded from the tunnel and the server is unreachable through
@@ -2010,7 +2037,18 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     // Captures and drops don't touch system DNS, so the pre-action snapshot is
     // still accurate when nothing was applied or restored.
     dns.fingerprint = if applied + restored > 0 {
-        macos_current_dns_fingerprint()
+        // On a failed re-snapshot, fall back to the pre-action fingerprint. It's
+        // stale (it won't reflect the change we just made), but that only makes
+        // the next tick re-detect the same drift and re-run idempotent actions —
+        // safe, unlike trusting a degraded read as the new baseline.
+        macos_current_dns_fingerprint().unwrap_or_else(|error| {
+            warn!(
+                interface = inputs.interface,
+                error = %error,
+                "userspace_helper_dns_fingerprint_resnapshot_failed"
+            );
+            fingerprint
+        })
     } else {
         fingerprint
     };
