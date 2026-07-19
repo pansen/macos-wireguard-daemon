@@ -395,23 +395,15 @@ fn cmd_status() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let headers = ["Instance", "Provider", "Server", "Exit", "Backend"];
+    let headers = ["Instance", "Provider", "Server", "Endpoint", "Backend"];
     let rows: Vec<[String; 5]> = connections
         .iter()
         .map(|conn| {
-            let exit = conn
-                .server_display_name
-                .split('#')
-                .next()
-                .unwrap_or("")
-                .chars()
-                .filter(|c| c.is_ascii_alphabetic())
-                .collect::<String>();
             [
                 conn.instance_name.clone(),
                 conn.provider.clone(),
                 conn.server_display_name.clone(),
-                exit,
+                conn.server_endpoint.clone(),
                 conn.backend.to_string(),
             ]
         })
