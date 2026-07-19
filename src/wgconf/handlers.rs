@@ -205,6 +205,36 @@ fn connect_direct(
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
+        // The exclusive `wgconf0` slot is live but no saved state describes it —
+        // a desync (state pruned during a daemon idle window while the userspace
+        // helper kept running). Re-adopt the live interface by saving state for
+        // the config we were asked to bring up, so `status`/`disconnect` work
+        // again instead of every `--if-missing` autoconnect wedging here.
+        // A live `wgconf0` is always the userspace slot (wg-quick/kernel use utunN).
+        tracing::warn!(
+            interface = INTERFACE_NAME,
+            "adopting live wgconf interface with no saved state (state/daemon desync)"
+        );
+        let adopted = wireguard::connection::ConnectionState {
+            instance_name: DIRECT_INSTANCE.to_string(),
+            provider: PROVIDER.dir_name().to_string(),
+            interface_name: INTERFACE_NAME.to_string(),
+            backend: wireguard::backend::WgBackend::Userspace,
+            server_endpoint: routed
+                .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
+                .unwrap_or_else(|| best_effort_endpoint(&source.config_text)),
+            server_display_name: source.display_name.clone(),
+            dns_servers: wireguard::config::parse_config(&source.config_text)
+                .map(|parsed| parsed.dns_servers)
+                .unwrap_or_default(),
+            source_path: source.source_path.clone(),
+        };
+        adopted.save()?;
+
+        if if_missing {
+            println!("Already connected to {}.", source.display_name);
+            return Ok(());
+        }
         anyhow::bail!("Already connected. Run `tunmux disconnect --provider wgconf` first.");
     }
 
