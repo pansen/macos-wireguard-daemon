@@ -16,6 +16,14 @@ use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
 
+/// Whether an error from a `PrivilegedClient` call is a transient
+/// transport/cold-start error worth retrying, as opposed to an authoritative
+/// failure. Exposed for callers outside this module (e.g.
+/// `wireguard::userspace`) that implement their own retry/settle loops.
+pub(crate) fn is_retryable_transport_error(err: &AppError) -> bool {
+    is_transport_error(err)
+}
+
 pub struct PrivilegedClient {
     socket_path: PathBuf,
     transport: PrivilegedTransport,

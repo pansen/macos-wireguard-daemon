@@ -1,7 +1,7 @@
 use crate::config;
 use crate::error::Result;
 use crate::privileged_api::GotaTunAction;
-use crate::privileged_client::PrivilegedClient;
+use crate::privileged_client::{is_retryable_transport_error, PrivilegedClient};
 use tracing::info;
 
 use super::handshake;
@@ -85,7 +85,7 @@ pub fn is_interface_active(interface_name: &str) -> bool {
     for attempt in 0..ATTEMPTS {
         match client.interface_active(interface_name) {
             Ok(active) => return active,
-            Err(err) if attempt + 1 < ATTEMPTS => {
+            Err(err) if attempt + 1 < ATTEMPTS && is_retryable_transport_error(&err) => {
                 tracing::debug!(
                     interface = interface_name,
                     error = %err,
@@ -94,10 +94,12 @@ pub fn is_interface_active(interface_name: &str) -> bool {
                 std::thread::sleep(BACKOFF);
             }
             Err(err) => {
+                // Either an authoritative (non-transport) error, or the last
+                // attempt — report inactive without further retries.
                 tracing::debug!(
                     interface = interface_name,
                     error = %err,
-                    "interface_active probe failed after retries; reporting inactive"
+                    "interface_active probe failed; reporting inactive"
                 );
                 return false;
             }

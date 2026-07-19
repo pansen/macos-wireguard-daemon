@@ -373,22 +373,20 @@ async fn dispatch_provider_disconnect(
 }
 
 fn cmd_status() -> anyhow::Result<()> {
+    // Probe liveness across every backend, not just userspace: a reboot/crash
+    // leaves stale kernel/wg-quick state behind too, and `is_live()` already
+    // knows the right probe per backend.
     let mut connections: Vec<ConnectionState> = ConnectionState::load_all()?
         .into_iter()
-        .filter(|c| match c.backend {
-            wireguard::backend::WgBackend::Userspace => c.is_live(),
-            _ => true,
-        })
+        .filter(ConnectionState::is_live)
         .collect();
 
     let have_wgconf_direct = connections
         .iter()
         .any(|c| c.provider == "wgconf" && c.interface_name == "wgconf0");
-    if !have_wgconf_direct
-        && privileged_client::PrivilegedClient::new()
-            .interface_active("wgconf0")
-            .unwrap_or(false)
-    {
+    // Use the higher-level probe (not the raw client call) so a cold-starting
+    // privileged daemon doesn't make a live wgconf0 tunnel look inactive.
+    if !have_wgconf_direct && wireguard::userspace::is_interface_active("wgconf0") {
         connections.push(wireguard::connection::ConnectionState {
             instance_name: wireguard::connection::DIRECT_INSTANCE.to_string(),
             provider: "wgconf".to_string(),
