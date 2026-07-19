@@ -6,7 +6,6 @@
 //! `uninstall/privileged`.
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -14,6 +13,7 @@ use nix::unistd::{chown, geteuid, Gid, Group, Uid, User};
 
 use crate::cli::LaunchdCommand;
 use crate::config;
+use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failure, xml_escape};
 
 pub(crate) const LABEL: &str = "me.pansen.tunmux.privileged";
 pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist";
@@ -68,16 +68,6 @@ fn render_plist_from(template: &str, daemon_binary: &str, gid: u32) -> anyhow::R
     );
 
     Ok(rendered)
-}
-
-/// Escape the five XML special characters so a path with e.g. `&` in it
-/// still produces a well-formed plist.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// Reject binaries in locations a regular user controls.
@@ -380,48 +370,6 @@ fn bootstrap() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_checked(program: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {program} {}", args.join(" ")))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{program} {} failed ({}): {}",
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn run_ignore_failure(program: &str, args: &[&str]) {
-    match std::process::Command::new(program).args(args).output() {
-        Ok(output) if !output.status.success() => {
-            tracing::debug!(
-                program,
-                args = ?args,
-                status = ?output.status,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "launchd_command_ignored_failure"
-            );
-        }
-        Err(err) => {
-            tracing::debug!(program, args = ?args, error = %err, "launchd_command_failed_to_run");
-        }
-        Ok(_) => {}
-    }
-}
-
-fn remove_file_ignore_missing(path: &Path) -> anyhow::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,11 +423,6 @@ mod tests {
         let err = render_plist_from(&modified, "/usr/local/bin/tunmux", 20)
             .expect_err("missing expected Label should error");
         assert!(err.to_string().contains("Label"));
-    }
-
-    #[test]
-    fn xml_escape_escapes_specials() {
-        assert_eq!(xml_escape("/a&b/<c>"), "/a&amp;b/&lt;c&gt;");
     }
 
     #[test]

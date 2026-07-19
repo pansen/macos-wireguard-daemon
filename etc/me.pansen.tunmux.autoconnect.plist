@@ -11,12 +11,12 @@
          call the binary directly with no wrapper script. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/tunmux</string>
+        <string>@TUNMUX_BIN@</string>
         <string>--debug</string>
         <string>wgconf</string>
         <string>connect</string>
-        <string>--file</string>
-        <string>__PROFILE__</string>
+        <string>@CONNECT_FLAG@</string>
+        <string>@CONNECT_VALUE@</string>
         <string>--if-missing</string>
     </array>
 
@@ -32,8 +32,8 @@
     <string>Aqua</string>   <!-- only in a real GUI login session -->
 
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/tunmux-autoconnect.out.log</string>
+    <string>@TUNMUX_HOME@/Library/Logs/tunmux-autoconnect.out.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/tunmux-autoconnect.err.log</string>
+    <string>@TUNMUX_HOME@/Library/Logs/tunmux-autoconnect.err.log</string>
 </dict>
 </plist>

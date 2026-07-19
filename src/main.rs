@@ -1,6 +1,8 @@
+mod autoconnect;
 mod cli;
 mod config;
 mod error;
+mod launchctl;
 mod launchd;
 mod logging;
 mod privileged;
@@ -80,6 +82,14 @@ fn main() {
             }
         }
 
+        TopCommand::Autoconnect { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = autoconnect::dispatch(command) {
+                error!(command = ?"autoconnect", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
         // All other commands use the multi-threaded tokio runtime.
         other => {
             init_logging(cli.verbose);
@@ -114,6 +124,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         TopCommand::Status
         | TopCommand::Wg
         | TopCommand::Launchd { .. }
+        | TopCommand::Autoconnect { .. }
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }

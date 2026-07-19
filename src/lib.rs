@@ -5,9 +5,11 @@
 // config-file (`wgconf`) path.
 
 // Provider-agnostic infrastructure
+pub mod autoconnect;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod launchctl;
 pub mod launchd;
 pub mod logging;
 pub mod shared;

@@ -62,6 +62,12 @@ pub enum TopCommand {
         command: LaunchdCommand,
     },
 
+    /// Manage the per-user autoconnect LaunchAgent (GUI domain)
+    Autoconnect {
+        #[command(subcommand)]
+        command: AutoconnectCommand,
+    },
+
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
     Privileged {
@@ -133,6 +139,31 @@ pub enum LaunchdCommand {
     /// Restart the privileged daemon (launchctl kickstart -k)
     Restart,
     /// Stop and unregister the privileged daemon (keeps binary, group, logs)
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+pub enum AutoconnectCommand {
+    /// Install and start the per-user autoconnect LaunchAgent (run WITHOUT sudo)
+    Install {
+        /// WireGuard .conf file path
+        #[arg(long, required_unless_present = "profile", conflicts_with = "profile")]
+        file: Option<String>,
+
+        /// Saved profile name
+        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+        profile: Option<String>,
+
+        /// Overwrite and reload an existing installation
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+    /// List installed autoconnect LaunchAgent files (alias: ls)
+    #[command(visible_alias = "ls")]
+    List,
+    /// Reload (kickstart) the autoconnect LaunchAgent
+    Reload,
+    /// Stop and unregister the autoconnect LaunchAgent
     Uninstall,
 }
 
@@ -233,8 +264,8 @@ pub enum WgconfCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, LaunchdCommand, ProviderArg,
-        TopCommand, WgconfCommand,
+        AutoconnectCommand, Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand,
+        LaunchdCommand, ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
 
@@ -459,6 +490,113 @@ mod tests {
                 assert_eq!(p, Path::new("/tmp/custom.plist"));
             }
             _ => panic!("expected launchd install with template"),
+        }
+    }
+
+    #[test]
+    fn parse_autoconnect_install_with_file() {
+        let cli =
+            Cli::try_parse_from(["tunmux", "autoconnect", "install", "--file", "/tmp/x.conf"])
+                .expect("parse autoconnect install --file");
+
+        match cli.command {
+            TopCommand::Autoconnect {
+                command:
+                    AutoconnectCommand::Install {
+                        file,
+                        profile,
+                        force,
+                    },
+            } => {
+                assert_eq!(file.as_deref(), Some("/tmp/x.conf"));
+                assert!(profile.is_none());
+                assert!(!force);
+            }
+            _ => panic!("expected autoconnect install command"),
+        }
+    }
+
+    #[test]
+    fn parse_autoconnect_install_with_profile_and_force() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "autoconnect",
+            "install",
+            "--profile",
+            "work",
+            "--force",
+        ])
+        .expect("parse autoconnect install --profile --force");
+
+        match cli.command {
+            TopCommand::Autoconnect {
+                command:
+                    AutoconnectCommand::Install {
+                        file,
+                        profile,
+                        force,
+                    },
+            } => {
+                assert!(file.is_none());
+                assert_eq!(profile.as_deref(), Some("work"));
+                assert!(force);
+            }
+            _ => panic!("expected autoconnect install command"),
+        }
+    }
+
+    #[test]
+    fn parse_autoconnect_install_requires_exactly_one_source() {
+        let missing = Cli::try_parse_from(["tunmux", "autoconnect", "install"]);
+        assert!(missing.is_err());
+
+        let both = Cli::try_parse_from([
+            "tunmux",
+            "autoconnect",
+            "install",
+            "--file",
+            "/tmp/a.conf",
+            "--profile",
+            "a",
+        ]);
+        assert!(both.is_err());
+    }
+
+    #[test]
+    fn parse_autoconnect_reload_and_uninstall() {
+        for (arg, want) in [
+            (
+                "reload",
+                std::mem::discriminant(&AutoconnectCommand::Reload),
+            ),
+            (
+                "uninstall",
+                std::mem::discriminant(&AutoconnectCommand::Uninstall),
+            ),
+        ] {
+            let cli =
+                Cli::try_parse_from(["tunmux", "autoconnect", arg]).expect("parse autoconnect");
+            match cli.command {
+                TopCommand::Autoconnect { command } => {
+                    assert_eq!(std::mem::discriminant(&command), want)
+                }
+                _ => panic!("expected autoconnect command"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_autoconnect_list_and_ls_alias() {
+        for arg in ["list", "ls"] {
+            let cli = Cli::try_parse_from(["tunmux", "autoconnect", arg])
+                .expect("parse autoconnect list");
+            match cli.command {
+                TopCommand::Autoconnect { command } => assert_eq!(
+                    std::mem::discriminant(&command),
+                    std::mem::discriminant(&AutoconnectCommand::List)
+                ),
+                _ => panic!("expected autoconnect list command"),
+            }
         }
     }
 }

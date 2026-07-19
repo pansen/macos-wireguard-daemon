@@ -23,14 +23,7 @@ install/privileged:
 
 .PHONY: install/autostart
 install/autostart:
-	mkdir -p $$HOME/Library/LaunchAgents
-	sed -e "s|__HOME__|$$HOME|g" -e "s|__PROFILE__|$(TUNMUX_PROFILE)|g" etc/me.pansen.tunmux.autoconnect.plist > $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
-	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
-	launchctl bootstrap gui/$$(id -u) $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
-	@# test now
-	launchctl kickstart -k gui/$$(id -u)/me.pansen.tunmux.autoconnect
-	@# inspect
-	launchctl print gui/$$(id -u)/me.pansen.tunmux.autoconnect
+	/usr/local/bin/tunmux autoconnect install --file $(TUNMUX_PROFILE) --force
 
 
 .PHONY: install
@@ -47,8 +40,7 @@ reload/connections:
 
 .PHONY: reload/autostart
 reload/autostart:
-	launchctl kickstart -k gui/$$(id -u)/me.pansen.tunmux.autoconnect
-	launchctl print gui/$$(id -u)/me.pansen.tunmux.autoconnect
+	/usr/local/bin/tunmux autoconnect reload
 
 .PHONY: reload
 reload: reload/privileged reload/connections reload/autostart
@@ -56,8 +48,7 @@ reload: reload/privileged reload/connections reload/autostart
 
 .PHONY: uninstall/autostart
 uninstall/autostart:
-	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
-	rm -f $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
+	/usr/local/bin/tunmux autoconnect uninstall
 
 .PHONY: uninstall/dns
 uninstall/dns:
