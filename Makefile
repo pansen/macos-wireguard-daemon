@@ -76,10 +76,17 @@ uninstall/dns:
 
 .PHONY: uninstall/privileged
 uninstall/privileged: build.release
+	@# Unregister the daemon only (bootout + plist/socket removal). Keeps the
+	@# binary, tunmux group, and logs — see purge/privileged for full teardown.
 	@# Prefer the installed binary; if it was already removed, fall back to the
-	@# freshly compiled one so `launchd uninstall` (bootout + plist removal) still runs.
+	@# freshly compiled one so `launchd uninstall` still runs.
 	bin=/usr/local/bin/tunmux; [ -x "$$bin" ] || bin=target/release/tunmux; \
 	sudo "$$bin" launchd uninstall || true
+
+.PHONY: purge/privileged
+purge/privileged: uninstall/privileged
+	@# Destructive: after unregistering the daemon, remove the binary, all data,
+	@# logs, and the tunmux group.
 	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
 	sudo rm -f /usr/local/bin/tunmux
 	sudo rm -rf "/Library/Application Support/tunmux"
@@ -88,6 +95,9 @@ uninstall/privileged: build.release
 
 .PHONY: uninstall
 uninstall: uninstall/autostart uninstall/privileged uninstall/dns
+
+.PHONY: purge
+purge: uninstall purge/privileged
 
 
 .PHONY: check/privileged

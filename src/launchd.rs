@@ -234,7 +234,7 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     remove_file_ignore_missing(&config::privileged_socket_path())?;
 
     println!("tunmux privileged daemon uninstalled.");
-    println!("Intentionally kept (remove with `make uninstall/privileged` for a full removal):");
+    println!("Intentionally kept (remove with `make purge/privileged` for a full removal):");
     println!("  the tunmux binary");
     println!("  the tunmux group");
     println!("  {}", config::root_log_dir().display());
