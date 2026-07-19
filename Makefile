@@ -124,3 +124,23 @@ check/privileged:
 
 .PHONY: check
 check: check/privileged
+
+
+# --- Release ---------------------------------------------------------------
+# Cut a release from the CLI: push a v-prefixed tag and let the Release
+# workflow (.github/workflows/release.yml) build and publish the GitHub
+# Release with artifacts. Do NOT create the release in the web UI — a
+# published release is immutable and the asset upload would fail.
+#
+# Version defaults to Cargo.toml; override with:  make release VERSION=1.2.3
+VERSION ?= $(shell grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+TAG := v$(VERSION)
+
+.PHONY: release
+release:
+	@git diff --quiet && git diff --cached --quiet || { echo "==> working tree dirty; commit or stash first"; exit 1; }
+	@git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null && { echo "==> tag $(TAG) already exists"; exit 1; } || true
+	@echo "==> tagging $(TAG) at $$(git rev-parse --short HEAD)"
+	git tag -a "$(TAG)" -m "Release $(TAG)"
+	git push origin "$(TAG)"
+	@echo "==> pushed $(TAG) — the Release workflow will build and publish"
