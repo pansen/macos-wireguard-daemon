@@ -75,7 +75,7 @@ fn main() {
         TopCommand::Launchd { command } => {
             init_logging(cli.verbose);
             if let Err(e) = launchd::dispatch(command) {
-                error!( command = ?"launchd", error = ?e.to_string(), "command_failed");
+                error!(command = ?"launchd", error = %format!("{e:#}"), "command_failed");
                 std::process::exit(1);
             }
         }

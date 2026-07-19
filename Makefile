@@ -75,8 +75,11 @@ uninstall/dns:
 	sudo killall -HUP mDNSResponder
 
 .PHONY: uninstall/privileged
-uninstall/privileged:
-	sudo /usr/local/bin/tunmux launchd uninstall 2>/dev/null || true
+uninstall/privileged: build.release
+	@# Prefer the installed binary; if it was already removed, fall back to the
+	@# freshly compiled one so `launchd uninstall` (bootout + plist removal) still runs.
+	bin=/usr/local/bin/tunmux; [ -x "$$bin" ] || bin=target/release/tunmux; \
+	sudo "$$bin" launchd uninstall || true
 	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
 	sudo rm -f /usr/local/bin/tunmux
 	sudo rm -rf "/Library/Application Support/tunmux"

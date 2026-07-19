@@ -25,8 +25,7 @@
         <dict>
             <key>SockPathName</key>
             <string>/Library/Application Support/tunmux/run/ctl.sock</string>
-            <!-- @SOCK_PATH_GROUP@ (replaced at install time with SockPathGroup = integer GID of the tunmux group) -->
-            <!-- e.g. for GID 20 this whole line becomes: <key>SockPathGroup</key> <integer>20</integer> -->
+            <!-- @SOCK_PATH_GROUP@ replaced at install time with SockPathGroup = integer GID of the tunmux group; e.g. GID 20 becomes: <key>SockPathGroup</key> <integer>20</integer> -->
             <!-- 0660 octal = 432 decimal; plist <integer> is base-10 -->
             <key>SockPathMode</key>
             <integer>432</integer>

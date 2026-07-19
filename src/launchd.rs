@@ -15,8 +15,8 @@ use nix::unistd::{chown, geteuid, Gid, Group, Uid, User};
 use crate::cli::LaunchdCommand;
 use crate::config;
 
-pub const LABEL: &str = "me.pansen.tunmux.privileged";
-pub const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist";
+pub(crate) const LABEL: &str = "me.pansen.tunmux.privileged";
+pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist";
 
 /// Group whose members may talk to the privileged daemon's control socket.
 /// Must match `AUTH_GROUP_NAME` in `src/privileged/mod.rs`, which is private
@@ -25,37 +25,59 @@ const GROUP_NAME: &str = "tunmux";
 
 const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.tunmux.privileged.plist");
 const BIN_PLACEHOLDER: &str = "@TUNMUX_BIN@";
-const SOCK_GROUP_MARKER: &str =
-    "<!-- @SOCK_PATH_GROUP@ (replaced at install time with SockPathGroup = integer GID of the tunmux group) -->";
+const SOCK_GROUP_MARKER: &str = "@SOCK_PATH_GROUP@";
 
 /// Render the privileged daemon's launchd plist, substituting the daemon
 /// binary path and the authorized-group GID into `template`.
 fn render_plist_from(template: &str, daemon_binary: &str, gid: u32) -> anyhow::Result<String> {
     if !template.contains(BIN_PLACEHOLDER) {
-        anyhow::bail!(
-            "plist template is missing the {} placeholder",
-            BIN_PLACEHOLDER
-        );
+        anyhow::bail!("plist template is missing the {BIN_PLACEHOLDER} placeholder");
     }
-    let rendered = template.replace(BIN_PLACEHOLDER, daemon_binary);
 
     let marker_line = template
         .lines()
         .find(|line| line.contains(SOCK_GROUP_MARKER))
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "plist template is missing the SockPathGroup marker comment: {}",
-                SOCK_GROUP_MARKER
-            )
+            anyhow::anyhow!("plist template is missing the {SOCK_GROUP_MARKER} marker comment")
         })?;
     let indent: String = marker_line
         .chars()
         .take_while(|c| c.is_whitespace())
         .collect();
-    let replacement = format!("{indent}<key>SockPathGroup</key>\n{indent}<integer>{gid}</integer>");
-    let rendered = rendered.replace(marker_line, &replacement);
+    let group_kv = format!("{indent}<key>SockPathGroup</key>\n{indent}<integer>{gid}</integer>");
+
+    // Replace the marker line on the raw template first (so it matches regardless
+    // of where BIN_PLACEHOLDER sits), then substitute the escaped binary path.
+    let rendered = template
+        .replace(marker_line, &group_kv)
+        .replace(BIN_PLACEHOLDER, &xml_escape(daemon_binary));
+
+    // Fail closed: neither placeholder may survive, and the daemon Label the
+    // restart/uninstall paths target must be present (guards a bad custom template).
+    anyhow::ensure!(
+        !rendered.contains(BIN_PLACEHOLDER),
+        "rendered plist still contains {BIN_PLACEHOLDER}"
+    );
+    anyhow::ensure!(
+        !rendered.contains(SOCK_GROUP_MARKER),
+        "rendered plist still contains the {SOCK_GROUP_MARKER} marker"
+    );
+    anyhow::ensure!(
+        rendered.contains(LABEL),
+        "rendered plist is missing the expected launchd Label `{LABEL}` (custom template?)"
+    );
 
     Ok(rendered)
+}
+
+/// Escape the five XML special characters so a path with e.g. `&` in it
+/// still produces a well-formed plist.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Reject binaries in locations a regular user controls.
@@ -73,9 +95,9 @@ fn render_plist_from(template: &str, daemon_binary: &str, gid: u32) -> anyhow::R
 /// denylisting of known user-writable roots (home directories, temp dirs)
 /// is the meaningful signal here.
 pub fn validate_binary_location(
-    invoked: &std::path::Path,
-    resolved: &std::path::Path,
-    invoking_user_home: Option<&std::path::Path>,
+    invoked: &Path,
+    resolved: &Path,
+    invoking_user_home: Option<&Path>,
 ) -> anyhow::Result<()> {
     validate_one(invoked, invoking_user_home)?;
     validate_one(resolved, invoking_user_home)?;
@@ -88,12 +110,11 @@ const REJECTED_PREFIXES: &[&str] = &[
     "/private/tmp/",
     "/var/folders/",
     "/private/var/folders/",
+    "/var/tmp/",
+    "/private/var/tmp/",
 ];
 
-fn validate_one(
-    path: &std::path::Path,
-    invoking_user_home: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Result<()> {
     if !path.is_absolute() {
         anyhow::bail!(
             "refusing to install a launchd daemon that runs a non-absolute path ({}); \
@@ -137,18 +158,36 @@ pub fn dispatch(command: LaunchdCommand) -> anyhow::Result<()> {
     }
 }
 
-fn cmd_install(plist_template: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     require_root("install")?;
+
+    // Validate everything that can refuse the install BEFORE mutating any
+    // system state (group creation, membership, directories, plist).
     let user = invoking_user()?;
-    let gid = ensure_group_with_member(&user)?;
     let bin = daemon_binary_path()?;
-    ensure_directories(gid)?;
+    let bin_str = bin.to_str().ok_or_else(|| {
+        anyhow::anyhow!("tunmux binary path is not valid UTF-8: {}", bin.display())
+    })?;
     let template = match plist_template.as_deref() {
-        Some(path) => std::fs::read_to_string(path)
+        Some(path) => fs::read_to_string(path)
             .with_context(|| format!("failed to read plist template {}", path.display()))?,
         None => PLIST_TEMPLATE.to_string(),
     };
-    let plist = render_plist_from(&template, &bin.to_string_lossy(), gid)?;
+    // Cheap fail-closed pre-check so a malformed template can't leave a
+    // half-created group behind (render_plist_from re-checks below).
+    anyhow::ensure!(
+        template.contains(BIN_PLACEHOLDER),
+        "plist template is missing the {BIN_PLACEHOLDER} placeholder"
+    );
+    anyhow::ensure!(
+        template.lines().any(|l| l.contains(SOCK_GROUP_MARKER)),
+        "plist template is missing the {SOCK_GROUP_MARKER} marker comment"
+    );
+
+    // --- system mutation begins here ---
+    let gid = ensure_group_with_member(&user)?;
+    ensure_directories(gid)?;
+    let plist = render_plist_from(&template, bin_str, gid)?;
     write_plist(&plist)?;
     bootstrap()?;
 
@@ -170,7 +209,7 @@ fn cmd_restart() -> anyhow::Result<()> {
     // Re-run the same location validation as install, guarding against e.g.
     // `sudo ./target/debug/tunmux launchd restart` restarting a daemon that
     // was installed from a different (system) location.
-    daemon_binary_path()?;
+    let _ = daemon_binary_path()?;
 
     run_checked(
         "/bin/launchctl",
@@ -246,8 +285,10 @@ fn invoking_user() -> anyhow::Result<String> {
 /// address; the current dev/Makefile flow installs straight to
 /// /usr/local/bin, so it's unaffected either way.
 fn daemon_binary_path() -> anyhow::Result<PathBuf> {
-    let invoked = std::env::current_exe()?;
-    let resolved = fs::canonicalize(&invoked).unwrap_or_else(|_| invoked.clone());
+    let invoked =
+        std::env::current_exe().context("failed to determine the running tunmux binary path")?;
+    let resolved = fs::canonicalize(&invoked)
+        .with_context(|| format!("failed to resolve {}", invoked.display()))?;
     validate_binary_location(&invoked, &resolved, invoking_user_home().as_deref())?;
     Ok(invoked)
 }
@@ -301,17 +342,28 @@ fn ensure_directories(gid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the rendered plist to `PLIST_PATH` with the ownership/permissions
-/// launchd expects of a system daemon plist.
+/// Write the rendered plist to `PLIST_PATH` atomically (temp file + rename)
+/// with the ownership/permissions launchd expects of a system daemon plist.
 fn write_plist(contents: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::write(PLIST_PATH, contents).with_context(|| format!("failed to write {PLIST_PATH}"))?;
-    fs::set_permissions(PLIST_PATH, fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("failed to chmod {PLIST_PATH}"))?;
-    chown(PLIST_PATH, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
-        .with_context(|| format!("failed to chown {PLIST_PATH}"))?;
-    Ok(())
+    let tmp = PathBuf::from(format!("{PLIST_PATH}.tmp"));
+
+    let write_result = (|| -> anyhow::Result<()> {
+        fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+        chown(&tmp, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+            .with_context(|| format!("failed to chown {}", tmp.display()))?;
+        fs::rename(&tmp, PLIST_PATH).with_context(|| format!("failed to install {PLIST_PATH}"))?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        // Best-effort cleanup; ignore errors.
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 /// Port of Makefile:36-38 (order matters): drop any existing instance, clear
@@ -414,7 +466,28 @@ mod tests {
         let template = PLIST_TEMPLATE.replace(SOCK_GROUP_MARKER, "");
         let err = render_plist_from(&template, "/opt/homebrew/bin/tunmux", 499)
             .expect_err("missing marker should error");
-        assert!(err.to_string().contains("SockPathGroup"));
+        assert!(err.to_string().contains(SOCK_GROUP_MARKER));
+    }
+
+    #[test]
+    fn render_rejects_template_without_label() {
+        let modified = PLIST_TEMPLATE.replace(LABEL, "me.pansen.tunmux.evil");
+        let err = render_plist_from(&modified, "/usr/local/bin/tunmux", 20)
+            .expect_err("missing expected Label should error");
+        assert!(err.to_string().contains("Label"));
+    }
+
+    #[test]
+    fn xml_escape_escapes_specials() {
+        assert_eq!(xml_escape("/a&b/<c>"), "/a&amp;b/&lt;c&gt;");
+    }
+
+    #[test]
+    fn render_escapes_binary_path() {
+        let rendered =
+            render_plist_from(PLIST_TEMPLATE, "/opt/t&t/bin/tunmux", 20).expect("render succeeds");
+        assert!(rendered.contains("/opt/t&amp;t/bin/tunmux"));
+        assert!(!rendered.contains("t&t/bin"));
     }
 
     #[test]
@@ -440,6 +513,16 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/private/var/folders/xx/tunmux"),
             Path::new("/private/var/folders/xx/tunmux"),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_var_tmp() {
+        assert!(validate_binary_location(
+            Path::new("/var/tmp/tunmux"),
+            Path::new("/private/var/tmp/tunmux"),
             None,
         )
         .is_err());
