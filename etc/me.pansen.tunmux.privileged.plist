@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/tunmux</string>
+        <string>@TUNMUX_BIN@</string>
         <string>--debug</string>
         <string>privileged</string>
         <string>--serve</string>
@@ -25,8 +25,7 @@
         <dict>
             <key>SockPathName</key>
             <string>/Library/Application Support/tunmux/run/ctl.sock</string>
-            <!-- SockPathGroup requires an integer GID, not a name — group is set by the
-                 daemon via chown immediately after receiving the fd from launch_activate_socket. -->
+            <!-- @SOCK_PATH_GROUP@ replaced at install time with SockPathGroup = integer GID of the tunmux group; e.g. GID 20 becomes: <key>SockPathGroup</key> <integer>20</integer> -->
             <!-- 0660 octal = 432 decimal; plist <integer> is base-10 -->
             <key>SockPathMode</key>
             <integer>432</integer>

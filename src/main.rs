@@ -1,6 +1,9 @@
+mod autoconnect;
 mod cli;
 mod config;
 mod error;
+mod launchctl;
+mod launchd;
 mod logging;
 mod privileged;
 mod privileged_api;
@@ -71,6 +74,22 @@ fn main() {
             }
         }
 
+        TopCommand::Launchd { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = launchd::dispatch(command) {
+                error!(command = ?"launchd", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Autoconnect { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = autoconnect::dispatch(command) {
+                error!(command = ?"autoconnect", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
         // All other commands use the multi-threaded tokio runtime.
         other => {
             init_logging(cli.verbose);
@@ -102,7 +121,11 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             all,
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Hook { command } => run_hook_command(command),
-        TopCommand::Status | TopCommand::Wg | TopCommand::Privileged { .. } => {
+        TopCommand::Status
+        | TopCommand::Wg
+        | TopCommand::Launchd { .. }
+        | TopCommand::Autoconnect { .. }
+        | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }
@@ -350,33 +373,81 @@ async fn dispatch_provider_disconnect(
 }
 
 fn cmd_status() -> anyhow::Result<()> {
-    let connections = ConnectionState::load_all()?;
+    // Probe liveness across every backend, not just userspace: a reboot/crash
+    // leaves stale kernel/wg-quick state behind too, and `is_live()` already
+    // knows the right probe per backend.
+    let mut connections: Vec<ConnectionState> = ConnectionState::load_all()?
+        .into_iter()
+        .filter(ConnectionState::is_live)
+        .collect();
+
+    let have_wgconf_direct = connections
+        .iter()
+        .any(|c| c.provider == "wgconf" && c.interface_name == "wgconf0");
+    // Use the higher-level probe (not the raw client call) so a cold-starting
+    // privileged daemon doesn't make a live wgconf0 tunnel look inactive.
+    if !have_wgconf_direct && wireguard::userspace::is_interface_active("wgconf0") {
+        connections.push(wireguard::connection::ConnectionState {
+            instance_name: wireguard::connection::DIRECT_INSTANCE.to_string(),
+            provider: "wgconf".to_string(),
+            interface_name: "wgconf0".to_string(),
+            backend: wireguard::backend::WgBackend::Userspace,
+            server_endpoint: "(unknown)".to_string(),
+            server_display_name: "(unknown)".to_string(),
+            dns_servers: Vec::new(),
+            source_path: None,
+        });
+    }
 
     if connections.is_empty() {
         println!("No active connections.");
         return Ok(());
     }
 
+    let headers = ["Instance", "Provider", "Server", "Endpoint", "Backend"];
+    let rows: Vec<[String; 5]> = connections
+        .iter()
+        .map(|conn| {
+            [
+                conn.instance_name.clone(),
+                conn.provider.clone(),
+                conn.server_display_name.clone(),
+                conn.server_endpoint.clone(),
+                conn.backend.to_string(),
+            ]
+        })
+        .collect();
+
+    // Size each column to the widest of its header and cells so long values
+    // (e.g. a `.conf` filename in Server) don't push the table out of alignment.
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let render_row = |cells: &[String]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+    println!("{}", render_row(&header_cells).trim_end());
     println!(
-        "{:<12} {:<9} {:<10} {:<5} {:<9}",
-        "Instance", "Provider", "Server", "Exit", "Backend"
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("-+-")
     );
-    println!("{}", "-".repeat(50));
-
-    for conn in &connections {
-        let exit = conn
-            .server_display_name
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .chars()
-            .filter(|c| c.is_ascii_alphabetic())
-            .collect::<String>();
-
-        println!(
-            "{:<12} {:<9} {:<10} {:<5} {:<9}",
-            conn.instance_name, conn.provider, conn.server_display_name, exit, conn.backend,
-        );
+    for row in &rows {
+        println!("{}", render_row(row).trim_end());
     }
 
     Ok(())

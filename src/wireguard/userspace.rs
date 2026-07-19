@@ -1,7 +1,7 @@
 use crate::config;
 use crate::error::Result;
 use crate::privileged_api::GotaTunAction;
-use crate::privileged_client::PrivilegedClient;
+use crate::privileged_client::{is_retryable_transport_error, PrivilegedClient};
 use tracing::info;
 
 use super::handshake;
@@ -71,7 +71,39 @@ pub fn down_raw(interface_name: &str) -> Result<()> {
 /// semantics).
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
-    PrivilegedClient::new()
-        .interface_active(interface_name)
-        .unwrap_or(false)
+    let client = PrivilegedClient::new();
+    // The privileged daemon is on-demand and idle-exits; the first probe after
+    // an idle exit can race its cold start and return a *transport error*. A
+    // bare `unwrap_or(false)` there reports a live tunnel as down, which then
+    // wrongly clears saved connection state (see `direct_connection_active`)
+    // and drives a needless disconnect / re-adopt churn every autoconnect
+    // cycle. An authoritative `Ok(active)` from the daemon is returned
+    // immediately (so a genuinely-down tunnel stays fast); only a transport
+    // error is retried briefly so the probe settles on the true state.
+    const ATTEMPTS: usize = 4;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+    for attempt in 0..ATTEMPTS {
+        match client.interface_active(interface_name) {
+            Ok(active) => return active,
+            Err(err) if attempt + 1 < ATTEMPTS && is_retryable_transport_error(&err) => {
+                tracing::debug!(
+                    interface = interface_name,
+                    error = %err,
+                    "interface_active probe errored; retrying (daemon cold start?)"
+                );
+                std::thread::sleep(BACKOFF);
+            }
+            Err(err) => {
+                // Either an authoritative (non-transport) error, or the last
+                // attempt — report inactive without further retries.
+                tracing::debug!(
+                    interface = interface_name,
+                    error = %err,
+                    "interface_active probe failed; reporting inactive"
+                );
+                return false;
+            }
+        }
+    }
+    false
 }
