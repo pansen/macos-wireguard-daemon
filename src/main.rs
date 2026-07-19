@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod error;
+mod launchd;
 mod logging;
 mod privileged;
 mod privileged_api;
@@ -71,6 +72,14 @@ fn main() {
             }
         }
 
+        TopCommand::Launchd { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = launchd::dispatch(command) {
+                error!( command = ?"launchd", error = ?e.to_string(), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
         // All other commands use the multi-threaded tokio runtime.
         other => {
             init_logging(cli.verbose);
@@ -102,7 +111,10 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             all,
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Hook { command } => run_hook_command(command),
-        TopCommand::Status | TopCommand::Wg | TopCommand::Privileged { .. } => {
+        TopCommand::Status
+        | TopCommand::Wg
+        | TopCommand::Launchd { .. }
+        | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }

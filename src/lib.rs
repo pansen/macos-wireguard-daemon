@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod launchd;
 pub mod logging;
 pub mod shared;
 

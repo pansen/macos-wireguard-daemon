@@ -16,27 +16,9 @@ build.release: submodule
 
 .PHONY: install/privileged
 install/privileged:
-	sudo dseditgroup -o read tunmux >/dev/null 2>&1 || sudo dseditgroup -o create tunmux
-	sudo dseditgroup -o edit -a $$(id -un) -t user tunmux
-
+	@# Binary copy is a dev stand-in for the future Homebrew bottle.
 	sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
-	sudo mkdir -p /var/log/tunmux && sudo chmod 755 /var/log/tunmux
-	sudo mkdir -p "/Library/Application Support/tunmux/run"
-	sudo chgrp tunmux "/Library/Application Support/tunmux/run"
-	sudo chmod 0750 "/Library/Application Support/tunmux/run"
-
-	sudo cp etc/me.pansen.tunmux.privileged.plist /Library/LaunchDaemons/
-	sudo chown root:wheel /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
-	sudo chmod 644 /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
-	GID=$$(dscl . -read /Groups/tunmux PrimaryGroupID | awk '{print $$2}'); \
-	sudo /usr/libexec/PlistBuddy -c "Delete :Sockets:Listeners:SockPathGroup" \
-		/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist 2>/dev/null || true; \
-	sudo /usr/libexec/PlistBuddy -c "Add :Sockets:Listeners:SockPathGroup integer $$GID" \
-		/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
-	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
-	@# Clear any stale "disabled" override — bootstrap of a disabled label fails with EIO (5).
-	sudo launchctl enable system/me.pansen.tunmux.privileged
-	sudo launchctl bootstrap system /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
+	sudo /usr/local/bin/tunmux launchd install
 
 
 .PHONY: install/autostart
@@ -57,7 +39,7 @@ install: build.release install/privileged install/autostart
 
 .PHONY: reload/privileged
 reload/privileged:
-	sudo launchctl kickstart -k system/me.pansen.tunmux.privileged
+	sudo /usr/local/bin/tunmux launchd restart
 
 .PHONY: reload/connections
 reload/connections:
@@ -94,10 +76,8 @@ uninstall/dns:
 
 .PHONY: uninstall/privileged
 uninstall/privileged:
-	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
-	sudo launchctl disable system/me.pansen.tunmux.privileged 2>/dev/null || true
+	sudo /usr/local/bin/tunmux launchd uninstall 2>/dev/null || true
 	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
-	sudo rm -f /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 	sudo rm -f /usr/local/bin/tunmux
 	sudo rm -rf "/Library/Application Support/tunmux"
 	sudo rm -rf /var/log/tunmux

@@ -353,20 +353,24 @@ Changes from current:
 > shorter `SockMode`/`SockGroup`. Confirm which the running launchd honors (see gotchas);
 > the value must end up `0660 root:tunmux` on the created socket.
 
-### 3. `Makefile` — pre-create the socket directory
+### 3. `Makefile` — delegate daemon setup to the binary
 
-Under on-demand activation the daemon may not be running to create
-`/Library/Application Support/tunmux/run`; launchd needs the parent directory to exist to create the socket
-file. Add to `install/privileged` (the `tunmux` group already exists by this point):
+`install/privileged` now installs the binary and delegates all daemon setup to
+`tunmux launchd install`:
 
 ```make
-sudo mkdir -p "/Library/Application Support/tunmux/run"
-sudo chgrp tunmux "/Library/Application Support/tunmux/run"
-sudo chmod 0750 "/Library/Application Support/tunmux/run"
+sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
+sudo /usr/local/bin/tunmux launchd install
 ```
 
-The rest of `install/privileged` (group creation, binary install, log dir, plist
-copy/chown, `bootout`/`bootstrap`) is unchanged.
+`tunmux launchd install` handles group creation, log dir setup, socket dir
+pre-creation, plist copy/chown, and launchctl bootstrap. Similarly,
+`tunmux launchd restart` replaces the direct `launchctl kickstart`, and
+`tunmux launchd uninstall` handles bootout/disable and plist removal.
+
+This centralizes the entire daemon lifecycle in the binary, keeping the
+Makefile simple and reducing duplication between install-time and upgrade
+flows.
 
 ### 4. Unprivileged client — no change
 
