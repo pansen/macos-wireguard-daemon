@@ -450,6 +450,28 @@ fn cmd_status() -> anyhow::Result<()> {
         println!("{}", render_row(row).trim_end());
     }
 
+    // Beneath the summary table, print the live route/DNS overview for any
+    // userspace tunnel. The state lives in the per-interface helper's memory, so
+    // it's fetched via the privileged service (which alone can reach the helper's
+    // root-only query socket). Best-effort: a fetch failure never fails `status`.
+    let client = privileged_client::PrivilegedClient::new();
+    for conn in &connections {
+        if conn.backend != wireguard::backend::WgBackend::Userspace {
+            continue;
+        }
+        match client.network_overview(&conn.interface_name) {
+            Ok(Some(overview)) => {
+                println!();
+                println!("{}", overview.trim_end());
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "network overview for {} unavailable: {}",
+                conn.interface_name, e
+            ),
+        }
+    }
+
     Ok(())
 }
 

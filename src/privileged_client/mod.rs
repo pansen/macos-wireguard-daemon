@@ -197,6 +197,21 @@ impl PrivilegedClient {
         }
     }
 
+    /// Fetch the live route/DNS overview for a userspace tunnel, rendered by the
+    /// helper that owns the interface. Returns `None` when the tunnel has no
+    /// overview to show (kernel/wg-quick backend, or the helper isn't running).
+    pub fn network_overview(&self, interface: &str) -> Result<Option<String>> {
+        match self.send(PrivilegedRequest::NetworkOverview {
+            interface: interface.to_string(),
+        })? {
+            PrivilegedResponse::Text(output) if output.is_empty() => Ok(None),
+            PrivilegedResponse::Text(output) => Ok(Some(output)),
+            _ => Err(AppError::Other(
+                "invalid privileged response for NetworkOverview".into(),
+            )),
+        }
+    }
+
     /// Ask the privileged service whether the userspace UAPI control socket for
     /// `interface` exists. Used for liveness checks that would otherwise be
     /// permission-blind from an unprivileged caller (the socket dir is

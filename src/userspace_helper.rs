@@ -70,6 +70,16 @@ fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
     PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.cleanup"))
 }
 
+/// Unix socket the helper listens on to serve the live network overview. The
+/// privileged service (also root) connects here on behalf of `tunmux status`;
+/// the state it renders lives only in this process's memory, so a query channel
+/// is the only way to expose it. Lives under the same `0750 root:daemon`
+/// runtime dir as the UAPI socket, so unprivileged callers can't reach it.
+#[cfg(target_os = "macos")]
+fn gotatun_query_socket_path(interface: &str) -> PathBuf {
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.query.sock"))
+}
+
 #[cfg(unix)]
 fn gotatun_log_path(interface: &str) -> PathBuf {
     // Shared with the privileged service (which clears and tails this file), so
@@ -92,7 +102,9 @@ struct RunningDevice {
 enum CleanupState {
     None,
     #[cfg(target_os = "macos")]
-    Macos(Box<MacosCleanupState>),
+    // `Arc` (not `Box`) so the overview query server thread can share the live
+    // routing/DNS state with the reconciler without copying it.
+    Macos(std::sync::Arc<MacosCleanupState>),
 }
 
 #[cfg(target_os = "macos")]
@@ -345,6 +357,17 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 pid = std::process::id(),
                 "userspace_helper_ready"
             );
+
+            // Expose the live network overview for `tunmux status`. Best-effort:
+            // a bind failure only costs the status view, not the tunnel.
+            #[cfg(target_os = "macos")]
+            if let CleanupState::Macos(state) = &running.cleanup {
+                spawn_overview_query_server(
+                    &running.control_interface_name,
+                    std::sync::Arc::clone(state),
+                );
+            }
+
             let shutdown_started = std::time::Instant::now();
             let wait_result = rt.block_on(wait_for_shutdown(&running));
             debug!(
@@ -403,6 +426,10 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(&control_socket_path);
             let _ = std::fs::remove_file(&pid_path);
             let _ = std::fs::remove_file(gotatun_name_path(interface));
+            // The query server thread dies with the process; drop its socket file
+            // so a later tunnel on the same interface binds cleanly.
+            #[cfg(target_os = "macos")]
+            let _ = std::fs::remove_file(gotatun_query_socket_path(interface));
 
             final_result?;
         }
@@ -914,7 +941,7 @@ fn configure_network(
     config: &ParsedUserspaceConfig,
 ) -> anyhow::Result<CleanupState> {
     let cleanup = configure_network_macos(interface, config)?;
-    Ok(CleanupState::Macos(Box::new(cleanup)))
+    Ok(CleanupState::Macos(std::sync::Arc::new(cleanup)))
 }
 
 #[cfg(unix)]
@@ -2188,7 +2215,7 @@ fn parse_device_from_hw_line(hw: &str) -> Option<String> {
 /// Emit a full route + DNS overview. Called once after connect setup and after
 /// route/DNS reconciliation work, so the log shows the resulting tunnel state.
 #[cfg(target_os = "macos")]
-fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
+fn build_macos_network_overview(state: &MacosCleanupState) -> String {
     let inputs = &state.reconcile;
     let (routes, route_fingerprint) = {
         let routing = state
@@ -2212,15 +2239,72 @@ fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
         global_resolvers: macos_global_resolvers(),
         tailscaled_present: tailscaled_socket_present(),
     };
-    let table = format_macos_network_overview_table(
+    format_macos_network_overview_table(
         inputs,
         &routes,
         &route_fingerprint,
         &owned_dns,
         &dns_fingerprint,
         &foreign,
-    );
-    info!(reason, interface = inputs.interface, "\n{table}\n");
+    )
+}
+
+/// Emit a full route + DNS overview. Called once after connect setup and after
+/// route/DNS reconciliation work, so the log shows the resulting tunnel state.
+#[cfg(target_os = "macos")]
+fn log_macos_network_overview(reason: &str, state: &MacosCleanupState) {
+    let table = build_macos_network_overview(state);
+    info!(reason, interface = state.reconcile.interface, "\n{table}\n");
+}
+
+/// Serve the network overview on a per-interface Unix socket for the lifetime
+/// of the tunnel. Each connection gets one freshly-rendered overview and is
+/// then closed — no request body is read, since the socket serves exactly one
+/// thing. Runs on a dedicated blocking thread because rendering shells out to
+/// `ifconfig`/`scutil`/`networksetup`, which must not block the async runtime.
+#[cfg(target_os = "macos")]
+fn spawn_overview_query_server(interface: &str, state: std::sync::Arc<MacosCleanupState>) {
+    use std::io::Write;
+
+    let path = gotatun_query_socket_path(interface);
+    // A stale socket from a crashed predecessor would make bind() fail with
+    // EADDRINUSE; clear it first (the pid file guards against a live double-run).
+    let _ = std::fs::remove_file(&path);
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(interface, error = %error, "userspace_helper_query_socket_bind_failed");
+            return;
+        }
+    };
+    // Belt-and-suspenders: the runtime dir is already root-only, but pin the
+    // socket private so only root (the privileged service) can connect.
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(interface, error = %error, "userspace_helper_query_socket_chmod_failed");
+    }
+
+    let interface = interface.to_string();
+    let thread_interface = interface.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("tunmux-overview-{interface}"))
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let table = build_macos_network_overview(&state);
+                        if let Err(error) = stream.write_all(table.as_bytes()) {
+                            debug!(interface = thread_interface, error = %error, "userspace_helper_query_write_failed");
+                        }
+                    }
+                    Err(error) => {
+                        debug!(interface = thread_interface, error = %error, "userspace_helper_query_accept_failed");
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(interface, error = %error, "userspace_helper_query_thread_spawn_failed");
+    }
 }
 
 #[cfg(target_os = "macos")]

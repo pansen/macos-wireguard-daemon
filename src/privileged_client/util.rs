@@ -29,6 +29,7 @@ pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
         PrivilegedRequest::InterfaceActive { .. } => "InterfaceActive",
         PrivilegedRequest::WgShow { .. } => "WgShow",
+        PrivilegedRequest::NetworkOverview { .. } => "NetworkOverview",
     }
 }
 

@@ -3,7 +3,8 @@ use crate::error::AppError;
 use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
 
 use super::commands::{
-    run_gotatun_down, run_gotatun_up, run_wg_quick_down, run_wg_quick_up, run_wg_show,
+    run_gotatun_down, run_gotatun_up, run_network_overview, run_wg_quick_down, run_wg_quick_up,
+    run_wg_show,
 };
 use super::ControlState;
 use tracing::debug;
@@ -121,6 +122,18 @@ pub(super) fn dispatch(
                 message: format!("{}", e),
             },
         },
+
+        PrivilegedRequest::NetworkOverview { interface } => {
+            match run_network_overview(interface.as_str()) {
+                // No query socket (kernel/wg-quick backend, or not up): empty text
+                // tells the caller to render nothing rather than an error.
+                Ok(overview) => PrivilegedResponse::Text(overview.unwrap_or_default()),
+                Err(e) => PrivilegedResponse::Error {
+                    code: categorize_error(&e),
+                    message: format!("{}", e),
+                },
+            }
+        }
 
         PrivilegedRequest::InterfaceActive { interface } => {
             // The userspace UAPI control socket. Checked here (as root) because

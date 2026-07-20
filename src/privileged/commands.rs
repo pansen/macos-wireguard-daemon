@@ -64,6 +64,27 @@ pub(super) fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Fetch the live network overview from a userspace helper's query socket.
+/// Returns `Ok(None)` when there is no such socket (kernel/wg-quick backend, or
+/// the tunnel isn't a gotatun userspace one) so the caller can quietly skip it.
+pub(super) fn run_network_overview(interface: &str) -> Result<Option<String>> {
+    use std::io::Read;
+
+    let socket_path = std::path::PathBuf::from("/var/run/wireguard")
+        .join(format!("{interface}.tunmux.query.sock"));
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|e| AppError::Other(format!("overview query connect: {e}")))?;
+    let mut overview = String::new();
+    stream
+        .read_to_string(&mut overview)
+        .map_err(|e| AppError::Other(format!("overview query read: {e}")))?;
+    Ok(Some(overview))
+}
+
 pub(super) fn run_wg_show(interface: &str) -> Result<String> {
     let socket_path =
         std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));

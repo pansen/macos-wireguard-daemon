@@ -55,6 +55,13 @@ pub enum PrivilegedRequest {
     WgShow {
         interface: String,
     },
+
+    /// Fetch the live route/DNS overview for a userspace tunnel by querying the
+    /// helper's `/var/run/wireguard/<interface>.tunmux.query.sock`. Proxied
+    /// through the privileged service because that socket is root-only.
+    NetworkOverview {
+        interface: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +108,7 @@ impl PrivilegedRequest {
             Self::ShutdownIfIdle => Ok(()),
             Self::InterfaceActive { interface } => validate_interface_name(interface),
             Self::WgShow { interface } => validate_interface_name(interface),
+            Self::NetworkOverview { interface } => validate_interface_name(interface),
         }
     }
 }
