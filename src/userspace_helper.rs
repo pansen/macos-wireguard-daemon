@@ -1903,6 +1903,25 @@ fn capture_macos_dns_service(
     })
 }
 
+/// Whether a DNS reconcile must act even though the observed fingerprint is
+/// unchanged. A collision (a directly-connected LAN that shadows the tunnel
+/// resolver) transitions ownership without necessarily moving the fingerprint,
+/// because DHCP-provided resolvers are invisible to `networksetup -getdnsservers`
+/// — joining or leaving such a LAN can leave every service's observed DNS
+/// untouched. Two symmetric transitions:
+///   * `must_pull_back`: a collision means we own services that now need
+///     restoring to their originals.
+///   * `must_reassert`: a cleared collision means services we should own are
+///     currently unowned and need tunnel DNS (re-)applied. Without this, a
+///     pull-back would never be undone until some other fingerprint-visible
+///     event happened to knock it loose.
+#[cfg(target_os = "macos")]
+fn dns_reconcile_forced(collision_present: bool, owned: &[String], targets: &[String]) -> bool {
+    let must_pull_back = collision_present && !owned.is_empty();
+    let must_reassert = !collision_present && targets.iter().any(|t| !owned.contains(t));
+    must_pull_back || must_reassert
+}
+
 /// Re-apply DNS when the host DNS environment changed (roam, DHCP renewal, a new
 /// or vanished service, a primary-service change). Cheap and silent when nothing
 /// changed; expressive when it acts. Mirrors `macos_reconcile_routes`.
@@ -1939,10 +1958,22 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         .dns
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Normally skip when the DNS environment is unchanged. But still act when a
-    // collision means we own services that now need restoring to their originals.
-    let must_pull_back = collision.is_some() && !dns.services.is_empty();
-    if fingerprint == dns.fingerprint && !must_pull_back {
+
+    // On a collision, target nothing so every owned service is restored to its
+    // original DNS rather than left pointing at an unreachable (or
+    // LAN-impersonatable) address.
+    let owned: Vec<String> = dns.services.iter().map(|s| s.service.clone()).collect();
+    let targets = match &collision {
+        Some(_) => Vec::new(),
+        None => dns_target_services(DNS_POLICY, &fingerprint),
+    };
+
+    // Normally skip when the DNS environment is unchanged, but still act when a
+    // collision transition changed required ownership without moving the
+    // fingerprint (see `dns_reconcile_forced`).
+    if fingerprint == dns.fingerprint
+        && !dns_reconcile_forced(collision.is_some(), &owned, &targets)
+    {
         return false; // cheap identity check, same guard as routes.
     }
 
@@ -1956,22 +1987,15 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         "userspace_helper_dns_change_detected"
     );
 
-    // On a collision, target nothing so every owned service is restored to its
-    // original DNS rather than left pointing at an unreachable (or
-    // LAN-impersonatable) address.
-    let targets = match collision {
-        Some((server, (subnet_ip, subnet_prefix))) => {
-            warn!(
-                interface = inputs.interface,
-                dns_server = %server,
-                local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
-                "userspace_helper_dns_unreachable_local_lan"
-            );
-            Vec::new()
-        }
-        None => dns_target_services(DNS_POLICY, &fingerprint),
-    };
-    let owned: Vec<String> = dns.services.iter().map(|s| s.service.clone()).collect();
+    if let Some((server, (subnet_ip, subnet_prefix))) = &collision {
+        warn!(
+            interface = inputs.interface,
+            dns_server = %server,
+            local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
+            "userspace_helper_dns_unreachable_local_lan"
+        );
+    }
+
     let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
 
     let (mut applied, mut captured, mut restored, mut dropped, mut errors) =
@@ -3277,6 +3301,31 @@ resolver #1
         let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
         assert_eq!(actions, DnsActions::default());
+    }
+
+    #[test]
+    fn dns_reconcile_forced_covers_collision_transitions() {
+        let wifi = || vec!["Wi-Fi".to_string()];
+
+        // Steady state, no collision, already own the target: guard may skip.
+        assert!(!dns_reconcile_forced(false, &wifi(), &wifi()));
+
+        // Entering a colliding LAN while we own services: must pull back, even
+        // though the fingerprint need not have moved.
+        assert!(dns_reconcile_forced(true, &wifi(), &[]));
+
+        // In a collision but owning nothing: nothing to restore, don't force.
+        assert!(!dns_reconcile_forced(true, &[], &[]));
+
+        // Leaving a collision: we own nothing but should own the primary again.
+        // This is the roam-off-collision case that previously never re-applied.
+        assert!(dns_reconcile_forced(false, &[], &wifi()));
+
+        // No collision and every target already owned: don't force.
+        assert!(!dns_reconcile_forced(false, &wifi(), &wifi()));
+
+        // No collision, no targets (e.g. VPN promotes no DNS): don't force.
+        assert!(!dns_reconcile_forced(false, &[], &[]));
     }
 
     #[test]
