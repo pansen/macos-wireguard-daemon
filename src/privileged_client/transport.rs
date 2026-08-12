@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
-use tracing::debug;
+use tracing::{debug, Level};
 
 use crate::config::PrivilegedTransport;
 use crate::error::{AppError, Result};
@@ -584,11 +584,13 @@ impl PrivilegedClient {
 
 /// Read the server's reply, which is zero or more log frames (`{"log":"…"}`) followed by exactly
 /// one response frame (`{"kind":…}`). Log frames are printed to stderr (so the operation's
-/// privileged-side logs appear in the caller's terminal); the response frame is returned.
+/// privileged-side logs appear in the caller's terminal), subject to this process's own log level;
+/// the response frame is returned.
 ///
 /// Backward compatible: an older server that sends only a response produces no log frames, so the
 /// first line is parsed as the response.
 fn read_framed_response<R: BufRead>(reader: &mut R) -> Result<super::PrivilegedResponse> {
+    let mut log_filter = LogLineFilter::new(crate::logging::terminal_max_level());
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -608,9 +610,47 @@ fn read_framed_response<R: BufRead>(reader: &mut R) -> Result<super::PrivilegedR
         match serde_json::from_str::<Frame>(trimmed)
             .map_err(|e| AppError::Other(format!("decode response: {}", e)))?
         {
-            Frame::Log { log } => eprintln!("{log}"),
+            Frame::Log { log } => {
+                if log_filter.accepts(&log) {
+                    eprintln!("{log}");
+                }
+            }
             Frame::Response(response) => return Ok(response),
         }
+    }
+}
+
+/// Decides which of the daemon's log lines this process prints.
+///
+/// The daemon always runs at debug level (its plist says so, and its log files
+/// want the detail), and its lines arrive as finished text that never passes
+/// through this process's subscriber. Without this the caller sees debug
+/// output it never asked for; with it, `-v` and `RUST_LOG` govern the daemon's
+/// lines the same way they govern the CLI's own.
+///
+/// A line with no recognizable level, such as the continuation of a multi-line
+/// message, inherits the previous line's decision, so a multi-line event is
+/// kept or dropped whole instead of losing its header or its body. Before any
+/// parseable line the default is to print, so an unrecognized format degrades
+/// to showing everything rather than swallowing it.
+struct LogLineFilter {
+    max: Option<Level>,
+    printing: bool,
+}
+
+impl LogLineFilter {
+    fn new(max: Option<Level>) -> Self {
+        Self {
+            printing: max.is_some(),
+            max,
+        }
+    }
+
+    fn accepts(&mut self, line: &str) -> bool {
+        if let Some(level) = crate::logging::parse_line_level(line) {
+            self.printing = self.max.is_some_and(|max| level <= max);
+        }
+        self.printing
     }
 }
 
@@ -625,8 +665,48 @@ enum Frame {
 #[cfg(test)]
 mod tests {
     use super::super::PrivilegedResponse;
-    use super::{read_framed_response, Frame};
+    use super::{read_framed_response, Frame, Level, LogLineFilter};
     use std::io::Cursor;
+
+    fn line(level: &str, message: &str) -> String {
+        format!("2026-06-14T08:18:02Z {level} {message} tunmux::privileged: ")
+    }
+
+    #[test]
+    fn filter_drops_debug_below_the_threshold() {
+        let mut filter = LogLineFilter::new(Some(Level::INFO));
+        assert!(!filter.accepts(&line("DEBUG", "gotatun_shutdown_begin")));
+        assert!(filter.accepts(&line(" INFO", "connection_state_removed")));
+        assert!(filter.accepts(&line("ERROR", "boom")));
+    }
+
+    #[test]
+    fn filter_keeps_debug_when_the_caller_asked_for_it() {
+        let mut filter = LogLineFilter::new(Some(Level::DEBUG));
+        assert!(filter.accepts(&line("DEBUG", "gotatun_shutdown_begin")));
+        assert!(filter.accepts(&line(" INFO", "connection_state_removed")));
+    }
+
+    #[test]
+    fn filter_keeps_a_multiline_message_whole() {
+        // A table logged as one INFO event arrives as several lines; only the
+        // first carries a level, and the rest must follow it either way.
+        let mut filter = LogLineFilter::new(Some(Level::INFO));
+        assert!(filter.accepts(&line(" INFO", "network overview")));
+        assert!(filter.accepts("INTERFACE  MTU   ADDRESSES"));
+
+        assert!(!filter.accepts(&line("DEBUG", "route table")));
+        assert!(!filter.accepts("DESTINATION       VIA"));
+    }
+
+    #[test]
+    fn filter_prints_unrecognized_output_and_nothing_when_off() {
+        // Nothing parseable yet: show it rather than swallow it.
+        assert!(LogLineFilter::new(Some(Level::ERROR)).accepts("helper said something"));
+        // Logging off means off, even for lines with no level.
+        assert!(!LogLineFilter::new(None).accepts("helper said something"));
+        assert!(!LogLineFilter::new(None).accepts(&line("ERROR", "boom")));
+    }
 
     fn reader(s: &str) -> Cursor<Vec<u8>> {
         Cursor::new(s.as_bytes().to_vec())

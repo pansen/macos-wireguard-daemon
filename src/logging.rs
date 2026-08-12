@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use time::macros::format_description;
 use tracing::field::{Field, Visit};
@@ -23,6 +23,10 @@ const GOTATUN_UAPI_CONNECTION_TARGET: &str = "gotatun::device::uapi";
 const GOTATUN_UAPI_CONNECTION_MESSAGE: &str = "New UAPI connection on unix socket";
 
 static SUPPRESS_GOTATUN_UAPI_CONNECTION_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+/// The level `init_terminal` installed, readable afterwards via
+/// [`terminal_max_level`].
+static TERMINAL_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
 pub struct GotatunUapiConnectionLogSuppression;
 
@@ -218,6 +222,77 @@ impl fmt::Display for FormattedLevel<'_> {
     }
 }
 
+/// Recover the level from a line already rendered by [`TunmuxLogFormat`].
+///
+/// The CLI receives the privileged daemon's log lines as finished text over
+/// the control socket, long past the point where a `tracing` subscriber could
+/// filter them, so the level has to come back out of the string. Kept next to
+/// the formatter that writes it: the two are one format, in one file.
+///
+/// `None` for anything not shaped like a formatted line, which includes the
+/// continuation lines of a multi-line message. Callers decide what to do with
+/// those rather than being handed a guess.
+pub fn parse_line_level(line: &str) -> Option<Level> {
+    // `INFO` and `WARN` are space-padded *inside* their color escape, so a
+    // colored line splits into a bare escape followed by the level word.
+    // Dropping tokens that strip down to nothing rejoins the two.
+    let mut tokens = line
+        .split_whitespace()
+        .map(strip_ansi)
+        .filter(|token| !token.is_empty());
+
+    // Anchor on the timestamp so a stray word in a message body can't be read
+    // as a level.
+    if !looks_like_timestamp(tokens.next()?) {
+        return None;
+    }
+
+    match tokens.next()? {
+        "TRACE" => Some(Level::TRACE),
+        "DEBUG" => Some(Level::DEBUG),
+        "INFO" => Some(Level::INFO),
+        "WARN" => Some(Level::WARN),
+        "ERROR" => Some(Level::ERROR),
+        _ => None,
+    }
+}
+
+/// Whether `token` is shaped like a [`LOG_TIMESTAMP_FORMAT`] timestamp
+/// (`2026-06-14T08:18:02Z`). Shape only, no calendar validation: this decides
+/// whether a line is one of ours, not whether the date is real.
+fn looks_like_timestamp(token: &str) -> bool {
+    const TIMESTAMP_LEN: usize = "2026-06-14T08:18:02Z".len();
+    token.len() == TIMESTAMP_LEN && token.ends_with('Z')
+}
+
+/// Strip the SGR escapes that [`FormattedLevel`] and `format_timestamp` wrap a
+/// token in when color is on, so parsing works on colored output too.
+fn strip_ansi(token: &str) -> &str {
+    let mut token = token;
+    while let Some(rest) = token.strip_prefix('\u{1b}') {
+        match rest.split_once('m') {
+            Some((_, tail)) => token = tail,
+            None => return token,
+        }
+    }
+    match token.find('\u{1b}') {
+        Some(idx) => &token[..idx],
+        None => token,
+    }
+}
+
+/// The maximum level this process's terminal logging renders, for callers that
+/// hold log text produced elsewhere and want to apply the same threshold.
+/// `None` means logging is off. Defaults to `INFO` before
+/// [`init_terminal`] runs (or in a process that never calls it).
+pub fn terminal_max_level() -> Option<Level> {
+    TERMINAL_LEVEL
+        .get()
+        .copied()
+        .unwrap_or(LevelFilter::INFO)
+        .into_level()
+}
+
 fn write_dimmed(writer: &mut Writer<'_>, value: &str) -> fmt::Result {
     if writer.has_ansi_escapes() {
         write!(writer, "\x1b[2m{value}\x1b[0m")
@@ -251,6 +326,7 @@ pub fn init_terminal(verbose: bool) {
         LevelFilter::INFO
     };
     let level = level_from_env_or_default(default);
+    let _ = TERMINAL_LEVEL.set(level);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(ansi_enabled(true))
         .event_format(TunmuxLogFormat::new())
@@ -391,4 +467,62 @@ pub fn init_file_sync(path: &str, verbose: bool) -> anyhow::Result<()> {
         .finish();
     install_subscriber(subscriber, level);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_line_level, strip_ansi, FormattedLevel};
+    use tracing::Level;
+
+    /// A line in the shape `TunmuxLogFormat` writes, using the real level
+    /// renderer so the padding and color codes match what the daemon emits.
+    fn formatted_line(level: Level, ansi: bool) -> String {
+        format!(
+            "2026-06-14T08:18:02Z {} some_event field=1 tunmux::privileged: ",
+            FormattedLevel::new(&level, ansi)
+        )
+    }
+
+    #[test]
+    fn parses_every_level_plain_and_colored() {
+        for level in [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ] {
+            for ansi in [false, true] {
+                assert_eq!(
+                    parse_line_level(&formatted_line(level, ansi)),
+                    Some(level),
+                    "level={level} ansi={ansi}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_lines_that_are_not_ours() {
+        // Continuation line of a multi-line message (e.g. the network overview
+        // table), and a message whose body merely mentions a level word.
+        assert_eq!(parse_line_level("INTERFACE  MTU   ADDRESSES"), None);
+        assert_eq!(parse_line_level(""), None);
+        assert_eq!(parse_line_level("something DEBUG else"), None);
+    }
+
+    #[test]
+    fn rejects_timestamp_without_a_level() {
+        assert_eq!(parse_line_level("2026-06-14T08:18:02Z hello world"), None);
+    }
+
+    #[test]
+    fn strip_ansi_unwraps_both_ends() {
+        assert_eq!(strip_ansi("\x1b[34mDEBUG\x1b[0m"), "DEBUG");
+        assert_eq!(
+            strip_ansi("\x1b[2m2026-06-14T08:18:02Z\x1b[0m"),
+            "2026-06-14T08:18:02Z"
+        );
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
 }

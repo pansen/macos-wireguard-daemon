@@ -1,9 +1,9 @@
 //! Pure core for the `tunmux launchd` subcommand: an installer for the
 //! privileged launchd daemon plist. This module provides both the
 //! plist-rendering / binary-location-validation logic and the
-//! `tunmux launchd install|restart|uninstall` command handlers, porting
-//! `make install/privileged`, `reload/privileged`, and the launchd parts of
-//! `uninstall/privileged`.
+//! `tunmux launchd install|restart|uninstall` command handlers, which own
+//! every system-domain launchd operation (the Makefile and `tunmux reload`
+//! both go through them).
 
 use std::fs;
 use std::path::{Path, PathBuf};

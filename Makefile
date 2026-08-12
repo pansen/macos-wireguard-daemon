@@ -14,36 +14,28 @@ hooks:
 build.release: submodule
 	cargo build --release
 
-.PHONY: install/privileged
-install/privileged:
+.PHONY: install/binary
+install/binary:
 	@# Binary copy is a dev stand-in for the future Homebrew bottle.
 	sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
+
+.PHONY: install/privileged
+install/privileged: install/binary
 	sudo /usr/local/bin/tunmux launchd install
 
 
-.PHONY: install/autostart
-install/autostart:
-	/usr/local/bin/tunmux autoconnect install --file $(TUNMUX_PROFILE) --force
-
-
 .PHONY: install
-install: build.release install/privileged install/autostart
+install: build.release install/binary
+	@# `tunmux reload` registers the privileged daemon (escalating on its own)
+	@# and the autoconnect agent; --file seeds the agent on a first install.
+	/usr/local/bin/tunmux reload --file $(TUNMUX_PROFILE)
 
-
-.PHONY: reload/privileged
-reload/privileged:
-	sudo /usr/local/bin/tunmux launchd restart
-
-.PHONY: reload/connections
-reload/connections:
-	/usr/local/bin/tunmux --debug disconnect --provider wgconf --all
-
-.PHONY: reload/autostart
-reload/autostart:
-	/usr/local/bin/tunmux autoconnect reload
 
 .PHONY: reload
-reload: reload/privileged reload/connections reload/autostart
+reload:
+	@# Re-registers both launchd services and reconnects, keeping whatever
+	@# profile the installed autoconnect agent was set up with.
+	/usr/local/bin/tunmux reload
 
 
 .PHONY: uninstall/autostart

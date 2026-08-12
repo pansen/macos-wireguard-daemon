@@ -8,6 +8,7 @@ mod logging;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
+mod reload;
 mod shared;
 mod userspace_helper;
 mod wgconf;
@@ -27,7 +28,7 @@ fn main() {
     }
 
     let cli = Cli::parse();
-    if cli.verbose {
+    if cli.verbose || defaults_to_debug(&cli.command) {
         logging::enable_debug();
     }
 
@@ -111,6 +112,13 @@ fn init_logging(verbose: bool) {
     logging::init_terminal(verbose);
 }
 
+/// Commands that log at debug level without being asked. `reload` is the one:
+/// you run it because something is off, so the daemon and helper detail is the
+/// point. `-s` opts back out.
+fn defaults_to_debug(command: &TopCommand) -> bool {
+    matches!(command, TopCommand::Reload(args) if !args.silent)
+}
+
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match command {
         TopCommand::Wgconf { command } => wgconf::handlers::dispatch(command, &config).await,
@@ -121,6 +129,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             all,
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Hook { command } => run_hook_command(command),
+        TopCommand::Reload(args) => reload::run(args, &config).await,
         TopCommand::Status
         | TopCommand::Wg
         | TopCommand::Launchd { .. }
@@ -501,7 +510,34 @@ fn cmd_wg() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::defaults_to_debug;
+    use crate::cli::{Cli, ReloadArgs, TopCommand};
     use crate::config;
+    use clap::Parser;
+
+    #[test]
+    fn reload_logs_at_debug_unless_silenced() {
+        assert!(defaults_to_debug(&TopCommand::Reload(ReloadArgs {
+            file: None,
+            profile: None,
+            silent: false,
+        })));
+        assert!(!defaults_to_debug(&TopCommand::Reload(ReloadArgs {
+            file: None,
+            profile: None,
+            silent: true,
+        })));
+        assert!(!defaults_to_debug(&TopCommand::Status));
+    }
+
+    #[test]
+    fn parsed_reload_command_asks_for_debug_logging() {
+        let cli = Cli::try_parse_from(["tunmux", "reload"]).expect("parse reload");
+        assert!(defaults_to_debug(&cli.command));
+
+        let quiet = Cli::try_parse_from(["tunmux", "reload", "-s"]).expect("parse silent reload");
+        assert!(!defaults_to_debug(&quiet.command));
+    }
 
     #[test]
     fn provider_mapping_includes_wgconf() {

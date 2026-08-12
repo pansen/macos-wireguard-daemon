@@ -68,6 +68,18 @@ pub enum TopCommand {
         command: AutoconnectCommand,
     },
 
+    /// Re-bootstrap both launchd services and bring the tunnel back up
+    ///
+    /// Runs, in order:
+    ///   sudo tunmux launchd install   (re-registers the privileged daemon)
+    ///   tunmux disconnect --all       (drops tunnels left over from before)
+    ///   tunmux autoconnect install -f (re-registers the agent, reconnects)
+    ///
+    /// Run as your normal user; only the daemon step escalates via sudo.
+    /// Logs at debug level unless -s is given.
+    #[command(verbatim_doc_comment)]
+    Reload(ReloadArgs),
+
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
     Privileged {
@@ -165,6 +177,24 @@ pub enum AutoconnectCommand {
     Reload,
     /// Stop and unregister the autoconnect LaunchAgent
     Uninstall,
+}
+
+#[derive(Args, Clone)]
+pub struct ReloadArgs {
+    /// WireGuard .conf file the autoconnect agent should use. Defaults to the
+    /// source of the installed agent, so an existing setup needs no argument.
+    #[arg(long, conflicts_with = "profile")]
+    pub file: Option<String>,
+
+    /// Saved profile the autoconnect agent should use. Defaults to the source
+    /// of the installed agent.
+    #[arg(long, conflicts_with = "file")]
+    pub profile: Option<String>,
+
+    /// Log at the usual level instead of debug, leaving only the step headers
+    /// and anything the steps report at info level or above.
+    #[arg(short = 's', long, conflicts_with = "verbose")]
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -583,6 +613,55 @@ mod tests {
                 _ => panic!("expected autoconnect command"),
             }
         }
+    }
+
+    #[test]
+    fn parse_reload_with_optional_source() {
+        let bare = Cli::try_parse_from(["tunmux", "reload"]).expect("parse bare reload");
+        match bare.command {
+            TopCommand::Reload(args) => {
+                assert!(args.file.is_none());
+                assert!(args.profile.is_none());
+            }
+            _ => panic!("expected reload command"),
+        }
+
+        let with_profile =
+            Cli::try_parse_from(["tunmux", "reload", "--profile", "work"]).expect("parse reload");
+        match with_profile.command {
+            TopCommand::Reload(args) => assert_eq!(args.profile.as_deref(), Some("work")),
+            _ => panic!("expected reload command"),
+        }
+
+        let both = Cli::try_parse_from([
+            "tunmux",
+            "reload",
+            "--file",
+            "/tmp/a.conf",
+            "--profile",
+            "work",
+        ]);
+        assert!(both.is_err());
+    }
+
+    #[test]
+    fn parse_reload_silent_flag() {
+        let bare = Cli::try_parse_from(["tunmux", "reload"]).expect("parse bare reload");
+        match bare.command {
+            TopCommand::Reload(args) => assert!(!args.silent),
+            _ => panic!("expected reload command"),
+        }
+
+        for arg in ["-s", "--silent"] {
+            let cli = Cli::try_parse_from(["tunmux", "reload", arg]).expect("parse reload silent");
+            match cli.command {
+                TopCommand::Reload(args) => assert!(args.silent),
+                _ => panic!("expected reload command"),
+            }
+        }
+
+        // Asking for both quiet and verbose has no sensible reading.
+        assert!(Cli::try_parse_from(["tunmux", "reload", "-s", "-v"]).is_err());
     }
 
     #[test]

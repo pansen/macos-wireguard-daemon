@@ -1,8 +1,8 @@
 //! Pure core for the `tunmux autoconnect` subcommand: an installer for the
 //! per-user (GUI-domain) autoconnect LaunchAgent plist. This module provides
 //! both the plist-rendering logic and the
-//! `tunmux autoconnect install|reload|uninstall` command handlers, porting
-//! `make install/autostart`, `reload/autostart`, and `uninstall/autostart`.
+//! `tunmux autoconnect install|list|reload|uninstall` command handlers, plus
+//! the re-install entry point `tunmux reload` uses.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -27,6 +27,7 @@ const VALUE_PLACEHOLDER: &str = "@CONNECT_VALUE@";
 
 /// The WireGuard config source the autoconnect agent should connect with,
 /// mirroring the file/profile mutual exclusion of `WgconfConnectArgs`.
+#[derive(Debug)]
 enum ConnectSource {
     File(String),
     Profile(String),
@@ -108,6 +109,47 @@ pub fn dispatch(command: AutoconnectCommand) -> anyhow::Result<()> {
         AutoconnectCommand::List => cmd_list(),
         AutoconnectCommand::Reload => cmd_reload(),
         AutoconnectCommand::Uninstall => cmd_uninstall(),
+    }
+}
+
+/// Re-render and re-bootstrap the agent, for `tunmux reload`. With neither
+/// `file` nor `profile` given, the connect source is read back from the
+/// installed plist, so a reload keeps whatever the agent was set up with.
+pub(crate) fn reinstall(file: Option<String>, profile: Option<String>) -> anyhow::Result<()> {
+    let source = match (file, profile) {
+        (None, None) => installed_connect_source()?,
+        (file, profile) => connect_source(file, profile)?,
+    };
+    cmd_install(source, true)
+}
+
+/// The connect source of the currently installed agent plist.
+fn installed_connect_source() -> anyhow::Result<ConnectSource> {
+    let home = std::env::var("HOME").context("could not determine $HOME")?;
+    let plist_path = launch_agents_dir(&home).join(format!("{LABEL}.plist"));
+    let contents = fs::read_to_string(&plist_path).with_context(|| {
+        format!(
+            "cannot read the installed autoconnect agent at {}; pass --file <path> or \
+             --profile <name> to install it",
+            plist_path.display()
+        )
+    })?;
+    connect_source_from_plist(&contents).with_context(|| {
+        format!(
+            "could not determine the connect source of {}; pass --file <path> or \
+             --profile <name>",
+            plist_path.display()
+        )
+    })
+}
+
+fn connect_source_from_plist(plist: &str) -> anyhow::Result<ConnectSource> {
+    let (flag, value) = parse_connect_source(plist)
+        .ok_or_else(|| anyhow::anyhow!("plist has no recognizable `connect` arguments"))?;
+    match flag.as_str() {
+        "--file" => Ok(ConnectSource::File(value)),
+        "--profile" => Ok(ConnectSource::Profile(value)),
+        other => anyhow::bail!("unexpected connect flag in plist: {other}"),
     }
 }
 
@@ -236,11 +278,11 @@ fn cmd_list() -> anyhow::Result<()> {
             "🔘"
         };
         println!("{marker}  {}", path.display());
-        if let Some(source) = fs::read_to_string(path)
+        if let Some((flag, value)) = fs::read_to_string(path)
             .ok()
             .and_then(|contents| parse_connect_source(&contents))
         {
-            println!("    {source}");
+            println!("    {flag} {value}");
         }
     }
     Ok(())
@@ -258,9 +300,10 @@ fn is_loaded(uid: u32, label: &str) -> bool {
 }
 
 /// Best-effort extraction of the `connect` source (flag + value) from a
-/// rendered autoconnect plist, for display in `list`. Returns `None` when the
-/// ProgramArguments don't have the expected `… connect <flag> <value> …` shape.
-fn parse_connect_source(plist: &str) -> Option<String> {
+/// rendered autoconnect plist, for `list` and for reload's source lookup.
+/// Returns `None` when the ProgramArguments don't have the expected
+/// `… connect <flag> <value> …` shape.
+fn parse_connect_source(plist: &str) -> Option<(String, String)> {
     let strings: Vec<String> = plist
         .lines()
         .filter_map(|line| {
@@ -271,9 +314,9 @@ fn parse_connect_source(plist: &str) -> Option<String> {
         })
         .collect();
     let idx = strings.iter().position(|s| s == "connect")?;
-    let flag = strings.get(idx + 1)?;
-    let value = strings.get(idx + 2)?;
-    Some(format!("{flag} {value}"))
+    let flag = strings.get(idx + 1)?.clone();
+    let value = strings.get(idx + 2)?.clone();
+    Some((flag, value))
 }
 
 /// Write the rendered plist to `path` atomically (temp file + rename), user
@@ -423,8 +466,8 @@ mod tests {
         )
         .expect("render succeeds");
         assert_eq!(
-            parse_connect_source(&rendered).as_deref(),
-            Some("--file /tmp/a&b.conf")
+            parse_connect_source(&rendered),
+            Some(("--file".to_string(), "/tmp/a&b.conf".to_string()))
         );
     }
 
@@ -439,8 +482,35 @@ mod tests {
         )
         .expect("render succeeds");
         assert_eq!(
-            parse_connect_source(&rendered).as_deref(),
-            Some("--profile work")
+            parse_connect_source(&rendered),
+            Some(("--profile".to_string(), "work".to_string()))
         );
+    }
+
+    #[test]
+    fn connect_source_from_plist_round_trips_both_kinds() {
+        for source in [
+            ConnectSource::File("/tmp/a&b.conf".to_string()),
+            ConnectSource::Profile("work".to_string()),
+        ] {
+            let rendered = render_plist(
+                PLIST_TEMPLATE,
+                "/opt/homebrew/bin/tunmux",
+                "/Users/andi",
+                &source,
+            )
+            .expect("render succeeds");
+
+            let parsed = connect_source_from_plist(&rendered).expect("parse succeeds");
+            assert_eq!(parsed.flag(), source.flag());
+            assert_eq!(parsed.value(), source.value());
+        }
+    }
+
+    #[test]
+    fn connect_source_from_plist_errors_on_unusable_plist() {
+        let err = connect_source_from_plist("<plist><string>status</string></plist>")
+            .expect_err("no connect arguments should error");
+        assert!(err.to_string().contains("connect"));
     }
 }

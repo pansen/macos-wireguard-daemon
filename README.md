@@ -50,6 +50,22 @@ membership to take effect).
 After that there is nothing to babysit. `make uninstall` removes everything
 cleanly, including any DNS override.
 
+A macOS update can leave the launchd services booted out or disabled. To put
+both of them back and reconnect, run:
+
+```bash
+tunmux reload
+```
+
+It re-registers the privileged daemon (escalating via `sudo` for that one
+step), drops tunnels left over from before, and re-registers the login agent
+with the profile it already had. `make reload` is the same command.
+
+Unlike the rest of the CLI, `reload` logs at debug level, including the
+detail streamed back from the privileged daemon, since you generally run it
+when something needs looking at. `tunmux reload -s` keeps the step headers
+and drops the rest.
+
 ## What It Does While You Forget About It
 
 - Keeps the tunnel connected across network roaming (Wi-Fi → Ethernet,

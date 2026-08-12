@@ -12,6 +12,7 @@ pub mod error;
 pub mod launchctl;
 pub mod launchd;
 pub mod logging;
+pub mod reload;
 pub mod shared;
 
 // WireGuard config-file provider (the sole provider in this build)
