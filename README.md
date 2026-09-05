@@ -104,6 +104,28 @@ There are three ways to bring the tunnel up:
 All three run on the same embedded userspace engine; the backend only changes
 how the tunnel is set up.
 
+Privileged subprocesses use a restricted system PATH, followed by `/usr/local/bin`
+when that directory and its ancestors are root-owned, are not symlinks, and have
+no group or other write access. This permits the normal `/usr/local/bin/tunmux`
+installation; daemon and helper launches also use absolute executable paths.
+The `userspace` and `kernel`
+backends need no external WireGuard tools. The external `wg-quick` backend requires
+an administrator-installed `bash` (version 4 or later), `wg-quick`, `wg`, and
+`wireguard-go` in `/Library/Application Support/tunmux/bin`. These must be regular
+root-owned files with no group or other write access, and their parent directories
+must also be root-owned and protected against writes. Their runtime dependencies
+must be installed in equally protected locations. Symlinks into Homebrew are
+rejected. The installed tunmux daemon and its parent directories have the same
+ownership requirements.
+
+The daemon records the running tunnel's configuration in a private, root-owned
+state file. `connect --if-missing` verifies configuration contents and MTU settings
+before reusing a tunnel, including when local connection state is missing. A
+different configuration returns a conflict; disconnect before switching profiles.
+Configuration comparison is exact, so even formatting-only edits require a
+reconnect. When upgrading from a version without this identity record, disconnect
+the existing tunnel before reconnecting with the new version.
+
 ## Configuration
 
 tunmux reads optional defaults from `$XDG_CONFIG_HOME/tunmux/config.toml` (typically `~/.config/tunmux/config.toml`). The file is optional; without it, sensible defaults apply. It covers the default backend, the optional checks, and how the privileged daemon is started and stopped. Anything set in the config can be overridden per command on the command line.

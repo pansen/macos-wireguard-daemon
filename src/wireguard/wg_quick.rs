@@ -2,7 +2,7 @@ use crate::config;
 use crate::error::Result;
 use crate::privileged_api::WgQuickAction;
 use crate::privileged_client::PrivilegedClient;
-use tracing::{debug, info};
+use tracing::info;
 
 use super::handshake;
 
@@ -62,19 +62,11 @@ pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
     )
 }
 
-/// Check if a WireGuard interface is currently active.
-///
-/// On macOS the actual interface is named `utunN` (kernel-assigned), so use
-/// `wg show interfaces` to detect any active WireGuard tunnel.
+/// Finding 5 — Incorrect tunnel adoption and connection races: probe the
+/// requested interface through root, not whether any unrelated VPN is active.
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
-    let _ = interface_name;
-    debug!(cmd = "wg show interfaces", "exec");
-    std::process::Command::new("wg")
-        .args(["show", "interfaces"])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
-        .unwrap_or(false)
+    super::userspace::is_interface_active(interface_name)
 }
 
 fn _provider_name(provider: config::Provider) -> &'static str {

@@ -10,6 +10,8 @@ mod privileged_api;
 mod privileged_client;
 mod reload;
 mod shared;
+mod state_file;
+mod trusted_exec;
 mod userspace_helper;
 mod wgconf;
 mod wireguard;

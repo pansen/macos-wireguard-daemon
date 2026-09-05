@@ -452,13 +452,27 @@ impl Write for SharedFileWriter {
 /// Synchronous, line-durable file logging. Used by the gotatun helper so the privileged service
 /// can tail its log file and stream it back to the caller without a flush race.
 pub fn init_file_sync(path: &str, verbose: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let default = if verbose {
         LevelFilter::DEBUG
     } else {
         LevelFilter::INFO
     };
     let level = level_from_env_or_default(default);
-    let file = Arc::new(OpenOptions::new().create(true).append(true).open(path)?);
+    // Finding 2 — Protected log disclosure: create private logs without
+    // following a pre-existing symlink, and repair an older log's mode.
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "helper log is not a regular file"
+    );
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let file = Arc::new(file);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(ansi_enabled(false))
         .event_format(TunmuxLogFormat::new())

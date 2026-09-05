@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -12,7 +11,7 @@ use super::backend::WgBackend;
 /// Reserved instance name for the traditional all-traffic VPN mode.
 pub const DIRECT_INSTANCE: &str = "_direct";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionState {
     pub instance_name: String,
     pub provider: String,
@@ -30,13 +29,20 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
+    /// Finding 5 — Incorrect tunnel adoption and connection races: hold from
+    /// the first state probe through connect/disconnect and the final commit.
+    pub fn lock() -> Result<std::fs::File> {
+        config::ensure_connections_dir()?;
+        Ok(crate::state_file::lock(
+            &config::connections_dir().join(".connection.lock"),
+        )?)
+    }
     /// Save to ~/.config/tunmux/connections/<instance>.json
     pub fn save(&self) -> Result<()> {
         config::ensure_connections_dir()?;
         let path = config::connections_dir().join(format!("{}.json", self.instance_name));
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, &json)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        crate::state_file::write_atomic(&path, json.as_bytes())?;
         info!( path = ?path.display().to_string(), "connection_state_saved");
         Ok(())
     }
@@ -95,12 +101,12 @@ impl ConnectionState {
     pub fn is_live(&self) -> bool {
         use super::{userspace, wg_quick};
         match self.backend {
-            WgBackend::Userspace => userspace::is_interface_active(&self.interface_name),
+            WgBackend::Userspace | WgBackend::Kernel => {
+                userspace::is_interface_active(&self.interface_name)
+            }
             // Kernel and wg-quick both back a named interface (Linux) or a
             // kernel-assigned utunN (macOS); the same probe applies.
-            WgBackend::WgQuick | WgBackend::Kernel => {
-                wg_quick::is_interface_active(&self.interface_name)
-            }
+            WgBackend::WgQuick => wg_quick::is_interface_active(&self.interface_name),
         }
     }
 }

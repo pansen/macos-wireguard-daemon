@@ -113,7 +113,7 @@ impl PrivilegedRequest {
     }
 }
 
-fn validate_interface_name(interface: &str) -> Result<(), String> {
+pub(crate) fn validate_interface_name(interface: &str) -> Result<(), String> {
     if interface == "wgconf0" {
         return Ok(());
     }

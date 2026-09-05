@@ -15,7 +15,7 @@ use std::os::unix::net::UnixDatagram;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
-use std::process::{Command, Output};
+use std::process::Output;
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -308,13 +308,9 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             // caller. Synchronous writer so the service reads complete lines without a flush race.
             // Ensure the runtime dir exists first (it is otherwise created later by start_device).
             let _ = std::fs::create_dir_all(SOCK_DIR);
-            // Ensure the log's parent dir exists (on macOS this is ~/Library/Logs,
-            // which normally exists; create_dir_all is cheap insurance).
+            crate::config::ensure_root_log_dir()?;
             let log_path = gotatun_log_path(interface);
-            if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = crate::logging::init_file_sync(&log_path.to_string_lossy(), false);
+            crate::logging::init_file_sync(&log_path.to_string_lossy(), false)?;
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -665,60 +661,46 @@ fn send_udp_probe(target: SocketAddr) -> bool {
 
 #[cfg(target_os = "macos")]
 async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
-    // `wg show <iface> transfer` connects to gotatun's in-process UAPI socket, which can only
-    // be serviced by the async UAPI task running on this same runtime. Running the command
-    // inline would block the runtime thread and self-deadlock (the runtime can no longer poll
-    // the task that `wg` is waiting on). Run it on a blocking thread, bounded by a timeout, so
-    // the runtime stays free to answer the UAPI request and a stuck `wg` can never wedge us.
-    let owned_interface = interface.to_string();
-    let output = {
-        let _suppress_probe_uapi_log = crate::logging::suppress_gotatun_uapi_connection_logs();
-        match tokio::time::timeout(
-            Duration::from_secs(4),
-            tokio::task::spawn_blocking(move || {
-                Command::new("wg")
-                    .args(["show", &owned_interface, "transfer"])
-                    .output()
-            }),
-        )
-        .await
-        {
-            Ok(join_result) => join_result
-                .context("wg show transfer task panicked")?
-                .context("failed to run wg show transfer")?,
-            Err(_) => anyhow::bail!("wg show {} transfer timed out", interface),
-        }
-    };
-    if !output.status.success() {
-        anyhow::bail!("wg show {} transfer failed", interface);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parsed_any = false;
-    let mut rx_total: u64 = 0;
-    let mut tx_total: u64 = 0;
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Ok(rx) = fields[1].parse::<u64>() else {
-            continue;
-        };
-        let Ok(tx) = fields[2].parse::<u64>() else {
-            continue;
-        };
-        parsed_any = true;
-        rx_total = rx_total.saturating_add(rx);
-        tx_total = tx_total.saturating_add(tx);
-    }
-
-    if parsed_any {
-        Ok(Some((rx_total, tx_total)))
-    } else {
-        Ok(None)
-    }
+    // Finding 3 — Executable substitution through PATH: query our own UAPI
+    // instead of requiring a Homebrew wg binary for the default backend.
+    // The blocking reader runs off-runtime so the device can answer its query.
+    let socket_path = PathBuf::from(SOCK_DIR).join(format!("{interface}.sock"));
+    let _suppress_probe_uapi_log = crate::logging::suppress_gotatun_uapi_connection_logs();
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
+            stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+            stream.write_all(b"get=1\n\n")?;
+            let mut reader = BufReader::new(stream).take(256 * 1024);
+            let mut rx: u64 = 0;
+            let mut tx: u64 = 0;
+            let mut any = false;
+            loop {
+                let mut line = String::new();
+                anyhow::ensure!(
+                    reader.read_line(&mut line)? != 0,
+                    "incomplete UAPI response"
+                );
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("rx_bytes=") {
+                    rx = rx.saturating_add(value.parse::<u64>()?);
+                    any = true;
+                } else if let Some(value) = line.strip_prefix("tx_bytes=") {
+                    tx = tx.saturating_add(value.parse::<u64>()?);
+                } else if line == "errno=0" {
+                    return Ok(if any { Some((rx, tx)) } else { None });
+                } else if line.starts_with("errno=") {
+                    anyhow::bail!("UAPI transfer query failed");
+                }
+            }
+        }),
+    )
+    .await
+    .context("UAPI transfer query timed out")?
+    .context("UAPI transfer reader panicked")?
 }
 
 #[cfg(unix)]
@@ -1020,7 +1002,7 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
     trace!(command = %format_command_for_log(name, args), "userspace_helper_command");
-    Command::new(name)
+    crate::trusted_exec::command(name)?
         .args(args)
         .output()
         .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
@@ -2126,7 +2108,8 @@ fn scutil_global_primary_interface() -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new("scutil")
+    let mut child = crate::trusted_exec::command("scutil")
+        .expect("system command is approved")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2439,7 +2422,10 @@ struct ForeignTunnel {
 
 #[cfg(target_os = "macos")]
 fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
-    let output = match Command::new("ifconfig").output() {
+    let output = match crate::trusted_exec::command("ifconfig")
+        .expect("system command is approved")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2554,7 +2540,11 @@ fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
 
 #[cfg(target_os = "macos")]
 fn macos_global_resolvers() -> Vec<String> {
-    let output = match Command::new("scutil").arg("--dns").output() {
+    let output = match crate::trusted_exec::command("scutil")
+        .expect("system command is approved")
+        .arg("--dns")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2775,7 +2765,10 @@ fn format_table_row(values: &[String], widths: &[usize]) -> String {
 fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
     // Call ifconfig directly (not run_command_capture_output) to avoid emitting
     // a debug command log line on every reconcile tick.
-    let output = match Command::new("ifconfig").output() {
+    let output = match crate::trusted_exec::command("ifconfig")
+        .expect("system command is approved")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2875,7 +2868,8 @@ fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
     }
     args.push("default");
 
-    let output = Command::new("route")
+    let output = crate::trusted_exec::command("route")
+        .expect("system command is approved")
         .args(args)
         .output()
         .context("failed to run route -n get default")?;

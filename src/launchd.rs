@@ -78,12 +78,9 @@ fn render_plist_from(template: &str, daemon_binary: &str, gid: u32) -> anyhow::R
 /// unprivileged user — otherwise a user could swap the binary out from
 /// under root's launchd.
 ///
-/// This check is deliberately path-prefix-based, not ownership-based:
-/// /opt/homebrew is user-owned by design on Apple Silicon (Homebrew installs
-/// without root), so an ownership check would either reject legitimate
-/// Homebrew installs or fail to catch the actual risk. Prefix-based
-/// denylisting of known user-writable roots (home directories, temp dirs)
-/// is the meaningful signal here.
+/// Finding 3 — Executable substitution through PATH: these lexical checks
+/// reject known user-controlled locations. The installer additionally checks
+/// ownership and write permissions of the actual binary and its ancestors.
 pub fn validate_binary_location(
     invoked: &Path,
     resolved: &Path,
@@ -95,6 +92,7 @@ pub fn validate_binary_location(
 }
 
 const REJECTED_PREFIXES: &[&str] = &[
+    "/opt/homebrew/",
     "/Users/",
     "/tmp/",
     "/private/tmp/",
@@ -108,7 +106,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
     if !path.is_absolute() {
         anyhow::bail!(
             "refusing to install a launchd daemon that runs a non-absolute path ({}); \
-             install a build from a system location such as /usr/local/bin or via Homebrew",
+             install a build from a system location such as /usr/local/bin with root-owned parent directories",
             path.display()
         );
     }
@@ -120,7 +118,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
             anyhow::bail!(
                 "refusing to install a launchd daemon that runs a binary from a user-writable \
                  location ({}); place the tunmux binary in a system location such as \
-                 /usr/local/bin or install it via Homebrew",
+                 /usr/local/bin with root-owned parent directories",
                 path.display()
             );
         }
@@ -131,7 +129,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
             anyhow::bail!(
                 "refusing to install a launchd daemon that runs a binary from the invoking \
                  user's home directory ({}); place the tunmux binary in a system location \
-                 such as /usr/local/bin or install it via Homebrew",
+                 such as /usr/local/bin with root-owned parent directories",
                 path.display()
             );
         }
@@ -264,22 +262,18 @@ fn invoking_user() -> anyhow::Result<String> {
     }
 }
 
-/// The daemon binary path to embed in the plist's ProgramArguments, after
-/// validating it isn't installed somewhere a regular user could tamper with.
-///
-/// Deliberately not canonicalized: keeping the as-invoked path means a
-/// Homebrew `opt` symlink stays stable across upgrades (only the symlink
-/// target changes). If `current_exe()` itself ever returns an
-/// already-canonicalized path on this platform, that only affects future
-/// Homebrew opt-symlink stability, which the bottle packaging will need to
-/// address; the current dev/Makefile flow installs straight to
-/// /usr/local/bin, so it's unaffected either way.
+/// Validate the installed daemon and its parents before placing its path in a
+/// root launchd job. The executable must be a regular file, not a Homebrew link.
 fn daemon_binary_path() -> anyhow::Result<PathBuf> {
     let invoked =
         std::env::current_exe().context("failed to determine the running tunmux binary path")?;
     let resolved = fs::canonicalize(&invoked)
         .with_context(|| format!("failed to resolve {}", invoked.display()))?;
     validate_binary_location(&invoked, &resolved, invoking_user_home().as_deref())?;
+    crate::trusted_exec::validate_root_owned_path(
+        &invoked,
+        crate::trusted_exec::TrustedPath::Executable,
+    )?;
     Ok(invoked)
 }
 
@@ -509,12 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_homebrew_cellar_symlink_target() {
+    fn rejects_homebrew_cellar_symlink_target() {
         assert!(validate_binary_location(
             Path::new("/opt/homebrew/bin/tunmux"),
             Path::new("/opt/homebrew/Cellar/tunmux/0.9.0/bin/tunmux"),
             None,
         )
-        .is_ok());
+        .is_err());
     }
 }
