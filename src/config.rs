@@ -200,6 +200,19 @@ pub fn root_log_dir() -> PathBuf {
     PathBuf::from("/var/log/tunmux")
 }
 
+pub fn ensure_root_log_dir() -> Result<()> {
+    // Finding 2 — Protected log disclosure: the directory must not allow an
+    // unprivileged process to replace the log or insert a symlink between reads.
+    let dir = root_log_dir();
+    fs::create_dir_all(&dir)?;
+    crate::trusted_exec::validate_root_owned_path(
+        &fs::canonicalize(&dir)?,
+        crate::trusted_exec::TrustedPath::Directory,
+    )?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// Log file the gotatun userspace helper writes and the privileged service tails.
 /// Single source of truth shared by the helper (writer) and the service
 /// (clear-at-connect + tail), which must agree on the path.
@@ -217,6 +230,12 @@ pub fn ensure_privileged_runtime_dir() -> Result<()> {
         fs::create_dir_all(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     }
+    // Finding 5 — Incorrect tunnel adoption and connection races: the
+    // authoritative identity and mutation lock require a root-controlled parent.
+    crate::trusted_exec::validate_root_owned_path(
+        &dir,
+        crate::trusted_exec::TrustedPath::Directory,
+    )?;
     Ok(())
 }
 

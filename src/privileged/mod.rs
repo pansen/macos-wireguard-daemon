@@ -2,17 +2,18 @@ mod commands;
 mod daemon;
 mod dispatch;
 mod managed_pids;
+mod socket;
+mod tunnel_state;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
-use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::unistd::Group;
 use nix::unistd::{chown, Gid};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config;
 use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
@@ -66,6 +67,7 @@ pub fn serve(
         idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64, "privileged_service_start");
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
+    config::ensure_root_log_dir()?;
 
     // Resolve group GID for chown of socket dir and file.
     let group_gid = authorized_group
@@ -123,62 +125,8 @@ pub fn serve(
         }
     };
 
-    if idle_timeout.is_some() {
-        listener.set_nonblocking(true)?;
-        info!(
-            idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or_default() as u64, "privileged_service_idle_timeout_enabled");
-    }
-
     let mut control_state = ControlState::new(cli_autostarted);
-    let mut last_activity = Instant::now();
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let mut stream = stream;
-                // On macOS (BSD), accepted sockets inherit O_NONBLOCK from the listener.
-                // The connection must be handled in blocking mode so write_all() doesn't EAGAIN.
-                stream.set_nonblocking(false)?;
-                loop {
-                    match handle_client(
-                        &mut stream,
-                        &mut control_state,
-                        authorized_group.as_deref(),
-                    ) {
-                        ClientReadResult::ConnectionClosed => break,
-                        ClientReadResult::Response { logs, response } => {
-                            let buffer = encode_response_frames(&logs, &response)?;
-                            if let Err(e) = stream.write_all(&buffer) {
-                                warn!( error = ?e.to_string(), "privileged_response_write_failed");
-                                break;
-                            }
-                            last_activity = Instant::now();
-                            if control_state.should_exit_now() {
-                                debug!(
-                                    "privileged_service_stop_condition_explicit_shutdown_no_leases"
-                                );
-                                info!("privileged_service_exiting_explicit_shutdown");
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Some(timeout) = idle_timeout {
-                    if last_activity.elapsed() >= timeout {
-                        debug!("privileged_service_stop_condition_idle_timeout_elapsed");
-                        info!(
-                            idle_timeout_ms = ?timeout.as_millis() as u64, "privileged_service_exiting_idle_timeout");
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                return Err(e.into());
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    socket::serve(listener, &mut control_state, idle_timeout)
 }
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
@@ -186,6 +134,7 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         autostarted = ?cli_autostarted,
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     config::ensure_privileged_runtime_dir()?;
+    config::ensure_root_log_dir()?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -195,7 +144,11 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
 
     loop {
         let mut payload = String::new();
-        let bytes = reader.read_line(&mut payload)?;
+        // Finding 4 — Idle clients blocking the daemon: stdio is a dedicated
+        // process per caller, but still needs the same bounded frame size.
+        let bytes = std::io::Read::take(&mut reader, socket::MAX_REQUEST_BYTES as u64 + 1)
+            .read_line(&mut payload)?;
+        anyhow::ensure!(bytes <= socket::MAX_REQUEST_BYTES, "request too large");
         if bytes == 0 {
             debug!("privileged_stdio_service_exiting_stdin_eof");
             return Ok(());
@@ -257,16 +210,6 @@ fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
     Ok(Some(listener))
 }
 
-enum ClientReadResult {
-    ConnectionClosed,
-    Response {
-        /// Log lines captured while handling the request, streamed to the caller before the
-        /// response (empty for requests that produce no captured output).
-        logs: Vec<String>,
-        response: PrivilegedResponse,
-    },
-}
-
 /// Serialize zero or more log frames (`{"log":"…"}`) followed by the response, each as a
 /// newline-delimited JSON line. The CLI prints log frames and returns on the response frame.
 fn encode_response_frames(
@@ -281,36 +224,6 @@ fn encode_response_frames(
     serde_json::to_writer(&mut buffer, response)?;
     buffer.push(b'\n');
     Ok(buffer)
-}
-
-fn handle_client(
-    stream: &mut UnixStream,
-    control_state: &mut ControlState,
-    authorized_group: Option<&str>,
-) -> ClientReadResult {
-    let mut reader = BufReader::new(&mut *stream);
-    let mut payload = String::new();
-    match reader.read_line(&mut payload) {
-        Ok(0) => return ClientReadResult::ConnectionClosed,
-        Ok(_) => {}
-        Err(e) => {
-            return ClientReadResult::Response {
-                logs: Vec::new(),
-                response: PrivilegedResponse::Error {
-                    code: "Protocol".into(),
-                    message: format!("failed to read request: {}", e),
-                },
-            };
-        }
-    }
-
-    // macOS access control is enforced by the socket's group ownership and mode
-    // (0660, chowned to the authorized group), set when the listener is created.
-    let _ = authorized_group;
-    let peer = (0u32, 0u32);
-
-    let (logs, response) = process_request_payload(&payload, control_state, Some((peer.0, peer.1)));
-    ClientReadResult::Response { logs, response }
 }
 
 fn process_request_payload(
@@ -341,6 +254,18 @@ fn process_request_payload(
         }
     };
 
+    // Finding 2 — Protected log disclosure: reject untrusted names before any
+    // capture constructs a path or opens a file, including on the error path.
+    if let Err(e) = request.validate() {
+        return (
+            Vec::new(),
+            PrivilegedResponse::Error {
+                code: "Validation".into(),
+                message: e,
+            },
+        );
+    }
+
     // For gotatun up/down, capture this request's log output (the service's own lines via the
     // thread-local capture, plus the helper's log file) so it can be streamed to the caller.
     // Begin before the `privileged_request_received` line so it is included.
@@ -359,51 +284,50 @@ fn process_request_payload(
             request = ?request_kind, "privileged_request_received");
     }
 
-    if let Err(e) = request.validate() {
-        let logs = finish_gotatun_capture(gotatun_capture);
-        return (
-            logs,
-            PrivilegedResponse::Error {
-                code: "Validation".into(),
-                message: e,
-            },
-        );
-    }
-
     let response = dispatch(request, control_state);
     let logs = finish_gotatun_capture(gotatun_capture);
     (logs, response)
 }
 
-/// If `request` is a gotatun up/down, start capturing the service's log output and return the
-/// helper log file path plus the offset to stream from. `Up` resets the log to a fresh file
-/// (read from 0); `Down` streams only lines appended from the current end onward.
-fn gotatun_capture_for(request: &PrivilegedRequest) -> Option<(std::path::PathBuf, u64)> {
-    let PrivilegedRequest::GotaTunRun {
-        action, interface, ..
-    } = request
-    else {
+struct HelperLogCapture {
+    path: std::path::PathBuf,
+    offset: u64,
+    inode: Option<u64>,
+}
+
+/// Capture new output only. A fresh helper replaces its log, while a verified
+/// idempotent connect must not replay the previous session's entire log.
+fn gotatun_capture_for(request: &PrivilegedRequest) -> Option<HelperLogCapture> {
+    use std::os::unix::fs::MetadataExt;
+    let PrivilegedRequest::GotaTunRun { interface, .. } = request else {
         return None;
     };
     crate::logging::begin_log_capture();
     let path = commands::gotatun_log_path(interface);
-    let start = match action {
-        crate::privileged_api::GotaTunAction::Up => 0,
-        crate::privileged_api::GotaTunAction::Down => {
-            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-        }
-    };
-    Some((path, start))
+    let metadata = std::fs::symlink_metadata(&path).ok();
+    Some(HelperLogCapture {
+        path,
+        offset: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+        inode: metadata.map(|m| m.ino()),
+    })
 }
 
 /// Finish a capture started by `gotatun_capture_for`: merge the service's captured lines with the
 /// helper's log tail, ordered by timestamp. Returns empty if no capture was active.
-fn finish_gotatun_capture(capture: Option<(std::path::PathBuf, u64)>) -> Vec<String> {
+fn finish_gotatun_capture(capture: Option<HelperLogCapture>) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
     let service_lines = crate::logging::take_log_capture();
-    let Some((path, start)) = capture else {
+    let Some(HelperLogCapture {
+        path,
+        offset,
+        inode,
+    }) = capture
+    else {
         return Vec::new();
     };
-    let helper_lines = read_log_tail(&path, start);
+    let current_inode = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
+    let offset = if inode == current_inode { offset } else { 0 };
+    let helper_lines = read_log_tail(&path, offset);
     merge_log_lines(service_lines, helper_lines)
 }
 
@@ -414,9 +338,19 @@ fn finish_gotatun_capture(capture: Option<(std::path::PathBuf, u64)>) -> Vec<Str
 /// at [`MAX_HELPER_TAIL_BYTES`]; past the cap a `(truncated)` marker is appended.
 fn read_log_tail(path: &std::path::Path, offset: u64) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Finding 2 — Protected log disclosure: a log must be a regular file,
+    // never a symlink to another root-readable file or a blocking FIFO.
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    else {
         return Vec::new();
     };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Vec::new();
+    }
 
     // Peek at the byte just before `offset`: if it isn't a newline, `offset` sits inside a line and
     // the first chunk we read is a partial line to be discarded. If it is a newline (or offset==0)
@@ -537,6 +471,72 @@ fn read_group_gid(group_name: &str) -> Option<u32> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[test]
+    fn invalid_interface_cannot_disclose_a_log() {
+        let path = std::env::temp_dir().join(format!("tunmux-private-{}.log", std::process::id()));
+        std::fs::write(&path, "PRIVATE_SENTINEL\n").unwrap();
+        let absolute = path.to_str().unwrap().strip_suffix(".log").unwrap();
+        for interface in [absolute.to_owned(), format!("../../../{absolute}")] {
+            let payload = serde_json::json!({
+                "kind": "gota_tun_run", "action": "Up", "interface": interface,
+                "config_content": "unused"
+            })
+            .to_string();
+            let (logs, response) =
+                process_request_payload(&payload, &mut ControlState::new(false), None);
+            assert!(logs.is_empty());
+            assert!(
+                matches!(response, PrivilegedResponse::Error { code, .. } if code == "Validation")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "PRIVATE_SENTINEL\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn log_reader_rejects_symlinks_and_fifos() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("tunmux-log-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let private = dir.join("private.log");
+        std::fs::write(&private, "PRIVATE_SENTINEL\n").unwrap();
+        let link = dir.join("helper.log");
+        symlink(&private, &link).unwrap();
+        assert!(read_log_tail(&link, 0).is_empty());
+        let fifo = dir.join("fifo.log");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(read_log_tail(&fifo, 0).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idempotent_capture_skips_old_log_but_new_helper_starts_at_zero() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("tunmux-capture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("helper.log");
+        std::fs::write(&path, "old session\n").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let capture = || HelperLogCapture {
+            path: path.clone(),
+            offset: metadata.len(),
+            inode: Some(metadata.ino()),
+        };
+        assert!(finish_gotatun_capture(Some(capture())).is_empty());
+        let replacement = dir.join("new.log");
+        std::fs::write(&replacement, "new session\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(finish_gotatun_capture(Some(capture())), ["new session"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Split the framed bytes into one JSON value per newline-delimited line.
     fn parse_frames(bytes: &[u8]) -> Vec<serde_json::Value> {

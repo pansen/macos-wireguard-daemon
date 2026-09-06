@@ -7,7 +7,7 @@ use std::io;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "macos")]
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -15,7 +15,7 @@ use std::os::unix::net::UnixDatagram;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
-use std::process::{Command, Output};
+use std::process::Output;
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -308,13 +308,9 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             // caller. Synchronous writer so the service reads complete lines without a flush race.
             // Ensure the runtime dir exists first (it is otherwise created later by start_device).
             let _ = std::fs::create_dir_all(SOCK_DIR);
-            // Ensure the log's parent dir exists (on macOS this is ~/Library/Logs,
-            // which normally exists; create_dir_all is cheap insurance).
+            crate::config::ensure_root_log_dir()?;
             let log_path = gotatun_log_path(interface);
-            if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = crate::logging::init_file_sync(&log_path.to_string_lossy(), false);
+            crate::logging::init_file_sync(&log_path.to_string_lossy(), false)?;
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -511,21 +507,11 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     #[cfg(target_os = "macos")]
-    let diag_enabled = true;
-    #[cfg(target_os = "macos")]
-    let mut next_diag_at = std::time::Instant::now();
+    let mut next_transfer_sample_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut next_reconcile_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut last_transfer: Option<(u64, u64)> = None;
-    #[cfg(target_os = "macos")]
-    let mut last_probe_sent: Option<(bool, bool)> = None;
-
-    #[cfg(target_os = "macos")]
-    info!(
-        interface = running.control_interface_name,
-        "userspace_helper_dataplane_probe_enabled"
-    );
 
     loop {
         tokio::select! {
@@ -547,26 +533,30 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                 {
                     // Adapt routing to network changes (roam, suspend/resume,
                     // link up/down) live, without requiring a reconnect. Throttled
-                    // off the 1s tick so the `ifconfig` snapshot stays cheap.
+                    // off the 1s tick. System commands must run off-runtime:
+                    // this current-thread runtime also drives WireGuard packets.
                     if std::time::Instant::now() >= next_reconcile_at {
                         next_reconcile_at = std::time::Instant::now() + MACOS_RECONCILE_INTERVAL;
                         if let CleanupState::Macos(state) = &running.cleanup {
-                            let routes_changed = macos_reconcile_routes(state);
-                            let dns_changed = macos_reconcile_dns(state);
-                            if routes_changed || dns_changed {
-                                log_macos_network_overview("reconcile", state);
-                            }
+                            let state = std::sync::Arc::clone(state);
+                            run_macos_maintenance("reconcile", move || {
+                                let routes_changed = macos_reconcile_routes(&state);
+                                let dns_changed = macos_reconcile_dns(&state);
+                                if routes_changed || dns_changed {
+                                    log_macos_network_overview("reconcile", &state);
+                                }
+                            })
+                            .await?;
                         }
                     }
 
-                    if diag_enabled && std::time::Instant::now() >= next_diag_at {
-                        next_diag_at = std::time::Instant::now() + Duration::from_secs(5);
-                        log_macos_dataplane_probe(
+                    if std::time::Instant::now() >= next_transfer_sample_at {
+                        next_transfer_sample_at = std::time::Instant::now() + Duration::from_secs(5);
+                        log_macos_transfer_sample(
                             &running.control_interface_name,
                             &mut last_transfer,
-                            &mut last_probe_sent,
                         )
-                        .await;
+                        .await?;
                     }
                 }
             }
@@ -577,22 +567,43 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn log_macos_dataplane_probe(
+async fn run_macos_maintenance<T: Send + 'static>(
+    operation: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    // Await each job so ticks cannot overlap and teardown cannot race a worker
+    // that is still changing routes or DNS. Awaiting yields the runtime thread
+    // to the packet engine, unlike synchronous subprocess/socket operations.
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let result = work();
+        debug!(
+            operation,
+            elapsed_ms = started.elapsed().as_millis(),
+            "userspace_helper_maintenance_complete"
+        );
+        result
+    })
+    .await
+    .with_context(|| format!("macOS {operation} maintenance task panicked"))
+}
+
+/// Sample the tunnel's WireGuard transfer counters.
+///
+/// This only reads counters the device already maintains; it generates no
+/// traffic of its own. An earlier version first sent a UDP byte to public DNS
+/// resolvers on both families to try to prove the dataplane worked. That never
+/// established anything: nothing validated a reply, unrelated traffic accounts
+/// for any counter movement, and under a split tunnel those destinations were
+/// not in AllowedIPs and so left through the physical interface without
+/// touching WireGuard at all. It also cost about two seconds per sample,
+/// because closing a filtered socket waits out `net.cfil.close_wait_timeout`.
+/// See `doc/macos-udp-probe-delay.md`.
+#[cfg(target_os = "macos")]
+async fn log_macos_transfer_sample(
     interface: &str,
     last_transfer: &mut Option<(u64, u64)>,
-    last_probe_sent: &mut Option<(bool, bool)>,
-) {
-    let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
-    let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
-        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-        53,
-    )));
-
-    // A probe-send flag flipping (a send starting or stopping to work) is worth
-    // surfacing at INFO; an unchanged flag is not.
-    let probe_sent_changed = *last_probe_sent != Some((ipv4_probe_sent, ipv6_probe_sent));
-    *last_probe_sent = Some((ipv4_probe_sent, ipv6_probe_sent));
-
+) -> anyhow::Result<()> {
     match read_wg_transfer_bytes(interface).await {
         Ok(Some((rx_bytes, tx_bytes))) => {
             let (delta_rx_bytes, delta_tx_bytes) = last_transfer
@@ -604,121 +615,90 @@ async fn log_macos_dataplane_probe(
                 })
                 .unwrap_or((0, 0));
             *last_transfer = Some((rx_bytes, tx_bytes));
-            // Steady idle tunnels probe every 5s with no movement; keep that
+            // An idle tunnel samples every 5s with no movement; keep that
             // heartbeat at DEBUG so default (INFO) logs stay quiet, and only
-            // surface probes that actually moved bytes or changed send state.
-            let noteworthy = delta_rx_bytes != 0 || delta_tx_bytes != 0 || probe_sent_changed;
-            if noteworthy {
+            // surface samples where bytes actually moved.
+            let moved = delta_rx_bytes != 0 || delta_tx_bytes != 0;
+            if moved {
                 info!(
                     interface,
-                    ipv4_probe_sent,
-                    ipv6_probe_sent,
                     rx_bytes,
                     tx_bytes,
                     delta_rx_bytes,
                     delta_tx_bytes,
-                    "userspace_helper_dataplane_probe"
+                    "userspace_helper_transfer_sample"
                 );
             } else {
                 debug!(
                     interface,
-                    ipv4_probe_sent,
-                    ipv6_probe_sent,
                     rx_bytes,
                     tx_bytes,
                     delta_rx_bytes,
                     delta_tx_bytes,
-                    "userspace_helper_dataplane_probe"
+                    "userspace_helper_transfer_sample"
                 );
             }
         }
         Ok(None) => {
-            info!(
-                interface,
-                ipv4_probe_sent, ipv6_probe_sent, "userspace_helper_dataplane_probe_no_transfer"
-            );
+            info!(interface, "userspace_helper_transfer_sample_unavailable");
         }
         Err(error) => {
+            // Stays at WARN: a genuine UAPI failure means the device stopped
+            // answering. One benign case reaches here, a sample racing teardown
+            // after the control socket was removed, which reports ENOENT.
             warn!(
                 interface,
-                ipv4_probe_sent,
-                ipv6_probe_sent,
                 error = %error,
-                "userspace_helper_dataplane_probe_failed"
+                "userspace_helper_transfer_sample_failed"
             );
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn send_udp_probe(target: SocketAddr) -> bool {
-    let bind = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let Ok(socket) = UdpSocket::bind(bind) else {
-        return false;
-    };
-    socket.send_to(&[0], target).is_ok()
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
 async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
-    // `wg show <iface> transfer` connects to gotatun's in-process UAPI socket, which can only
-    // be serviced by the async UAPI task running on this same runtime. Running the command
-    // inline would block the runtime thread and self-deadlock (the runtime can no longer poll
-    // the task that `wg` is waiting on). Run it on a blocking thread, bounded by a timeout, so
-    // the runtime stays free to answer the UAPI request and a stuck `wg` can never wedge us.
-    let owned_interface = interface.to_string();
-    let output = {
-        let _suppress_probe_uapi_log = crate::logging::suppress_gotatun_uapi_connection_logs();
-        match tokio::time::timeout(
-            Duration::from_secs(4),
-            tokio::task::spawn_blocking(move || {
-                Command::new("wg")
-                    .args(["show", &owned_interface, "transfer"])
-                    .output()
-            }),
-        )
-        .await
-        {
-            Ok(join_result) => join_result
-                .context("wg show transfer task panicked")?
-                .context("failed to run wg show transfer")?,
-            Err(_) => anyhow::bail!("wg show {} transfer timed out", interface),
-        }
-    };
-    if !output.status.success() {
-        anyhow::bail!("wg show {} transfer failed", interface);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parsed_any = false;
-    let mut rx_total: u64 = 0;
-    let mut tx_total: u64 = 0;
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Ok(rx) = fields[1].parse::<u64>() else {
-            continue;
-        };
-        let Ok(tx) = fields[2].parse::<u64>() else {
-            continue;
-        };
-        parsed_any = true;
-        rx_total = rx_total.saturating_add(rx);
-        tx_total = tx_total.saturating_add(tx);
-    }
-
-    if parsed_any {
-        Ok(Some((rx_total, tx_total)))
-    } else {
-        Ok(None)
-    }
+    // Finding 3 — Executable substitution through PATH: query our own UAPI
+    // instead of requiring a Homebrew wg binary for the default backend.
+    // The blocking reader runs off-runtime so the device can answer its query.
+    let socket_path = PathBuf::from(SOCK_DIR).join(format!("{interface}.sock"));
+    let _suppress_probe_uapi_log = crate::logging::suppress_gotatun_uapi_connection_logs();
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
+            stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+            stream.write_all(b"get=1\n\n")?;
+            let mut reader = BufReader::new(stream).take(256 * 1024);
+            let mut rx: u64 = 0;
+            let mut tx: u64 = 0;
+            let mut any = false;
+            loop {
+                let mut line = String::new();
+                anyhow::ensure!(
+                    reader.read_line(&mut line)? != 0,
+                    "incomplete UAPI response"
+                );
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("rx_bytes=") {
+                    rx = rx.saturating_add(value.parse::<u64>()?);
+                    any = true;
+                } else if let Some(value) = line.strip_prefix("tx_bytes=") {
+                    tx = tx.saturating_add(value.parse::<u64>()?);
+                    any = true;
+                } else if line == "errno=0" {
+                    return Ok(if any { Some((rx, tx)) } else { None });
+                } else if line.starts_with("errno=") {
+                    anyhow::bail!("UAPI transfer query failed");
+                }
+            }
+        }),
+    )
+    .await
+    .context("UAPI transfer query timed out")?
+    .context("UAPI transfer reader panicked")?
 }
 
 #[cfg(unix)]
@@ -1020,7 +1000,7 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
     trace!(command = %format_command_for_log(name, args), "userspace_helper_command");
-    Command::new(name)
+    crate::trusted_exec::command(name)?
         .args(args)
         .output()
         .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
@@ -2126,7 +2106,8 @@ fn scutil_global_primary_interface() -> Option<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new("scutil")
+    let mut child = crate::trusted_exec::command("scutil")
+        .expect("system command is approved")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2439,7 +2420,10 @@ struct ForeignTunnel {
 
 #[cfg(target_os = "macos")]
 fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
-    let output = match Command::new("ifconfig").output() {
+    let output = match crate::trusted_exec::command("ifconfig")
+        .expect("system command is approved")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2554,7 +2538,11 @@ fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
 
 #[cfg(target_os = "macos")]
 fn macos_global_resolvers() -> Vec<String> {
-    let output = match Command::new("scutil").arg("--dns").output() {
+    let output = match crate::trusted_exec::command("scutil")
+        .expect("system command is approved")
+        .arg("--dns")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2775,7 +2763,10 @@ fn format_table_row(values: &[String], widths: &[usize]) -> String {
 fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
     // Call ifconfig directly (not run_command_capture_output) to avoid emitting
     // a debug command log line on every reconcile tick.
-    let output = match Command::new("ifconfig").output() {
+    let output = match crate::trusted_exec::command("ifconfig")
+        .expect("system command is approved")
+        .output()
+    {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -2875,7 +2866,8 @@ fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
     }
     args.push("default");
 
-    let output = Command::new("route")
+    let output = crate::trusted_exec::command("route")
+        .expect("system command is approved")
         .args(args)
         .output()
         .context("failed to run route -n get default")?;
@@ -2916,6 +2908,116 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
 mod tests {
     use super::*;
     use std::net::IpAddr;
+
+    /// Time a UDP socket's creation+bind, send and close separately.
+    ///
+    /// This is the reproduction for `doc/macos-udp-probe-delay.md`, kept out of
+    /// the production path: it exists to re-measure the environment (a macOS
+    /// content filter's close-wait), not to diagnose the tunnel. Logging happens
+    /// only after the close, because a synchronous log between send and close
+    /// would give the filter extra time to detach and shorten what we measure.
+    #[cfg(target_os = "macos")]
+    fn measure_udp_socket_lifecycle(target: SocketAddr) {
+        use std::net::UdpSocket;
+
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let started = std::time::Instant::now();
+        // std combines socket creation and the bind syscall.
+        let bound = UdpSocket::bind(bind);
+        let bind_elapsed = started.elapsed();
+        let socket = match bound {
+            Ok(socket) => socket,
+            Err(error) => {
+                debug!(
+                    %target,
+                    bind_us = bind_elapsed.as_micros(),
+                    %error,
+                    "userspace_helper_udp_probe_bind_failed"
+                );
+                return;
+            }
+        };
+        let started = std::time::Instant::now();
+        let sent = socket.send_to(&[0], target);
+        let send_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        drop(socket);
+        let drop_elapsed = started.elapsed();
+        debug!(
+            %target,
+            bind_us = bind_elapsed.as_micros(),
+            send_us = send_elapsed.as_micros(),
+            drop_us = drop_elapsed.as_micros(),
+            result = ?sent,
+            "userspace_helper_udp_probe_timing"
+        );
+    }
+
+    // Runs the measurement in the same awaited blocking worker the helper uses,
+    // so the numbers reflect that context. Sends public traffic; never in CI.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "manual diagnostic: sends UDP packets to public DNS addresses"]
+    async fn measure_public_udp_probe_lifecycle() {
+        run_macos_maintenance("udp_probe_diagnostic", || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_test_writer()
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            // Install on the worker itself; thread-local subscribers are not
+            // automatically carried into spawn_blocking.
+            tracing::subscriber::with_default(subscriber, || {
+                for _ in 0..3 {
+                    measure_udp_socket_lifecycle(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
+                    measure_udp_socket_lifecycle(SocketAddr::from((
+                        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                        53,
+                    )));
+                }
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_maintenance_does_not_stall_network_io() {
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let maintenance = run_macos_maintenance("test", move || {
+            started_tx.send(()).unwrap();
+            // Only the async network task can release this blocking operation.
+            // A timeout lets an inline-blocking regression fail instead of hang.
+            release_rx.recv_timeout(Duration::from_secs(5))
+        });
+        let traffic = async {
+            started_rx.await.unwrap();
+            sender
+                .send_to(b"ping", receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            let mut packet = [0; 4];
+            let (len, _) = receiver.recv_from(&mut packet).await.unwrap();
+            assert_eq!(&packet[..len], b"ping");
+            let _ = release_tx.send(());
+        };
+
+        // Poll maintenance first so running it inline would block the only
+        // runtime thread before it can deliver the UDP packet.
+        let (result, ()) = tokio::join!(biased; maintenance, traffic);
+        result
+            .expect("maintenance worker completed")
+            .expect("network I/O must progress while maintenance is blocked");
+    }
 
     fn subnet(value: &str) -> (IpAddr, u8) {
         let (ip, prefix) = parse_cidr(value).expect("valid cidr");

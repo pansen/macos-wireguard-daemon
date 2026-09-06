@@ -20,7 +20,7 @@ struct ConfigSource {
     display_name: String,
     config_text: String,
     /// Canonicalized path of the source `.conf` (both `--file` and `--profile`
-    /// resolve to a concrete file). Used as the identity key for `--if-missing`.
+    /// resolve to a concrete file). Informational; the daemon verifies contents.
     source_path: Option<String>,
 }
 
@@ -184,61 +184,30 @@ fn connect_direct(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    match connection_ops::direct_connection_active()? {
+    let _connection_lock = wireguard::connection::ConnectionState::lock()?;
+    let already_active = match connection_ops::direct_connection_active()? {
         connection_ops::DirectSlotStatus::Active => {
-            // --if-missing: a no-op success only when the *same* source is already
-            // live. A different (or unidentifiable) source still errors, so we never
-            // silently mask a failed profile switch.
-            if if_missing && source.source_path.is_some() {
-                if let Some(live) = connection_ops::live_direct_connection()? {
-                    if live.source_path == source.source_path {
-                        println!("Already connected to {}.", live.server_display_name);
-                        return Ok(());
-                    }
-                }
+            if !if_missing {
+                anyhow::bail!("Already connected via direct VPN. Disconnect first.");
             }
-            anyhow::bail!("Already connected via direct VPN. Disconnect first.");
+            // Finding 5 — Incorrect tunnel adoption and connection races:
+            // even a matching source path can have changed contents. Continue
+            // to the daemon's atomic configuration check before claiming success.
+            true
         }
-        connection_ops::DirectSlotStatus::ClearedStale(message) => println!("{}", message),
-        connection_ops::DirectSlotStatus::Free => {}
-    }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
-        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
-    {
-        // The exclusive `wgconf0` slot is live but no saved state describes it —
-        // a desync (state pruned during a daemon idle window while the userspace
-        // helper kept running). Re-adopt the live interface by saving state for
-        // the config we were asked to bring up, so `status`/`disconnect` work
-        // again instead of every `--if-missing` autoconnect wedging here.
-        // A live `wgconf0` is always the userspace slot (wg-quick/kernel use utunN).
-        tracing::warn!(
-            interface = INTERFACE_NAME,
-            "adopting live wgconf interface with no saved state (state/daemon desync)"
-        );
-        let adopted = wireguard::connection::ConnectionState {
-            instance_name: DIRECT_INSTANCE.to_string(),
-            provider: PROVIDER.dir_name().to_string(),
-            interface_name: INTERFACE_NAME.to_string(),
-            backend: wireguard::backend::WgBackend::Userspace,
-            server_endpoint: routed
-                .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
-                .unwrap_or_else(|| best_effort_endpoint(&source.config_text)),
-            server_display_name: source.display_name.clone(),
-            dns_servers: wireguard::config::parse_config(&source.config_text)
-                .map(|parsed| parsed.dns_servers)
-                .unwrap_or_default(),
-            source_path: source.source_path.clone(),
-        };
-        adopted.save()?;
-
-        if if_missing {
-            println!("Already connected to {}.", source.display_name);
-            return Ok(());
+        connection_ops::DirectSlotStatus::ClearedStale(message) => {
+            println!("{}", message);
+            false
         }
-        anyhow::bail!("Already connected. Run `tunmux disconnect --provider wgconf` first.");
-    }
+        connection_ops::DirectSlotStatus::Free => false,
+    };
+    // Finding 5 — Incorrect tunnel adoption and connection races: never
+    // invent metadata for an orphan. The privileged up operation verifies its
+    // persisted identity (or returns a conflict) before we save local state.
 
-    println!("Connecting to {}...", source.display_name);
+    if !already_active {
+        println!("Connecting to {}...", source.display_name);
+    }
 
     let state_endpoint = routed
         .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
@@ -314,7 +283,7 @@ fn connect_direct(
                 disable_ipv6,
             )?;
             // kernel::up builds and saves the _direct state internally, so stamp
-            // the source path onto it afterwards to keep --if-missing working.
+            // the informational source path onto it afterwards.
             if source.source_path.is_some() {
                 if let Some(mut state) =
                     wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?
@@ -326,7 +295,15 @@ fn connect_direct(
         }
     }
 
-    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
+    // Release the state transaction before user hooks; a hook may itself call
+    // tunmux. Verified --if-missing must not rerun connection side effects.
+    let connected_state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?;
+    drop(_connection_lock);
+    if already_active {
+        println!("Already connected to {}.", source.display_name);
+        return Ok(());
+    }
+    if let Some(state) = connected_state {
         hooks::run_ifup(config, PROVIDER, &state);
     }
 

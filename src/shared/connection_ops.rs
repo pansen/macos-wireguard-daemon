@@ -12,9 +12,18 @@ pub fn cmd_disconnect_provider(
     all: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    disconnect_provider_connections(provider.dir_name(), instance, all, |conn| {
-        disconnect_one_provider_connection(conn, provider, config)
-    })
+    let mut disconnected = Vec::new();
+    let result = disconnect_provider_connections(provider.dir_name(), instance, all, |conn| {
+        disconnect_one_provider_connection(conn, provider, config)?;
+        disconnected.push(conn.clone());
+        Ok(())
+    });
+    // Finding 5 — Incorrect tunnel adoption and connection races: the state
+    // lock covers teardown and removal, but user hooks may recursively connect.
+    for state in disconnected {
+        hooks::run_ifdown(config, provider, &state);
+    }
+    result
 }
 
 pub fn resolve_connect_backend(
@@ -45,6 +54,7 @@ pub fn disconnect_provider_connections<F>(
 where
     F: FnMut(&ConnectionState) -> anyhow::Result<()>,
 {
+    let _connection_lock = ConnectionState::lock()?;
     if all {
         let connections = ConnectionState::load_all()?;
         let mine: Vec<_> = connections
@@ -112,7 +122,7 @@ where
 pub fn disconnect_one_provider_connection(
     state: &ConnectionState,
     provider: Provider,
-    config: &AppConfig,
+    _config: &AppConfig,
 ) -> anyhow::Result<()> {
     let teardown = match state.backend {
         WgBackend::Kernel => wireguard::kernel::down(state),
@@ -146,7 +156,6 @@ pub fn disconnect_one_provider_connection(
     }
     ConnectionState::remove(&state.instance_name)?;
 
-    hooks::run_ifdown(config, provider, state);
     Ok(())
 }
 
@@ -202,12 +211,4 @@ pub fn direct_connection_active() -> anyhow::Result<DirectSlotStatus> {
             ))
         }
     }
-}
-
-/// Returns the live [`ConnectionState`] for the direct slot, or `None` when no
-/// active tunnel exists. Does not prune stale state; callers that also need
-/// cleanup should call [`direct_connection_active`] first.
-pub fn live_direct_connection() -> anyhow::Result<Option<ConnectionState>> {
-    use crate::wireguard::connection::DIRECT_INSTANCE;
-    Ok(ConnectionState::load(DIRECT_INSTANCE)?.filter(|s| s.is_live()))
 }

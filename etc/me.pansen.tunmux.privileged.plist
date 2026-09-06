@@ -32,12 +32,13 @@
         </dict>
     </dict>
 
-    <!-- Extend PATH so that Homebrew tools (wg, etc.) are reachable from the daemon.
-         launchd default is /usr/bin:/bin:/usr/sbin:/sbin which misses /opt/homebrew/bin. -->
+    <!-- Finding 3 — Executable substitution through PATH: privileged commands
+         must never search user-writable Homebrew directories. Subprocesses append
+         /usr/local/bin at runtime only after checking ownership and permissions. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TUNMUX_LOG_COLOR</key>
         <string>always</string>
     </dict>

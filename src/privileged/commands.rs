@@ -19,7 +19,7 @@ pub(super) fn run_wg_quick_up(
     std::fs::write(path, config_content)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
-    let mut command = Command::new("wg-quick");
+    let mut command = crate::trusted_exec::wg_quick_command(prefer_userspace)?;
     if prefer_userspace {
         command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
         command.env("TUNMUX_GOTATUN_HELPER", "1");
@@ -51,7 +51,7 @@ pub(super) fn run_wg_quick_up(
 
 pub(super) fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
     debug!(cmd = format!("wg-quick down {}", path.display()), "exec");
-    let status = Command::new("wg-quick")
+    let status = crate::trusted_exec::wg_quick_command(true)?
         .args(["down", path.to_string_lossy().as_ref()])
         .status()
         .map_err(|e| AppError::Other(format!("wg-quick down failed: {}", e)))?;
@@ -319,22 +319,13 @@ pub(super) fn run_gotatun_up(
 ) -> Result<()> {
     use base64::Engine;
 
-    // Idempotency / anti-race: every helper shares the control-socket path
-    // `/var/run/wireguard/<interface>.sock` (keyed by the logical name). If a
-    // previous helper is still alive and we spawn a second one, the departing
-    // helper's cleanup deletes the new helper's socket out from under it and the
-    // new helper self-terminates on `control_socket_removed`. Tear any existing
-    // live helper down cleanly first so there is never more than one and the new
-    // socket can't be clobbered by a concurrent teardown.
-    if let Ok(Some(existing_pid)) = read_gotatun_pid(&gotatun_pid_path(interface)) {
-        if pid_is_alive(existing_pid) {
-            debug!(
-                interface,
-                pid = existing_pid,
-                "gotatun_up_replacing_existing_helper"
-            );
-            run_gotatun_down(interface)?;
-        }
+    // Finding 5 — Incorrect tunnel adoption and connection races: the
+    // dispatcher verifies identity under its mutation lock. A helper whose
+    // socket vanished may still be cleaning up; never start over its files.
+    if read_gotatun_pid(&gotatun_pid_path(interface))?.is_some_and(pid_is_alive) {
+        return Err(AppError::WireGuard(
+            "existing helper is still running; disconnect it before reconnecting".into(),
+        ));
     }
 
     let exe = self_executable_for_spawn()?;
@@ -354,6 +345,7 @@ pub(super) fn run_gotatun_up(
         "exec"
     );
     let mut command = Command::new(exe);
+    crate::trusted_exec::sanitize(&mut command);
     command
         .env("TUNMUX_GOTATUN_HELPER", "1")
         .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
@@ -367,7 +359,6 @@ pub(super) fn run_gotatun_up(
     if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
         command.env(crate::logging::COLOR_ENV, color);
     }
-    command.env("TUNMUX_GOTATUN_DIAG", "1");
     let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
@@ -526,7 +517,8 @@ fn wait_for_cleanup_status(path: &std::path::Path, timeout: Duration) -> Option<
 }
 
 fn macos_interface_exists(interface: &str) -> bool {
-    Command::new("ifconfig")
+    crate::trusted_exec::command("ifconfig")
+        .expect("system command is approved")
         .arg(interface)
         .output()
         .map(|output| output.status.success())
