@@ -543,15 +543,20 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                 {
                     // Adapt routing to network changes (roam, suspend/resume,
                     // link up/down) live, without requiring a reconnect. Throttled
-                    // off the 1s tick so the `ifconfig` snapshot stays cheap.
+                    // off the 1s tick. System commands must run off-runtime:
+                    // this current-thread runtime also drives WireGuard packets.
                     if std::time::Instant::now() >= next_reconcile_at {
                         next_reconcile_at = std::time::Instant::now() + MACOS_RECONCILE_INTERVAL;
                         if let CleanupState::Macos(state) = &running.cleanup {
-                            let routes_changed = macos_reconcile_routes(state);
-                            let dns_changed = macos_reconcile_dns(state);
-                            if routes_changed || dns_changed {
-                                log_macos_network_overview("reconcile", state);
-                            }
+                            let state = std::sync::Arc::clone(state);
+                            run_macos_maintenance("reconcile", move || {
+                                let routes_changed = macos_reconcile_routes(&state);
+                                let dns_changed = macos_reconcile_dns(&state);
+                                if routes_changed || dns_changed {
+                                    log_macos_network_overview("reconcile", &state);
+                                }
+                            })
+                            .await?;
                         }
                     }
 
@@ -562,7 +567,7 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                             &mut last_transfer,
                             &mut last_probe_sent,
                         )
-                        .await;
+                        .await?;
                     }
                 }
             }
@@ -573,16 +578,43 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+async fn run_macos_maintenance<T: Send + 'static>(
+    operation: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    // Await each job so ticks cannot overlap and teardown cannot race a worker
+    // that is still changing routes or DNS. Awaiting yields the runtime thread
+    // to the packet engine, unlike synchronous subprocess/socket operations.
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let result = work();
+        debug!(
+            operation,
+            elapsed_ms = started.elapsed().as_millis(),
+            "userspace_helper_maintenance_complete"
+        );
+        result
+    })
+    .await
+    .with_context(|| format!("macOS {operation} maintenance task panicked"))
+}
+
+#[cfg(target_os = "macos")]
 async fn log_macos_dataplane_probe(
     interface: &str,
     last_transfer: &mut Option<(u64, u64)>,
     last_probe_sent: &mut Option<(bool, bool)>,
-) {
-    let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
-    let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
-        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-        53,
-    )));
+) -> anyhow::Result<()> {
+    let (ipv4_probe_sent, ipv6_probe_sent) = run_macos_maintenance("udp_probe", || {
+        (
+            send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53))),
+            send_udp_probe(SocketAddr::from((
+                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                53,
+            ))),
+        )
+    })
+    .await?;
 
     // A probe-send flag flipping (a send starting or stopping to work) is worth
     // surfacing at INFO; an unchanged flag is not.
@@ -644,6 +676,7 @@ async fn log_macos_dataplane_probe(
             );
         }
     }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2910,6 +2943,39 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
 mod tests {
     use super::*;
     use std::net::IpAddr;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_maintenance_does_not_stall_network_io() {
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let maintenance = run_macos_maintenance("test", move || {
+            started_tx.send(()).unwrap();
+            // Only the async network task can release this blocking operation.
+            // A timeout lets an inline-blocking regression fail instead of hang.
+            release_rx.recv_timeout(Duration::from_secs(5))
+        });
+        let traffic = async {
+            started_rx.await.unwrap();
+            sender
+                .send_to(b"ping", receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            let mut packet = [0; 4];
+            let (len, _) = receiver.recv_from(&mut packet).await.unwrap();
+            assert_eq!(&packet[..len], b"ping");
+            let _ = release_tx.send(());
+        };
+
+        // Poll maintenance first so running it inline would block the only
+        // runtime thread before it can deliver the UDP packet.
+        let (result, ()) = tokio::join!(biased; maintenance, traffic);
+        result
+            .expect("maintenance worker completed")
+            .expect("network I/O must progress while maintenance is blocked");
+    }
 
     fn subnet(value: &str) -> (IpAddr, u8) {
         let (ip, prefix) = parse_cidr(value).expect("valid cidr");
