@@ -2,16 +2,12 @@
 # Override on other machines/users: make install TUNMUX_PROFILE=/path/to/your.conf
 TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
 
-.PHONY: submodule
-submodule:
-	git submodule update --init --recursive
-
 .PHONY: hooks
 hooks:
 	git config core.hooksPath scripts/hooks
 
 .PHONY: build.release
-build.release: submodule
+build.release:
 	cargo build --release
 
 .PHONY: install/binary
