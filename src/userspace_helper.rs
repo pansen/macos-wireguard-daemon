@@ -687,6 +687,7 @@ async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, 
                     any = true;
                 } else if let Some(value) = line.strip_prefix("tx_bytes=") {
                     tx = tx.saturating_add(value.parse::<u64>()?);
+                    any = true;
                 } else if line == "errno=0" {
                     return Ok(if any { Some((rx, tx)) } else { None });
                 } else if line.starts_with("errno=") {
