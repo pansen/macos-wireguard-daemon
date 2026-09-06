@@ -359,7 +359,6 @@ pub(super) fn run_gotatun_up(
     if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
         command.env(crate::logging::COLOR_ENV, color);
     }
-    command.env("TUNMUX_GOTATUN_DIAG", "1");
     let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;

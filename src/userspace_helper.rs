@@ -7,7 +7,7 @@ use std::io;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "macos")]
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -507,21 +507,11 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     #[cfg(target_os = "macos")]
-    let diag_enabled = true;
-    #[cfg(target_os = "macos")]
-    let mut next_diag_at = std::time::Instant::now();
+    let mut next_transfer_sample_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut next_reconcile_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut last_transfer: Option<(u64, u64)> = None;
-    #[cfg(target_os = "macos")]
-    let mut last_probe_sent: Option<(bool, bool)> = None;
-
-    #[cfg(target_os = "macos")]
-    info!(
-        interface = running.control_interface_name,
-        "userspace_helper_dataplane_probe_enabled"
-    );
 
     loop {
         tokio::select! {
@@ -560,12 +550,11 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                         }
                     }
 
-                    if diag_enabled && std::time::Instant::now() >= next_diag_at {
-                        next_diag_at = std::time::Instant::now() + Duration::from_secs(5);
-                        log_macos_dataplane_probe(
+                    if std::time::Instant::now() >= next_transfer_sample_at {
+                        next_transfer_sample_at = std::time::Instant::now() + Duration::from_secs(5);
+                        log_macos_transfer_sample(
                             &running.control_interface_name,
                             &mut last_transfer,
-                            &mut last_probe_sent,
                         )
                         .await?;
                     }
@@ -599,28 +588,22 @@ async fn run_macos_maintenance<T: Send + 'static>(
     .with_context(|| format!("macOS {operation} maintenance task panicked"))
 }
 
+/// Sample the tunnel's WireGuard transfer counters.
+///
+/// This only reads counters the device already maintains; it generates no
+/// traffic of its own. An earlier version first sent a UDP byte to public DNS
+/// resolvers on both families to try to prove the dataplane worked. That never
+/// established anything: nothing validated a reply, unrelated traffic accounts
+/// for any counter movement, and under a split tunnel those destinations were
+/// not in AllowedIPs and so left through the physical interface without
+/// touching WireGuard at all. It also cost about two seconds per sample,
+/// because closing a filtered socket waits out `net.cfil.close_wait_timeout`.
+/// See `doc/macos-udp-probe-delay.md`.
 #[cfg(target_os = "macos")]
-async fn log_macos_dataplane_probe(
+async fn log_macos_transfer_sample(
     interface: &str,
     last_transfer: &mut Option<(u64, u64)>,
-    last_probe_sent: &mut Option<(bool, bool)>,
 ) -> anyhow::Result<()> {
-    let (ipv4_probe_sent, ipv6_probe_sent) = run_macos_maintenance("udp_probe", || {
-        (
-            send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53))),
-            send_udp_probe(SocketAddr::from((
-                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-                53,
-            ))),
-        )
-    })
-    .await?;
-
-    // A probe-send flag flipping (a send starting or stopping to work) is worth
-    // surfacing at INFO; an unchanged flag is not.
-    let probe_sent_changed = *last_probe_sent != Some((ipv4_probe_sent, ipv6_probe_sent));
-    *last_probe_sent = Some((ipv4_probe_sent, ipv6_probe_sent));
-
     match read_wg_transfer_bytes(interface).await {
         Ok(Some((rx_bytes, tx_bytes))) => {
             let (delta_rx_bytes, delta_tx_bytes) = last_transfer
@@ -632,93 +615,45 @@ async fn log_macos_dataplane_probe(
                 })
                 .unwrap_or((0, 0));
             *last_transfer = Some((rx_bytes, tx_bytes));
-            // Steady idle tunnels probe every 5s with no movement; keep that
+            // An idle tunnel samples every 5s with no movement; keep that
             // heartbeat at DEBUG so default (INFO) logs stay quiet, and only
-            // surface probes that actually moved bytes or changed send state.
-            let noteworthy = delta_rx_bytes != 0 || delta_tx_bytes != 0 || probe_sent_changed;
-            if noteworthy {
+            // surface samples where bytes actually moved.
+            let moved = delta_rx_bytes != 0 || delta_tx_bytes != 0;
+            if moved {
                 info!(
                     interface,
-                    ipv4_probe_sent,
-                    ipv6_probe_sent,
                     rx_bytes,
                     tx_bytes,
                     delta_rx_bytes,
                     delta_tx_bytes,
-                    "userspace_helper_dataplane_probe"
+                    "userspace_helper_transfer_sample"
                 );
             } else {
                 debug!(
                     interface,
-                    ipv4_probe_sent,
-                    ipv6_probe_sent,
                     rx_bytes,
                     tx_bytes,
                     delta_rx_bytes,
                     delta_tx_bytes,
-                    "userspace_helper_dataplane_probe"
+                    "userspace_helper_transfer_sample"
                 );
             }
         }
         Ok(None) => {
-            info!(
-                interface,
-                ipv4_probe_sent, ipv6_probe_sent, "userspace_helper_dataplane_probe_no_transfer"
-            );
+            info!(interface, "userspace_helper_transfer_sample_unavailable");
         }
         Err(error) => {
+            // Stays at WARN: a genuine UAPI failure means the device stopped
+            // answering. One benign case reaches here, a sample racing teardown
+            // after the control socket was removed, which reports ENOENT.
             warn!(
                 interface,
-                ipv4_probe_sent,
-                ipv6_probe_sent,
                 error = %error,
-                "userspace_helper_dataplane_probe_failed"
+                "userspace_helper_transfer_sample_failed"
             );
         }
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn send_udp_probe(target: SocketAddr) -> bool {
-    let bind = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let started = std::time::Instant::now();
-    // This measures std's combined socket creation + bind operation.
-    let bound = UdpSocket::bind(bind);
-    let bind_elapsed = started.elapsed();
-    let socket = match bound {
-        Ok(socket) => socket,
-        Err(error) => {
-            debug!(
-                %target,
-                bind_us = bind_elapsed.as_micros(),
-                %error,
-                "userspace_helper_udp_probe_bind_failed"
-            );
-            return false;
-        }
-    };
-    let started = std::time::Instant::now();
-    let sent = socket.send_to(&[0], target);
-    let send_elapsed = started.elapsed();
-    let started = std::time::Instant::now();
-    drop(socket);
-    let drop_elapsed = started.elapsed();
-    // Log only after closing: synchronous logging between send and drop would
-    // give a content filter extra time to finish and alter the measurement.
-    debug!(
-        %target,
-        bind_us = bind_elapsed.as_micros(),
-        send_us = send_elapsed.as_micros(),
-        drop_us = drop_elapsed.as_micros(),
-        result = ?sent,
-        "userspace_helper_udp_probe_timing"
-    );
-    sent.is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -2973,8 +2908,57 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
-    // Manual measurement of the actual helper code, including its blocking
-    // worker. This sends public traffic and must never run in normal CI.
+    /// Time a UDP socket's creation+bind, send and close separately.
+    ///
+    /// This is the reproduction for `doc/macos-udp-probe-delay.md`, kept out of
+    /// the production path: it exists to re-measure the environment (a macOS
+    /// content filter's close-wait), not to diagnose the tunnel. Logging happens
+    /// only after the close, because a synchronous log between send and close
+    /// would give the filter extra time to detach and shorten what we measure.
+    #[cfg(target_os = "macos")]
+    fn measure_udp_socket_lifecycle(target: SocketAddr) {
+        use std::net::UdpSocket;
+
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let started = std::time::Instant::now();
+        // std combines socket creation and the bind syscall.
+        let bound = UdpSocket::bind(bind);
+        let bind_elapsed = started.elapsed();
+        let socket = match bound {
+            Ok(socket) => socket,
+            Err(error) => {
+                debug!(
+                    %target,
+                    bind_us = bind_elapsed.as_micros(),
+                    %error,
+                    "userspace_helper_udp_probe_bind_failed"
+                );
+                return;
+            }
+        };
+        let started = std::time::Instant::now();
+        let sent = socket.send_to(&[0], target);
+        let send_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        drop(socket);
+        let drop_elapsed = started.elapsed();
+        debug!(
+            %target,
+            bind_us = bind_elapsed.as_micros(),
+            send_us = send_elapsed.as_micros(),
+            drop_us = drop_elapsed.as_micros(),
+            result = ?sent,
+            "userspace_helper_udp_probe_timing"
+        );
+    }
+
+    // Runs the measurement in the same awaited blocking worker the helper uses,
+    // so the numbers reflect that context. Sends public traffic; never in CI.
+    #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "manual diagnostic: sends UDP packets to public DNS addresses"]
     async fn measure_public_udp_probe_lifecycle() {
@@ -2989,8 +2973,8 @@ mod tests {
             // automatically carried into spawn_blocking.
             tracing::subscriber::with_default(subscriber, || {
                 for _ in 0..3 {
-                    send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
-                    send_udp_probe(SocketAddr::from((
+                    measure_udp_socket_lifecycle(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
+                    measure_udp_socket_lifecycle(SocketAddr::from((
                         Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
                         53,
                     )));
