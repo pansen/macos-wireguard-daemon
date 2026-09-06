@@ -686,10 +686,39 @@ fn send_udp_probe(target: SocketAddr) -> bool {
     } else {
         "[::]:0"
     };
-    let Ok(socket) = UdpSocket::bind(bind) else {
-        return false;
+    let started = std::time::Instant::now();
+    // This measures std's combined socket creation + bind operation.
+    let bound = UdpSocket::bind(bind);
+    let bind_elapsed = started.elapsed();
+    let socket = match bound {
+        Ok(socket) => socket,
+        Err(error) => {
+            debug!(
+                %target,
+                bind_us = bind_elapsed.as_micros(),
+                %error,
+                "userspace_helper_udp_probe_bind_failed"
+            );
+            return false;
+        }
     };
-    socket.send_to(&[0], target).is_ok()
+    let started = std::time::Instant::now();
+    let sent = socket.send_to(&[0], target);
+    let send_elapsed = started.elapsed();
+    let started = std::time::Instant::now();
+    drop(socket);
+    let drop_elapsed = started.elapsed();
+    // Log only after closing: synchronous logging between send and drop would
+    // give a content filter extra time to finish and alter the measurement.
+    debug!(
+        %target,
+        bind_us = bind_elapsed.as_micros(),
+        send_us = send_elapsed.as_micros(),
+        drop_us = drop_elapsed.as_micros(),
+        result = ?sent,
+        "userspace_helper_udp_probe_timing"
+    );
+    sent.is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -2943,6 +2972,34 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
 mod tests {
     use super::*;
     use std::net::IpAddr;
+
+    // Manual measurement of the actual helper code, including its blocking
+    // worker. This sends public traffic and must never run in normal CI.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "manual diagnostic: sends UDP packets to public DNS addresses"]
+    async fn measure_public_udp_probe_lifecycle() {
+        run_macos_maintenance("udp_probe_diagnostic", || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_test_writer()
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            // Install on the worker itself; thread-local subscribers are not
+            // automatically carried into spawn_blocking.
+            tracing::subscriber::with_default(subscriber, || {
+                for _ in 0..3 {
+                    send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
+                    send_udp_probe(SocketAddr::from((
+                        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                        53,
+                    )));
+                }
+            });
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_maintenance_does_not_stall_network_io() {
