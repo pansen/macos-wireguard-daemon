@@ -19,9 +19,7 @@ mod wireguard;
 use clap::Parser;
 use tracing::error;
 
-use cli::{
-    Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
-};
+use cli::{Cli, ConnectProviderCommand, ProviderArg, TopCommand};
 use wireguard::connection::ConnectionState;
 
 fn main() {
@@ -130,7 +128,6 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             provider,
             all,
         } => run_disconnect(instance, provider, all, &config).await,
-        TopCommand::Hook { command } => run_hook_command(command),
         TopCommand::Reload(args) => reload::run(args, &config).await,
         TopCommand::Status
         | TopCommand::Wg
@@ -139,131 +136,6 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }
-    }
-}
-
-fn run_hook_command(command: HookCommand) -> anyhow::Result<()> {
-    match command {
-        HookCommand::Run { builtin } => cmd_hook_run(builtin),
-        HookCommand::Debug {
-            instance,
-            provider,
-            event,
-        } => cmd_hook_debug(instance, provider, event),
-    }
-}
-
-fn cmd_hook_run(builtin: HookBuiltinArg) -> anyhow::Result<()> {
-    let entry = match builtin {
-        HookBuiltinArg::Connectivity => "builtin:connectivity",
-        HookBuiltinArg::ExternalIp => "builtin:external-ip",
-        HookBuiltinArg::DnsDetection => "builtin:dns-detection",
-    };
-
-    let connections = ConnectionState::load_all()?;
-    if connections.len() == 1 {
-        return shared::hooks::run_builtin_for_state(entry, &connections[0]);
-    }
-
-    if connections.len() > 1 {
-        tracing::warn!(
-            active_connections = connections.len(),
-            "hook_run_multiple_connections_no_proxy_context"
-        );
-    }
-
-    shared::hooks::run_builtin(entry)
-}
-
-fn cmd_hook_debug(
-    instance: Option<String>,
-    provider: Option<ProviderArg>,
-    event: HookEventArg,
-) -> anyhow::Result<()> {
-    let state = resolve_connection_for_hook_debug(instance, provider)?;
-    let provider_cfg = config::Provider::from_dir_name(&state.provider).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unsupported provider in connection state: {}",
-            state.provider
-        )
-    })?;
-
-    let env = match event {
-        HookEventArg::Ifup => shared::hooks::debug_ifup_env(provider_cfg, &state),
-        HookEventArg::Ifdown => shared::hooks::debug_ifdown_env(provider_cfg, &state),
-    };
-
-    println!(
-        "Hook env payload [{}] for {} ({})",
-        hook_event_label(event),
-        state.instance_name,
-        state.provider
-    );
-    for (key, value) in env {
-        println!("{}={}", key, value);
-    }
-
-    Ok(())
-}
-
-fn resolve_connection_for_hook_debug(
-    instance: Option<String>,
-    provider: Option<ProviderArg>,
-) -> anyhow::Result<ConnectionState> {
-    if let Some(instance_name) = instance {
-        let conn = ConnectionState::load(&instance_name)?
-            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", instance_name))?;
-
-        if let Some(requested) = provider {
-            if conn.provider != requested.label() {
-                anyhow::bail!(
-                    "instance {:?} belongs to provider {:?}, not {:?}",
-                    instance_name,
-                    conn.provider,
-                    requested.label()
-                );
-            }
-        }
-
-        return Ok(conn);
-    }
-
-    let mut connections = ConnectionState::load_all()?;
-    if let Some(requested) = provider {
-        let requested_label = requested.label();
-        connections.retain(|conn| conn.provider == requested_label);
-    }
-
-    match connections.len() {
-        0 => anyhow::bail!("no active connections{}", provider_hint(provider)),
-        1 => Ok(connections.remove(0)),
-        _ => {
-            println!("Multiple active connections. Specify instance for hook debug:\n");
-            for conn in &connections {
-                println!(
-                    "  {:<12} {:<9} {}",
-                    conn.instance_name, conn.provider, conn.server_display_name
-                );
-            }
-            println!("\nUsage: tunmux hook debug <instance>");
-            println!("       tunmux hook debug --provider <provider>");
-            anyhow::bail!("hook debug requires an unambiguous active connection")
-        }
-    }
-}
-
-fn hook_event_label(event: HookEventArg) -> &'static str {
-    match event {
-        HookEventArg::Ifup => "ifup",
-        HookEventArg::Ifdown => "ifdown",
-    }
-}
-
-fn provider_hint(provider: Option<ProviderArg>) -> &'static str {
-    if provider.is_some() {
-        " for selected provider"
-    } else {
-        ""
     }
 }
 

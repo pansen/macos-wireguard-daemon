@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -50,12 +50,6 @@ pub enum TopCommand {
     /// Show WireGuard tunnel state for active direct connection(s)
     Wg,
 
-    /// Hook utilities
-    Hook {
-        #[command(subcommand)]
-        command: HookCommand,
-    },
-
     /// Manage the privileged launchd daemon (system domain)
     Launchd {
         #[command(subcommand)]
@@ -101,30 +95,6 @@ pub enum TopCommand {
         /// Internal marker: daemon was launched by client autostart logic.
         #[arg(long, hide = true)]
         autostarted: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum HookCommand {
-    /// Run a predefined hook check now
-    Run {
-        /// Builtin hook entry
-        #[arg(value_enum)]
-        builtin: HookBuiltinArg,
-    },
-
-    /// Print the hook environment payload for an active instance
-    Debug {
-        /// Instance name (from `tunmux status`)
-        instance: Option<String>,
-
-        /// Provider to scope instance selection when `instance` is omitted
-        #[arg(short = 'p', long, value_enum)]
-        provider: Option<ProviderArg>,
-
-        /// Hook event payload to print
-        #[arg(long, value_enum, default_value = "ifup")]
-        event: HookEventArg,
     },
 }
 
@@ -195,19 +165,6 @@ pub struct ReloadArgs {
     /// and anything the steps report at info level or above.
     #[arg(short = 's', long, conflicts_with = "verbose")]
     pub silent: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum HookEventArg {
-    Ifup,
-    Ifdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum HookBuiltinArg {
-    Connectivity,
-    ExternalIp,
-    DnsDetection,
 }
 
 pub type ProviderArg = crate::config::Provider;
@@ -294,8 +251,8 @@ pub enum WgconfCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoconnectCommand, Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand,
-        LaunchdCommand, ProviderArg, TopCommand, WgconfCommand,
+        AutoconnectCommand, Cli, ConnectProviderCommand, LaunchdCommand, ProviderArg, TopCommand,
+        WgconfCommand,
     };
     use clap::Parser;
 
@@ -421,55 +378,6 @@ mod tests {
     fn parse_provider_disconnect_rejects_instance_with_all() {
         let wgconf = Cli::try_parse_from(["tunmux", "wgconf", "disconnect", "x", "--all"]);
         assert!(wgconf.is_err());
-    }
-
-    #[test]
-    fn parse_hook_debug_command() {
-        let cli = Cli::try_parse_from([
-            "tunmux",
-            "hook",
-            "debug",
-            "test-instance",
-            "--event",
-            "ifdown",
-        ])
-        .expect("parse hook debug");
-
-        match cli.command {
-            TopCommand::Hook {
-                command:
-                    HookCommand::Debug {
-                        instance, provider, ..
-                    },
-            } => {
-                assert_eq!(instance.as_deref(), Some("test-instance"));
-                assert!(provider.is_none());
-            }
-            _ => panic!("expected hook debug command"),
-        }
-    }
-
-    #[test]
-    fn parse_hook_run_builtin_command() {
-        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "external-ip"])
-            .expect("parse hook run builtin");
-
-        match cli.command {
-            TopCommand::Hook {
-                command: HookCommand::Run { builtin },
-            } => assert_eq!(builtin, HookBuiltinArg::ExternalIp),
-            _ => panic!("expected hook run command"),
-        }
-
-        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "dns-detection"])
-            .expect("parse hook run dns-detection builtin");
-
-        match cli.command {
-            TopCommand::Hook {
-                command: HookCommand::Run { builtin },
-            } => assert_eq!(builtin, HookBuiltinArg::DnsDetection),
-            _ => panic!("expected hook run command"),
-        }
     }
 
     #[test]

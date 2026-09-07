@@ -9,7 +9,6 @@ use anyhow::Context;
 use crate::cli::{WgconfCommand, WgconfConnectArgs};
 use crate::config::{self, AppConfig, Provider};
 use crate::shared::connection_ops;
-use crate::shared::hooks;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Wgconf;
@@ -96,7 +95,6 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         args.disable_ipv6,
         args.mtu,
         args.if_missing,
-        config,
     )?;
 
     Ok(())
@@ -180,7 +178,6 @@ fn connect_direct(
     disable_ipv6: bool,
     mtu: Option<u16>,
     if_missing: bool,
-    config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -295,16 +292,12 @@ fn connect_direct(
         }
     }
 
-    // Release the state transaction before user hooks; a hook may itself call
-    // tunmux. Verified --if-missing must not rerun connection side effects.
-    let connected_state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?;
+    // Release the state transaction before returning. Verified --if-missing must
+    // not rerun connection side effects.
     drop(_connection_lock);
     if already_active {
         println!("Already connected to {}.", source.display_name);
         return Ok(());
-    }
-    if let Some(state) = connected_state {
-        hooks::run_ifup(config, PROVIDER, &state);
     }
 
     println!(
