@@ -39,7 +39,7 @@ struct RoutedConfig {
 pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
         WgconfCommand::Connect(args) => cmd_connect(args, config),
-        WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
+        WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
         WgconfCommand::Status => cmd_status(),
         WgconfCommand::Save { file, name } => cmd_save(&file, &name),
         WgconfCommand::List => cmd_list(),
@@ -134,6 +134,7 @@ fn cmd_status() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let client = PrivilegedClient::new();
     for (index, conn) in connections.iter().enumerate() {
         if index > 0 {
             println!();
@@ -149,7 +150,7 @@ fn cmd_status() -> anyhow::Result<()> {
 
         // Live handshake/transfer via `wg show` (through the privileged service). The service is
         // already running while connected, so this does not trigger a new sudo prompt.
-        match PrivilegedClient::new().wg_show(&conn.interface_name) {
+        match client.wg_show(&conn.interface_name) {
             Ok(output) if !output.trim().is_empty() => {
                 println!();
                 println!("{}", crate::color::wg_show(output.trim_end()));
@@ -304,8 +305,8 @@ fn connect_direct(
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
-    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all, config)
+fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all)
 }
 
 fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<ConfigSource> {
