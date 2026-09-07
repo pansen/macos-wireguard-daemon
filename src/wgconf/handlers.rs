@@ -152,10 +152,7 @@ fn cmd_status() -> anyhow::Result<()> {
         match PrivilegedClient::new().wg_show(&conn.interface_name) {
             Ok(output) if !output.trim().is_empty() => {
                 println!();
-                print!("{}", output);
-                if !output.ends_with('\n') {
-                    println!();
-                }
+                println!("{}", crate::color::wg_show(output.trim_end()));
             }
             Ok(_) => {}
             Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),

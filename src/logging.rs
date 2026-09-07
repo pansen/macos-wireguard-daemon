@@ -74,7 +74,7 @@ fn level_from_env_or_default(default: LevelFilter) -> LevelFilter {
     }
 }
 
-fn ansi_enabled(default: bool) -> bool {
+pub(crate) fn ansi_enabled(default: bool) -> bool {
     let Some(value) = std::env::var_os(COLOR_ENV) else {
         return default;
     };

@@ -1,5 +1,6 @@
 mod autoconnect;
 mod cli;
+mod color;
 mod config;
 mod error;
 mod launchctl;
@@ -311,15 +312,16 @@ fn cmd_status() -> anyhow::Result<()> {
     };
 
     let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
-    println!("{}", render_row(&header_cells).trim_end());
     println!(
         "{}",
-        widths
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("-+-")
+        color::table_frame(render_row(&header_cells).trim_end())
     );
+    let rule = widths
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    println!("{}", color::table_frame(&rule));
     for row in &rows {
         println!("{}", render_row(row).trim_end());
     }
@@ -334,7 +336,7 @@ fn cmd_status() -> anyhow::Result<()> {
         match client.wg_show(&conn.interface_name) {
             Ok(output) if !output.trim().is_empty() => {
                 println!();
-                println!("{}", output.trim_end());
+                println!("{}", color::wg_show(output.trim_end()));
             }
             Ok(_) => {}
             Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
@@ -346,7 +348,7 @@ fn cmd_status() -> anyhow::Result<()> {
         match client.network_overview(&conn.interface_name) {
             Ok(Some(overview)) => {
                 println!();
-                println!("{}", overview.trim_end());
+                println!("{}", color::tables(overview.trim_end()));
             }
             Ok(None) => {}
             Err(e) => eprintln!(
