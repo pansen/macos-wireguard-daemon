@@ -44,11 +44,8 @@ pub enum TopCommand {
         all: bool,
     },
 
-    /// Show active VPN connections
+    /// Show active VPN connections, including WireGuard tunnel state
     Status,
-
-    /// Show WireGuard tunnel state for active direct connection(s)
-    Wg,
 
     /// Manage the privileged launchd daemon (system domain)
     Launchd {

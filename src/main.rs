@@ -58,19 +58,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        // Status and Wg are quick sync commands, no tokio needed.
+        // Status is a quick sync command, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
                 error!( command = ?"status", error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
-            }
-        }
-
-        TopCommand::Wg => {
-            init_logging(cli.verbose);
-            if let Err(e) = cmd_wg() {
-                error!( command = ?"wg", error = ?e.to_string(), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -130,7 +122,6 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         } => run_disconnect(instance, provider, all, &config).await,
         TopCommand::Reload(args) => reload::run(args, &config).await,
         TopCommand::Status
-        | TopCommand::Wg
         | TopCommand::Launchd { .. }
         | TopCommand::Autoconnect { .. }
         | TopCommand::Privileged { .. } => {
@@ -333,12 +324,22 @@ fn cmd_status() -> anyhow::Result<()> {
         println!("{}", render_row(row).trim_end());
     }
 
-    // Beneath the summary table, print the live route/DNS overview for any
-    // userspace tunnel. The state lives in the per-interface helper's memory, so
-    // it's fetched via the privileged service (which alone can reach the helper's
-    // root-only query socket). Best-effort: a fetch failure never fails `status`.
+    // Beneath the summary table, print per-interface detail: the WireGuard
+    // tunnel state from `wg show`, and for userspace tunnels the live route/DNS
+    // overview. Both live behind the privileged service (the helper's query
+    // socket is root-only), and both are best-effort: a fetch failure prints to
+    // stderr but never fails `status`.
     let client = privileged_client::PrivilegedClient::new();
     for conn in &connections {
+        match client.wg_show(&conn.interface_name) {
+            Ok(output) if !output.trim().is_empty() => {
+                println!();
+                println!("{}", output.trim_end());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
+        }
+
         if conn.backend != wireguard::backend::WgBackend::Userspace {
             continue;
         }
@@ -355,30 +356,6 @@ fn cmd_status() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn cmd_wg() -> anyhow::Result<()> {
-    use wireguard::connection::ConnectionState;
-
-    let connections = ConnectionState::load_all()?;
-    if connections.is_empty() {
-        println!("No active connections.");
-        return Ok(());
-    }
-
-    let mut first = true;
-    for conn in &connections {
-        if !first {
-            println!();
-        }
-        first = false;
-
-        match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
-            Ok(output) => print!("{}", output),
-            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
-        }
-    }
     Ok(())
 }
 
