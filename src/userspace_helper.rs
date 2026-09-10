@@ -1095,8 +1095,15 @@ fn configure_network_macos(
         // gateway here is fatal: an unpinned endpoint would route into the tunnel.
         fingerprint = macos_current_fingerprint(&inputs, GatewayFallback::Require)?;
         for route in macos_desired_routes(&inputs, &fingerprint) {
-            add_macos_route(&route)?;
-            routes_added.push(route);
+            match add_macos_route(&route)? {
+                MacosRouteInstall::Owned => routes_added.push(route),
+                // A physical interface holds the prefix; leave it alone rather
+                // than claiming a route teardown would then delete.
+                MacosRouteInstall::Foreign => warn!(
+                    destination = %route.destination,
+                    "userspace_helper_route_skipped_physical_prefix"
+                ),
+            }
         }
         // Apply DNS the same way the reconciler will, then seed the DNS
         // fingerprint so the first reconcile tick is a no-op.
@@ -1107,8 +1114,11 @@ fn configure_network_macos(
     if let Err(setup_error) = setup_result {
         let mut errors = Vec::new();
         for route in routes_added.iter().rev() {
-            if let Err(error) = del_macos_route(route) {
-                errors.push(error.to_string());
+            match del_macos_route(route) {
+                Ok(()) => {
+                    macos_restore_shadowed_lan_route(route, &fingerprint.local_subnets, interface)
+                }
+                Err(error) => errors.push(error.to_string()),
             }
         }
         for service in dns_services.iter().rev() {
@@ -1160,9 +1170,15 @@ fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
             routes = routing.routes_added.len(),
             "userspace_helper_network_cleanup_routes"
         );
+        let local_subnets = macos_local_connected_subnets(&state.reconcile.interface);
         for route in routing.routes_added.iter().rev() {
-            if let Err(error) = del_macos_route(route) {
-                errors.push(error.to_string());
+            match del_macos_route(route) {
+                Ok(()) => macos_restore_shadowed_lan_route(
+                    route,
+                    &local_subnets,
+                    &state.reconcile.interface,
+                ),
+                Err(error) => errors.push(error.to_string()),
             }
         }
     }
@@ -1334,8 +1350,20 @@ fn set_macos_search_domains_empty(service: &str) -> anyhow::Result<()> {
     run_command("networksetup", &["-setsearchdomains", service, "Empty"])
 }
 
+/// Whether the tunnel ends up owning a route it tried to install.
 #[cfg(target_os = "macos")]
-fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
+#[derive(Clone, Copy, PartialEq)]
+enum MacosRouteInstall {
+    /// The route is ours: we installed it, or replaced an earlier tunnel entry
+    /// for the same prefix. Teardown and reconcile may remove it again.
+    Owned,
+    /// A physical interface already holds this prefix (its connected LAN route).
+    /// Left untouched and not recorded as ours, so nothing later deletes it.
+    Foreign,
+}
+
+#[cfg(target_os = "macos")]
+fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
     let mut args: Vec<String> = vec!["-q".into(), "-n".into(), "add".into()];
     args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
     args.push(route.destination.clone());
@@ -1348,19 +1376,201 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     // Split routes (dev-bound, no explicit gateway) can linger on stale utun
-    // devices; clear any existing entry first so this tunnel owns the route.
+    // devices; clear such an entry first so this tunnel owns the route. Only a
+    // tunnel entry is cleared. Deleting the prefix unconditionally also removes
+    // a physical interface's connected LAN route, and taking the prefix from a
+    // LAN we are attached to makes that whole LAN unreachable.
     if route.interface.is_some() && route.gateway.is_none() {
-        let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
-        delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-        // Match del_macos_route: without -host/-net the delete can fail to match a
-        // CIDR destination, leaving the stale dev-bound route behind.
-        delete_args.push(macos_route_target_kind(route).into());
-        delete_args.push(route.destination.clone());
-        let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
-        let _ = run_command("route", &delete_refs);
+        match macos_route_destination(route).and_then(macos_route_table_entry) {
+            Some(entry) if !entry.is_tunnel_owned() => {
+                debug!(
+                    destination = %route.destination,
+                    holder = entry.interface.as_deref().unwrap_or("gateway"),
+                    "userspace_helper_route_prefix_held_by_physical_interface"
+                );
+                return Ok(MacosRouteInstall::Foreign);
+            }
+            Some(_) => {
+                let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
+                delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
+                // Match del_macos_route: without -host/-net the delete can fail to match a
+                // CIDR destination, leaving the stale dev-bound route behind.
+                delete_args.push(macos_route_target_kind(route).into());
+                delete_args.push(route.destination.clone());
+                let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
+                let _ = run_command("route", &delete_refs);
+            }
+            None => {}
+        }
     }
 
-    run_command_with_exists_ok("route", &refs)
+    run_command_with_exists_ok("route", &refs)?;
+    Ok(MacosRouteInstall::Owned)
+}
+
+/// One entry of the kernel routing table, as `route -n get` reports it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq)]
+struct MacosRouteEntry {
+    /// Network base and prefix length of the entry that answered the lookup.
+    destination: (IpAddr, u8),
+    interface: Option<String>,
+    has_gateway: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosRouteEntry {
+    /// True when a tunnel device holds this prefix directly, i.e. this or
+    /// another tunnel installed it rather than the kernel deriving it from a
+    /// physical interface address.
+    fn is_tunnel_owned(&self) -> bool {
+        !self.has_gateway
+            && self
+                .interface
+                .as_deref()
+                .is_some_and(|device| device.starts_with("utun"))
+    }
+}
+
+/// The destination of `route` as a network base and prefix length.
+#[cfg(target_os = "macos")]
+fn macos_route_destination(route: &MacosRoute) -> Option<(IpAddr, u8)> {
+    let (ip, prefix) = if route.destination.contains('/') {
+        parse_cidr(&route.destination).ok()?
+    } else {
+        let ip: IpAddr = route.destination.parse().ok()?;
+        let prefix = if ip.is_ipv6() { 128 } else { 32 };
+        (ip, prefix)
+    };
+    Some((macos_network_base(ip, prefix), prefix))
+}
+
+/// The routing table entry for exactly this prefix, or `None` when only a
+/// broader route (or nothing) covers it.
+///
+/// `route get` answers with whatever route wins the lookup for an address, so
+/// the reply is only an exact match when its own destination and mask match the
+/// prefix we asked about.
+#[cfg(target_os = "macos")]
+fn macos_route_table_entry(destination: (IpAddr, u8)) -> Option<MacosRouteEntry> {
+    let (ip, prefix) = destination;
+    let is_ipv6 = ip.is_ipv6();
+    let base = macos_network_base(ip, prefix).to_string();
+    let mut args: Vec<&str> = vec!["-n", "get"];
+    if is_ipv6 {
+        args.push("-inet6");
+    }
+    args.push(&base);
+    let output = run_command_capture_output("route", &args).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let entry = parse_macos_route_get(&String::from_utf8_lossy(&output.stdout), is_ipv6)?;
+    (entry.destination == destination).then_some(entry)
+}
+
+/// Parse the `key: value` block `route -n get` prints for one lookup.
+#[cfg(target_os = "macos")]
+fn parse_macos_route_get(text: &str, is_ipv6: bool) -> Option<MacosRouteEntry> {
+    let (mut destination, mut mask, mut gateway, mut interface) = (None, None, None, None);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("destination:") {
+            destination = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("mask:") {
+            mask = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("gateway:") {
+            gateway = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("interface:") {
+            interface = Some(value.trim().to_string());
+        }
+    }
+    // A default route reports "default" rather than an address; it never is the
+    // exact entry for a prefix we install, so failing to parse is the answer.
+    let destination: IpAddr = destination?.parse().ok()?;
+    let prefix = match mask.as_deref() {
+        // Host routes come back without a mask line.
+        None => {
+            if is_ipv6 {
+                128
+            } else {
+                32
+            }
+        }
+        Some("default") => 0,
+        Some(value) => parse_macos_route_mask(value)?,
+    };
+    Some(MacosRouteEntry {
+        destination: (macos_network_base(destination, prefix), prefix),
+        interface,
+        has_gateway: gateway.is_some(),
+    })
+}
+
+/// Convert a `route get` mask ("255.255.255.0", "ffff:ffff:ffff:ffff::") to a
+/// prefix length.
+#[cfg(target_os = "macos")]
+fn parse_macos_route_mask(mask: &str) -> Option<u8> {
+    match mask.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => Some(u32::from(v4).count_ones() as u8),
+        IpAddr::V6(v6) => Some(u128::from(v6).count_ones() as u8),
+    }
+}
+
+/// Put back the connected route of a LAN whose prefix a tunnel route held.
+///
+/// While a dev-bound tunnel route occupies a prefix, the kernel cannot install
+/// the connected route a physical interface derives from its own address. Join
+/// such a LAN with the tunnel route already in place and the connected route is
+/// silently skipped, so removing the tunnel route later leaves no route at all
+/// and the LAN goes unreachable. Re-add it in that case.
+#[cfg(target_os = "macos")]
+fn macos_restore_shadowed_lan_route(
+    route: &MacosRoute,
+    local_subnets: &[(IpAddr, u8)],
+    tunnel_interface: &str,
+) {
+    let Some(subnet) = macos_route_excluded_by_local_subnet(route, local_subnets) else {
+        return;
+    };
+    // The kernel entry survived (the tunnel route was more specific, or never
+    // displaced it), so there is nothing to repair.
+    if macos_route_table_entry(subnet).is_some() {
+        return;
+    }
+    let Some(device) = macos_connected_subnet_device(subnet, tunnel_interface) else {
+        return;
+    };
+    let (ip, prefix) = subnet;
+    let destination = format!("{ip}/{prefix}");
+    // Scoped to the owning device, matching how the kernel installs connected
+    // routes; an unscoped entry would outrank the interface's own routing.
+    let args = vec![
+        "-q".to_string(),
+        "-n".to_string(),
+        "add".to_string(),
+        if ip.is_ipv6() { "-inet6" } else { "-inet" }.to_string(),
+        "-net".to_string(),
+        destination.clone(),
+        "-ifscope".to_string(),
+        device.clone(),
+        "-interface".to_string(),
+        device.clone(),
+    ];
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_command_with_exists_ok("route", &refs) {
+        Ok(_) => info!(
+            destination = %destination,
+            device = %device,
+            "userspace_helper_lan_route_restored"
+        ),
+        Err(error) => warn!(
+            destination = %destination,
+            device = %device,
+            error = %error,
+            "userspace_helper_lan_route_restore_failed"
+        ),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1700,7 +1910,16 @@ fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
     for route in &current {
         if !desired.contains(route) {
             match del_macos_route(route) {
-                Ok(()) => removed += 1,
+                Ok(()) => {
+                    removed += 1;
+                    // Joining a LAN the tunnel already routed costs that LAN its
+                    // connected route; dropping ours is only half the repair.
+                    macos_restore_shadowed_lan_route(
+                        route,
+                        &fingerprint.local_subnets,
+                        &inputs.interface,
+                    );
+                }
                 Err(error) => {
                     errors += 1;
                     warn!(
@@ -1720,10 +1939,14 @@ fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
             continue;
         }
         match add_macos_route(&route) {
-            Ok(_) => {
+            Ok(MacosRouteInstall::Owned) => {
                 added += 1;
                 installed.push(route);
             }
+            Ok(MacosRouteInstall::Foreign) => warn!(
+                destination = %route.destination,
+                "userspace_helper_route_skipped_physical_prefix"
+            ),
             Err(error) => {
                 errors += 1;
                 warn!(
@@ -2761,6 +2984,28 @@ fn format_table_row(values: &[String], widths: &[usize]) -> String {
 /// interfaces (the physical LANs), excluding the tunnel itself.
 #[cfg(target_os = "macos")]
 fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
+    let mut subnets: Vec<(IpAddr, u8)> = macos_connected_subnets_by_device(tunnel_interface)
+        .into_iter()
+        .map(|(_, subnet)| subnet)
+        .collect();
+    subnets.sort();
+    subnets.dedup();
+    subnets
+}
+
+/// The device that carries `subnet`, for repairing its connected route.
+#[cfg(target_os = "macos")]
+fn macos_connected_subnet_device(subnet: (IpAddr, u8), tunnel_interface: &str) -> Option<String> {
+    macos_connected_subnets_by_device(tunnel_interface)
+        .into_iter()
+        .find(|(_, candidate)| *candidate == subnet)
+        .map(|(device, _)| device)
+}
+
+/// Every connected subnet paired with the interface it belongs to, in ifconfig
+/// order.
+#[cfg(target_os = "macos")]
+fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (IpAddr, u8))> {
     // Call ifconfig directly (not run_command_capture_output) to avoid emitting
     // a debug command log line on every reconcile tick.
     let output = match crate::trusted_exec::command("ifconfig")
@@ -2772,35 +3017,37 @@ fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut subnets = Vec::new();
-    let mut interface_qualifies = false;
+    let mut device: Option<String> = None;
     for line in text.lines() {
         if !line.starts_with(|c: char| c.is_whitespace()) {
             // Interface header: "en0: flags=8863<UP,BROADCAST,...> mtu 1500".
-            interface_qualifies = false;
+            device = None;
             if let Some((name, rest)) = line.split_once(':') {
-                interface_qualifies = name.trim() != tunnel_interface
+                let name = name.trim();
+                if name != tunnel_interface
                     && rest.contains("UP")
                     && !rest.contains("LOOPBACK")
-                    && !rest.contains("POINTOPOINT");
+                    && !rest.contains("POINTOPOINT")
+                {
+                    device = Some(name.to_string());
+                }
             }
             continue;
         }
-        if !interface_qualifies {
+        let Some(device) = device.as_deref() else {
             continue;
-        }
+        };
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("inet ") {
             if let Some(subnet) = parse_ifconfig_inet4_subnet(rest) {
-                subnets.push(subnet);
+                subnets.push((device.to_string(), subnet));
             }
         } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
             if let Some(subnet) = parse_ifconfig_inet6_subnet(rest) {
-                subnets.push(subnet);
+                subnets.push((device.to_string(), subnet));
             }
         }
     }
-    subnets.sort();
-    subnets.dedup();
     subnets
 }
 
@@ -3049,6 +3296,87 @@ mod tests {
             gateway: None,
         };
         assert_eq!(macos_route_target_kind(&host_cidr), "-host");
+    }
+
+    #[test]
+    fn route_get_reply_identifies_the_entry_holding_a_prefix() {
+        let lan = "   route to: 192.168.168.0\n\
+                    destination: 192.168.168.0\n\
+                           mask: 255.255.255.0\n\
+                      interface: en0\n\
+                          flags: <UP,DONE,CLONING>\n";
+        let entry = parse_macos_route_get(lan, false).expect("parsed");
+        assert_eq!(entry.destination, subnet("192.168.168.0/24"));
+        assert_eq!(entry.interface.as_deref(), Some("en0"));
+        assert!(!entry.is_tunnel_owned());
+
+        let tunnel = "   route to: 10.66.77.0\n\
+                       destination: 10.66.77.0\n\
+                              mask: 255.255.255.0\n\
+                         interface: utun6\n";
+        assert!(parse_macos_route_get(tunnel, false)
+            .expect("parsed")
+            .is_tunnel_owned());
+
+        // Answered by the default route: no entry for this prefix.
+        let covered = "   route to: 192.168.168.0\n\
+                       destination: default\n\
+                              mask: default\n\
+                           gateway: 192.168.168.1\n\
+                         interface: en0\n";
+        assert_eq!(parse_macos_route_get(covered, false), None);
+
+        // A host route comes back without a mask line.
+        let host = "   route to: 100.64.1.1\n\
+                    destination: 100.64.1.1\n\
+                      interface: utun6\n";
+        let entry = parse_macos_route_get(host, false).expect("parsed");
+        assert_eq!(entry.destination, subnet("100.64.1.1/32"));
+
+        let v6 = "   route to: fd86:4939:da7b::\n\
+                  destination: fd86:4939:da7b::\n\
+                         mask: ffff:ffff:ffff:ffff::\n\
+                    interface: en0\n";
+        let entry = parse_macos_route_get(v6, true).expect("parsed");
+        assert_eq!(entry.destination, subnet("fd86:4939:da7b::/64"));
+        assert!(!entry.is_tunnel_owned());
+    }
+
+    #[test]
+    fn a_gatewayed_tunnel_entry_is_not_treated_as_tunnel_owned() {
+        // An endpoint pin lives on the physical path even though route get
+        // names a tunnel-looking device; only dev-bound entries are ours.
+        let entry = MacosRouteEntry {
+            destination: subnet("23.88.101.22/32"),
+            interface: Some("utun6".to_string()),
+            has_gateway: true,
+        };
+        assert!(!entry.is_tunnel_owned());
+    }
+
+    #[test]
+    fn route_destinations_normalise_to_network_base_and_prefix() {
+        let network = MacosRoute {
+            is_ipv6: false,
+            destination: "192.168.168.42/24".to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        assert_eq!(
+            macos_route_destination(&network),
+            Some(subnet("192.168.168.0/24"))
+        );
+
+        let bare = MacosRoute {
+            is_ipv6: false,
+            destination: "23.88.101.22".to_string(),
+            interface: None,
+            gateway: Some("192.168.168.1".to_string()),
+        };
+        assert_eq!(
+            macos_route_destination(&bare),
+            Some(subnet("23.88.101.22/32"))
+        );
     }
 
     #[test]

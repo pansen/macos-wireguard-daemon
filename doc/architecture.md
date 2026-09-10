@@ -449,6 +449,16 @@ otherwise capture the endpoint) plus the AllowedIPs routes, minus anything that
 falls inside a directly-connected subnet. That subtraction is what keeps the
 split tunnel from hijacking the LAN you are actually on.
 
+The subtraction alone is not enough, because a prefix can only hold one entry.
+Joining a LAN the tunnel already routes (roaming into a subnet that is also in
+AllowedIPs) means the kernel cannot install that interface's connected route,
+and the tunnel route it lost out to is removed on the next reconcile, leaving
+the LAN with no route at all. Two rules close that gap. `add_macos_route`
+checks who holds a prefix before touching it, clearing a stale entry only when
+a tunnel device owns it and otherwise leaving the prefix alone and unowned, and
+`macos_restore_shadowed_lan_route` re-adds the connected route, scoped to its
+device, whenever removing a tunnel route leaves a local subnet uncovered.
+
 DNS: `plan_dns_actions` is deliberately I/O-free and therefore unit-testable. It
 takes the tunnel's DNS, the observed environment, the services currently owned,
 and the services that should be owned, and returns what to apply, restore, or
