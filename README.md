@@ -94,6 +94,9 @@ that require it.
 Only one connection is active at a time. While it is up, routing and DNS
 follow the current network.
 
+For the level below this one, how the CLI, the daemon and the per-tunnel helper
+actually talk to each other, see [doc/architecture.md](doc/architecture.md).
+
 ## Backends
 
 There are three ways to bring the tunnel up:

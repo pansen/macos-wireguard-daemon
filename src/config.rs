@@ -14,16 +14,6 @@ const APP_DIR: &str = "tunmux";
 #[serde(default)]
 pub struct AppConfig {
     pub general: GeneralConfig,
-    pub wgconf: WgconfConfig,
-}
-
-impl AppConfig {
-    /// Returns the hook config for a given provider.
-    pub fn hooks_for(&self, provider: Provider) -> &HookConfig {
-        match provider {
-            Provider::Wgconf => &self.wgconf.hooks,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,7 +27,6 @@ pub struct GeneralConfig {
     pub privileged_authorized_group: String,
     pub privileged_autostop_mode: PrivilegedAutostopMode,
     pub privileged_autostop_timeout_ms: u64,
-    pub hooks: HookConfig,
 }
 
 impl Default for GeneralConfig {
@@ -51,16 +40,8 @@ impl Default for GeneralConfig {
             privileged_authorized_group: String::new(),
             privileged_autostop_mode: PrivilegedAutostopMode::Never,
             privileged_autostop_timeout_ms: 30000,
-            hooks: HookConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct HookConfig {
-    pub ifup: Vec<String>,
-    pub ifdown: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -95,12 +76,6 @@ pub enum PrivilegedTransport {
     #[default]
     Socket,
     Stdio,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct WgconfConfig {
-    pub hooks: HookConfig,
 }
 
 pub fn load_config() -> AppConfig {

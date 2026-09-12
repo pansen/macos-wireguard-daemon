@@ -9,7 +9,6 @@ use anyhow::Context;
 use crate::cli::{WgconfCommand, WgconfConnectArgs};
 use crate::config::{self, AppConfig, Provider};
 use crate::shared::connection_ops;
-use crate::shared::hooks;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Wgconf;
@@ -40,7 +39,7 @@ struct RoutedConfig {
 pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
         WgconfCommand::Connect(args) => cmd_connect(args, config),
-        WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
+        WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
         WgconfCommand::Status => cmd_status(),
         WgconfCommand::Save { file, name } => cmd_save(&file, &name),
         WgconfCommand::List => cmd_list(),
@@ -96,7 +95,6 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         args.disable_ipv6,
         args.mtu,
         args.if_missing,
-        config,
     )?;
 
     Ok(())
@@ -136,6 +134,7 @@ fn cmd_status() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let client = PrivilegedClient::new();
     for (index, conn) in connections.iter().enumerate() {
         if index > 0 {
             println!();
@@ -151,13 +150,10 @@ fn cmd_status() -> anyhow::Result<()> {
 
         // Live handshake/transfer via `wg show` (through the privileged service). The service is
         // already running while connected, so this does not trigger a new sudo prompt.
-        match PrivilegedClient::new().wg_show(&conn.interface_name) {
+        match client.wg_show(&conn.interface_name) {
             Ok(output) if !output.trim().is_empty() => {
                 println!();
-                print!("{}", output);
-                if !output.ends_with('\n') {
-                    println!();
-                }
+                println!("{}", crate::color::wg_show(output.trim_end()));
             }
             Ok(_) => {}
             Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
@@ -180,7 +176,6 @@ fn connect_direct(
     disable_ipv6: bool,
     mtu: Option<u16>,
     if_missing: bool,
-    config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -295,16 +290,12 @@ fn connect_direct(
         }
     }
 
-    // Release the state transaction before user hooks; a hook may itself call
-    // tunmux. Verified --if-missing must not rerun connection side effects.
-    let connected_state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?;
+    // Release the state transaction before returning. Verified --if-missing must
+    // not rerun connection side effects.
     drop(_connection_lock);
     if already_active {
         println!("Already connected to {}.", source.display_name);
         return Ok(());
-    }
-    if let Some(state) = connected_state {
-        hooks::run_ifup(config, PROVIDER, &state);
     }
 
     println!(
@@ -314,8 +305,8 @@ fn connect_direct(
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
-    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all, config)
+fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+    connection_ops::cmd_disconnect_provider(PROVIDER, instance, all)
 }
 
 fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<ConfigSource> {

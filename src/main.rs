@@ -1,5 +1,6 @@
 mod autoconnect;
 mod cli;
+mod color;
 mod config;
 mod error;
 mod launchctl;
@@ -19,9 +20,7 @@ mod wireguard;
 use clap::Parser;
 use tracing::error;
 
-use cli::{
-    Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
-};
+use cli::{Cli, ConnectProviderCommand, ProviderArg, TopCommand};
 use wireguard::connection::ConnectionState;
 
 fn main() {
@@ -60,19 +59,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        // Status and Wg are quick sync commands, no tokio needed.
+        // Status is a quick sync command, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
                 error!( command = ?"status", error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
-            }
-        }
-
-        TopCommand::Wg => {
-            init_logging(cli.verbose);
-            if let Err(e) = cmd_wg() {
-                error!( command = ?"wg", error = ?e.to_string(), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -130,140 +121,13 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
             provider,
             all,
         } => run_disconnect(instance, provider, all, &config).await,
-        TopCommand::Hook { command } => run_hook_command(command),
         TopCommand::Reload(args) => reload::run(args, &config).await,
         TopCommand::Status
-        | TopCommand::Wg
         | TopCommand::Launchd { .. }
         | TopCommand::Autoconnect { .. }
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }
-    }
-}
-
-fn run_hook_command(command: HookCommand) -> anyhow::Result<()> {
-    match command {
-        HookCommand::Run { builtin } => cmd_hook_run(builtin),
-        HookCommand::Debug {
-            instance,
-            provider,
-            event,
-        } => cmd_hook_debug(instance, provider, event),
-    }
-}
-
-fn cmd_hook_run(builtin: HookBuiltinArg) -> anyhow::Result<()> {
-    let entry = match builtin {
-        HookBuiltinArg::Connectivity => "builtin:connectivity",
-        HookBuiltinArg::ExternalIp => "builtin:external-ip",
-        HookBuiltinArg::DnsDetection => "builtin:dns-detection",
-    };
-
-    let connections = ConnectionState::load_all()?;
-    if connections.len() == 1 {
-        return shared::hooks::run_builtin_for_state(entry, &connections[0]);
-    }
-
-    if connections.len() > 1 {
-        tracing::warn!(
-            active_connections = connections.len(),
-            "hook_run_multiple_connections_no_proxy_context"
-        );
-    }
-
-    shared::hooks::run_builtin(entry)
-}
-
-fn cmd_hook_debug(
-    instance: Option<String>,
-    provider: Option<ProviderArg>,
-    event: HookEventArg,
-) -> anyhow::Result<()> {
-    let state = resolve_connection_for_hook_debug(instance, provider)?;
-    let provider_cfg = config::Provider::from_dir_name(&state.provider).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unsupported provider in connection state: {}",
-            state.provider
-        )
-    })?;
-
-    let env = match event {
-        HookEventArg::Ifup => shared::hooks::debug_ifup_env(provider_cfg, &state),
-        HookEventArg::Ifdown => shared::hooks::debug_ifdown_env(provider_cfg, &state),
-    };
-
-    println!(
-        "Hook env payload [{}] for {} ({})",
-        hook_event_label(event),
-        state.instance_name,
-        state.provider
-    );
-    for (key, value) in env {
-        println!("{}={}", key, value);
-    }
-
-    Ok(())
-}
-
-fn resolve_connection_for_hook_debug(
-    instance: Option<String>,
-    provider: Option<ProviderArg>,
-) -> anyhow::Result<ConnectionState> {
-    if let Some(instance_name) = instance {
-        let conn = ConnectionState::load(&instance_name)?
-            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", instance_name))?;
-
-        if let Some(requested) = provider {
-            if conn.provider != requested.label() {
-                anyhow::bail!(
-                    "instance {:?} belongs to provider {:?}, not {:?}",
-                    instance_name,
-                    conn.provider,
-                    requested.label()
-                );
-            }
-        }
-
-        return Ok(conn);
-    }
-
-    let mut connections = ConnectionState::load_all()?;
-    if let Some(requested) = provider {
-        let requested_label = requested.label();
-        connections.retain(|conn| conn.provider == requested_label);
-    }
-
-    match connections.len() {
-        0 => anyhow::bail!("no active connections{}", provider_hint(provider)),
-        1 => Ok(connections.remove(0)),
-        _ => {
-            println!("Multiple active connections. Specify instance for hook debug:\n");
-            for conn in &connections {
-                println!(
-                    "  {:<12} {:<9} {}",
-                    conn.instance_name, conn.provider, conn.server_display_name
-                );
-            }
-            println!("\nUsage: tunmux hook debug <instance>");
-            println!("       tunmux hook debug --provider <provider>");
-            anyhow::bail!("hook debug requires an unambiguous active connection")
-        }
-    }
-}
-
-fn hook_event_label(event: HookEventArg) -> &'static str {
-    match event {
-        HookEventArg::Ifup => "ifup",
-        HookEventArg::Ifdown => "ifdown",
-    }
-}
-
-fn provider_hint(provider: Option<ProviderArg>) -> &'static str {
-    if provider.is_some() {
-        " for selected provider"
-    } else {
-        ""
     }
 }
 
@@ -448,32 +312,43 @@ fn cmd_status() -> anyhow::Result<()> {
     };
 
     let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
-    println!("{}", render_row(&header_cells).trim_end());
     println!(
         "{}",
-        widths
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("-+-")
+        color::table_frame(render_row(&header_cells).trim_end())
     );
+    let rule = widths
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    println!("{}", color::table_frame(&rule));
     for row in &rows {
         println!("{}", render_row(row).trim_end());
     }
 
-    // Beneath the summary table, print the live route/DNS overview for any
-    // userspace tunnel. The state lives in the per-interface helper's memory, so
-    // it's fetched via the privileged service (which alone can reach the helper's
-    // root-only query socket). Best-effort: a fetch failure never fails `status`.
+    // Beneath the summary table, print per-interface detail: the WireGuard
+    // tunnel state from `wg show`, and for userspace tunnels the live route/DNS
+    // overview. Both live behind the privileged service (the helper's query
+    // socket is root-only), and both are best-effort: a fetch failure prints to
+    // stderr but never fails `status`.
     let client = privileged_client::PrivilegedClient::new();
     for conn in &connections {
+        match client.wg_show(&conn.interface_name) {
+            Ok(output) if !output.trim().is_empty() => {
+                println!();
+                println!("{}", color::wg_show(output.trim_end()));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
+        }
+
         if conn.backend != wireguard::backend::WgBackend::Userspace {
             continue;
         }
         match client.network_overview(&conn.interface_name) {
             Ok(Some(overview)) => {
                 println!();
-                println!("{}", overview.trim_end());
+                println!("{}", color::tables(overview.trim_end()));
             }
             Ok(None) => {}
             Err(e) => eprintln!(
@@ -483,30 +358,6 @@ fn cmd_status() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn cmd_wg() -> anyhow::Result<()> {
-    use wireguard::connection::ConnectionState;
-
-    let connections = ConnectionState::load_all()?;
-    if connections.is_empty() {
-        println!("No active connections.");
-        return Ok(());
-    }
-
-    let mut first = true;
-    for conn in &connections {
-        if !first {
-            println!();
-        }
-        first = false;
-
-        match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
-            Ok(output) => print!("{}", output),
-            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
-        }
-    }
     Ok(())
 }
 

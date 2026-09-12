@@ -1,5 +1,4 @@
-use crate::config::{AppConfig, Provider};
-use crate::shared::hooks;
+use crate::config::Provider;
 use crate::wireguard;
 use crate::wireguard::backend::WgBackend;
 use crate::wireguard::connection::ConnectionState;
@@ -10,20 +9,10 @@ pub fn cmd_disconnect_provider(
     provider: Provider,
     instance: Option<String>,
     all: bool,
-    config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let mut disconnected = Vec::new();
-    let result = disconnect_provider_connections(provider.dir_name(), instance, all, |conn| {
-        disconnect_one_provider_connection(conn, provider, config)?;
-        disconnected.push(conn.clone());
-        Ok(())
-    });
-    // Finding 5 — Incorrect tunnel adoption and connection races: the state
-    // lock covers teardown and removal, but user hooks may recursively connect.
-    for state in disconnected {
-        hooks::run_ifdown(config, provider, &state);
-    }
-    result
+    disconnect_provider_connections(provider.dir_name(), instance, all, |conn| {
+        disconnect_one_provider_connection(conn, provider)
+    })
 }
 
 pub fn resolve_connect_backend(
@@ -122,7 +111,6 @@ where
 pub fn disconnect_one_provider_connection(
     state: &ConnectionState,
     provider: Provider,
-    _config: &AppConfig,
 ) -> anyhow::Result<()> {
     let teardown = match state.backend {
         WgBackend::Kernel => wireguard::kernel::down(state),
