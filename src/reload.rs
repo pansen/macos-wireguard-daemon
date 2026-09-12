@@ -1,10 +1,10 @@
 //! `tunmux reload`: put both launchd services back into a known-good state
-//! and bring the tunnel up again. This is the recovery path after a macOS
-//! update (which can leave the system daemon booted out or disabled) or after
-//! anything else that left tunmux behaving oddly.
+//! and bring stored connections back up. This is the recovery path after a
+//! macOS update (which can leave the system daemon booted out or disabled)
+//! or after anything else that left tunmux behaving oddly.
 //!
 //! The privileged daemon is re-registered by re-invoking this same binary
-//! under `sudo`, because the system domain needs root while the autoconnect
+//! under `sudo`, because the system domain needs root while the session
 //! agent lives in the user's GUI domain and must not be touched as root. Run
 //! the command as your normal user; only that one step escalates.
 
@@ -14,10 +14,12 @@ use std::process::Command;
 use anyhow::Context;
 use nix::unistd::geteuid;
 
-use crate::cli::{ReloadArgs, WgconfCommand};
+use crate::cli::ReloadArgs;
 use crate::config::AppConfig;
+use crate::privileged_api::ConnectionScope;
+use crate::privileged_client::PrivilegedClient;
 
-pub async fn run(args: ReloadArgs, config: &AppConfig) -> anyhow::Result<()> {
+pub async fn run(_args: ReloadArgs, _config: &AppConfig) -> anyhow::Result<()> {
     refuse_if_root()?;
 
     let exe =
@@ -28,28 +30,38 @@ pub async fn run(args: ReloadArgs, config: &AppConfig) -> anyhow::Result<()> {
 
     // Tunnels from before the reload describe a daemon and helper processes
     // that no longer exist, so drop them before the agent reconnects.
-    step("disconnecting active wgconf tunnels");
-    crate::wgconf::handlers::dispatch(
-        WgconfCommand::Disconnect {
-            instance: None,
-            all: true,
-        },
-        config,
-    )
-    .await?;
-    // The disconnect above only acts on what this process's own connection
-    // state believes is connected. Also reset the privileged daemon's own
-    // record directly, so a record left behind by a crashed or desynced
-    // prior run can't silently survive this reload.
-    if let Err(error) = crate::wgconf::handlers::force_reset_direct_interface() {
-        eprintln!("Warning: could not confirm privileged tunnel state was reset: {error:#}");
-    }
+    step("disconnecting this user's active connections");
+    disconnect_all_mine()?;
 
-    step("re-registering the autoconnect agent");
-    crate::autoconnect::reinstall(args.file, args.profile)?;
+    step("re-registering the session agent");
+    crate::session_agent::reinstall()?;
 
     println!();
     println!("tunmux reload complete. Check with: tunmux status");
+    Ok(())
+}
+
+/// Disconnect every one of the caller's currently-connected stored
+/// connections. Best-effort per connection, matching `connection disconnect
+/// --all`: one stuck connection must not abort the rest of the reload.
+fn disconnect_all_mine() -> anyhow::Result<()> {
+    let client = PrivilegedClient::new();
+    let connected: Vec<_> = client
+        .list_connections(ConnectionScope::Mine)?
+        .into_iter()
+        .filter(|conn| conn.connected)
+        .collect();
+    if connected.is_empty() {
+        println!("Not connected.");
+        return Ok(());
+    }
+    for conn in connected {
+        if let Err(error) = client.disconnect_connection(conn.id) {
+            eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id);
+            continue;
+        }
+        println!("Disconnected {}", conn.id);
+    }
     Ok(())
 }
 
@@ -82,7 +94,7 @@ fn step(what: &str) {
 }
 
 /// Bail if running as root. Two of the three steps are per-user: under sudo
-/// the disconnect would write root-owned connection state and the agent
+/// the disconnect would attribute to root's own connections and the agent
 /// install would target root's GUI domain.
 fn refuse_if_root() -> anyhow::Result<()> {
     if geteuid().is_root() {

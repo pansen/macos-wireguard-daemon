@@ -4,9 +4,8 @@
 //!
 //! Every accessor has a production entry point (using
 //! `config::privileged_runtime_dir()`) that forwards to a `..._in(root, ...)`
-//! twin taking an explicit root directory, the same pattern `tunnel_state.rs`
-//! uses, so tests can point the whole store at a temp directory without
-//! touching the real root-owned runtime dir.
+//! twin taking an explicit root directory, so tests can point the whole store
+//! at a temp directory without touching the real root-owned runtime dir.
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -367,7 +366,7 @@ pub fn load_all() -> Result<Vec<StoredConnection>> {
 }
 
 /// Look up the stored connection (if any) whose derived interface name is
-/// `interface`. Used to gate the legacy `GotaTunRun`/`WgShow`/`NetworkOverview`/
+/// `interface`. Used to gate the legacy `WgShow`/`NetworkOverview`/
 /// `InterfaceActive` ops by the same ownership rule as the connection-store
 /// ops whenever the interface they name happens to belong to one: those
 /// legacy ops predate per-connection ownership and, left ungated, would let
@@ -641,8 +640,133 @@ fn clear_active_in(root: &Path, id: ConnectionId) -> Result<()> {
     Ok(())
 }
 
+/// Whether `id` is genuinely connected right now -- not just whether an
+/// `active/<id>.json` marker exists. That marker is written under
+/// `config::privileged_runtime_dir()`, which (unlike the actual gotatun
+/// helper process and its `/var/run/wireguard/<iface>.sock`) survives a
+/// reboot or crash untouched, so a bare file-exists check would report a
+/// connection as connected forever after the machine restarts -- exactly the
+/// case boot/session reconciliation exists to fix. This mirrors the "recorded
+/// socket is gone: stale marker" branch `connection_ops::connect` already
+/// has for its own idempotency check.
 pub fn is_active(id: ConnectionId) -> Result<bool> {
-    Ok(active_path_in(&root_dir(), id).exists())
+    match load_active(id)? {
+        Some(active) => Ok(active.socket.try_exists().unwrap_or(false)),
+        None => Ok(false),
+    }
+}
+
+// ---- boot reconciliation (Phase 3) -----------------------------------------
+
+/// Boot-time reconciliation for global `Automatic` connections. Called on a
+/// background thread every time the daemon's socket listener is bound and
+/// accepting (see `mod.rs::serve`) -- but the daemon is on-demand
+/// (socket-activated, idle-exits) rather than a long-lived boot service, so
+/// that can happen many times within one machine boot, not just once. Gated
+/// by [`boot_id`] to actually run at most once per real boot: without this,
+/// an unprivileged `tunmux`-group member merely running e.g. `tunmux status`
+/// after the daemon has idled out would re-trigger a root-only
+/// `ConnectConnection` on every global `Automatic` record, silently undoing
+/// an admin's explicit `disconnect` within the idle timeout. If the boot
+/// identity can't be determined, fails open to reconciling (matching this
+/// function's behavior before the gate existed) rather than silently never
+/// reconciling. Iterating every candidate serially *before* the daemon starts
+/// serving would delay every client behind N helper-startup handshakes, so
+/// this runs after the listener is already accepting. Best-effort per
+/// connection: a broken or unreachable global config logs a warning and does
+/// not block the others or the daemon's availability. Per-user connections
+/// are out of scope here -- they are only ever brought up by that user's own
+/// session (the per-user session agent), never by the daemon at boot.
+pub fn reconcile_boot() {
+    let root = root_dir();
+    if let Some(boot_id) = boot_id() {
+        if already_reconciled_this_boot_in(&root, &boot_id) {
+            return;
+        }
+        reconcile_boot_once();
+        mark_reconciled_this_boot_in(&root, &boot_id);
+    } else {
+        tracing::warn!("boot_reconciliation_boot_id_unavailable_reconciling_anyway");
+        reconcile_boot_once();
+    }
+}
+
+fn reconcile_boot_once() {
+    let connections = match load_all() {
+        Ok(connections) => connections,
+        Err(error) => {
+            tracing::warn!(error = %error, "boot_reconciliation_listing_failed");
+            return;
+        }
+    };
+    for id in boot_reconcile_candidates(&connections) {
+        if let Err(error) = reconcile_connect(id) {
+            tracing::warn!(id = %id, error = %error, "boot_reconciliation_connect_failed");
+        }
+    }
+}
+
+fn boot_marker_path_in(root: &Path) -> PathBuf {
+    root.join("boot-reconcile.marker")
+}
+
+fn already_reconciled_this_boot_in(root: &Path, boot_id: &str) -> bool {
+    fs::read_to_string(boot_marker_path_in(root))
+        .map(|contents| contents.trim() == boot_id)
+        .unwrap_or(false)
+}
+
+fn mark_reconciled_this_boot_in(root: &Path, boot_id: &str) {
+    if let Err(error) = crate::state_file::write_atomic(&boot_marker_path_in(root), boot_id.as_bytes())
+    {
+        tracing::warn!(error = %error, "boot_reconciliation_marker_write_failed");
+    }
+}
+
+/// A value that's stable for the whole current boot session and changes
+/// across reboots (`sysctl kern.boottime`, the same mechanism `uptime` uses),
+/// used to gate [`reconcile_boot`] to run at most once per boot. `None` if
+/// the sysctl call fails for any reason.
+fn boot_id() -> Option<String> {
+    use nix::libc;
+    use std::mem;
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut boottime: libc::timeval = unsafe { mem::zeroed() };
+    let mut size = mem::size_of::<libc::timeval>();
+    // SAFETY: `mib`/`boottime`/`size` are correctly sized for a `KERN_BOOTTIME`
+    // query per `sysctl(3)`; `size` is initialized to the buffer's actual size.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            &mut boottime as *mut libc::timeval as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some(format!("{}.{}", boottime.tv_sec, boottime.tv_usec))
+}
+
+/// Which stored connections boot reconciliation should attempt to bring up:
+/// global, `Automatic`, and not already active. Split out from
+/// [`reconcile_boot`] so the selection criteria can be unit tested without
+/// touching the real network/gotatun layer.
+fn boot_reconcile_candidates(connections: &[StoredConnection]) -> Vec<ConnectionId> {
+    connections
+        .iter()
+        .filter(|c| c.global && c.start_mode == ConnectionStartMode::Automatic)
+        .filter(|c| !is_active(c.id).unwrap_or(false))
+        .map(|c| c.id)
+        .collect()
+}
+
+fn reconcile_connect(id: ConnectionId) -> Result<()> {
+    let conn_lock = lock_connection(id)?;
+    super::connection_ops::connect(&conn_lock, id, false)
 }
 
 #[cfg(test)]
@@ -858,6 +982,107 @@ mod tests {
         assert_eq!(loaded.interface, state.interface);
         clear_active_in(&root, id).unwrap();
         assert!(load_active_in(&root, id).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn boot_reconcile_candidates_selects_only_global_automatic_and_inactive() {
+        let root = temp_root("boot-candidates");
+        set_test_root(root.clone());
+
+        let global_auto = ConnectionId::new();
+        let mut c1 = sample(global_auto, true, None);
+        c1.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &c1).unwrap();
+
+        let global_manual = ConnectionId::new();
+        save_in(&root, &sample(global_manual, true, None)).unwrap();
+
+        let user_auto = ConnectionId::new();
+        let mut c3 = sample(user_auto, false, Some(501));
+        c3.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &c3).unwrap();
+
+        // Genuinely active: the recorded socket actually exists, so `is_active`
+        // (which now verifies that, not just the marker file -- see its doc
+        // comment) correctly excludes it.
+        let global_auto_active = ConnectionId::new();
+        let mut c4 = sample(global_auto_active, true, None);
+        c4.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &c4).unwrap();
+        let live_socket = root.join("live.sock");
+        fs::write(&live_socket, b"").unwrap();
+        save_active_in(
+            &root,
+            global_auto_active,
+            &ActiveConnectionState {
+                fingerprint: c4.fingerprint.clone(),
+                interface: c4.interface.clone(),
+                socket: live_socket,
+                device: 0,
+                inode: 0,
+                changed_sec: 0,
+                changed_nsec: 0,
+                connected_at: now_unix(),
+            },
+        )
+        .unwrap();
+
+        let connections = load_all_in(&root).unwrap();
+        let candidates = boot_reconcile_candidates(&connections);
+        assert_eq!(candidates, vec![global_auto]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn is_active_treats_a_stale_marker_with_a_missing_socket_as_inactive() {
+        // Regression test: `active/<id>.json` is written under the
+        // privileged runtime dir, which survives a reboot untouched, while
+        // the real gotatun helper and its UAPI socket do not. Without this,
+        // a connection that was up when the machine last shut down would
+        // report `connected` forever and never be a boot/session
+        // reconciliation candidate again.
+        let root = temp_root("stale-active-after-reboot");
+        set_test_root(root.clone());
+        let id = ConnectionId::new();
+        save_active_in(
+            &root,
+            id,
+            &ActiveConnectionState {
+                fingerprint: "sha256:whatever".to_string(),
+                interface: id.interface_name(),
+                socket: root.join("gone.sock"), // never created
+                device: 0,
+                inode: 0,
+                changed_sec: 0,
+                changed_nsec: 0,
+                connected_at: now_unix(),
+            },
+        )
+        .unwrap();
+
+        assert!(!is_active(id).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_boot_does_not_panic_with_a_corrupt_record_present() {
+        let root = temp_root("boot-smoke");
+        set_test_root(root.clone());
+
+        let global_auto = ConnectionId::new();
+        let mut c1 = sample(global_auto, true, None);
+        c1.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &c1).unwrap();
+
+        fs::write(connections_dir_in(&root).join("garbage.json"), b"not json").unwrap();
+
+        // Must not panic: the corrupt record is skipped by `load_all`'s
+        // existing best-effort behavior, and the real one is attempted (and,
+        // without real gotatun/root privileges in a test process, expected to
+        // fail fast rather than hang or block the caller indefinitely).
+        reconcile_boot();
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -18,32 +18,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum TopCommand {
-    /// WireGuard config file/profile commands
-    Wgconf {
-        #[command(subcommand)]
-        command: WgconfCommand,
-    },
-
-    /// Connect to a VPN server (`tunmux connect <provider> ...`)
-    Connect {
-        #[command(subcommand)]
-        provider: ConnectProviderCommand,
-    },
-
-    /// Disconnect VPN connection(s)
-    Disconnect {
-        /// Instance name to disconnect (from `tunmux status`)
-        instance: Option<String>,
-
-        /// Provider to scope disconnect operations
-        #[arg(short = 'p', long, value_enum)]
-        provider: Option<ProviderArg>,
-
-        /// Disconnect all active connections (all providers unless --provider is set)
-        #[arg(short = 'a', long, conflicts_with = "instance")]
-        all: bool,
-    },
-
     /// Show active VPN connections, including WireGuard tunnel state
     Status,
 
@@ -53,26 +27,20 @@ pub enum TopCommand {
         command: LaunchdCommand,
     },
 
-    /// Manage the per-user autoconnect LaunchAgent (GUI domain)
-    Autoconnect {
-        #[command(subcommand)]
-        command: AutoconnectCommand,
-    },
-
-    /// Manage privileged connection-store records (new multi-connection
-    /// backend; CLI surface still minimal while the wgconf commands above
-    /// remain the primary way to connect/disconnect)
+    /// Manage privileged connection-store records: add/list/remove stored
+    /// WireGuard configs and connect/disconnect them, plus the per-user
+    /// session-reconciliation agent (`connection agent ...`)
     Connection {
         #[command(subcommand)]
         command: ConnectionCommand,
     },
 
-    /// Re-bootstrap both launchd services and bring the tunnel back up
+    /// Re-bootstrap both launchd services and bring stored connections back up
     ///
     /// Runs, in order:
-    ///   sudo tunmux launchd install   (re-registers the privileged daemon)
-    ///   tunmux disconnect --all       (drops tunnels left over from before)
-    ///   tunmux autoconnect install -f (re-registers the agent, reconnects)
+    ///   sudo tunmux launchd install         (re-registers the privileged daemon)
+    ///   tunmux connection disconnect --all  (drops tunnels left over from before)
+    ///   tunmux connection agent install -f  (re-registers the session agent, reconnects)
     ///
     /// Run as your normal user; only the daemon step escalates via sudo.
     /// Logs at debug level unless -s is given.
@@ -129,29 +97,10 @@ pub enum LaunchdCommand {
     Uninstall,
 }
 
-#[derive(Subcommand)]
-pub enum AutoconnectCommand {
-    /// Install and start the per-user autoconnect LaunchAgent (run WITHOUT sudo)
-    Install {
-        /// WireGuard .conf file path
-        #[arg(long, required_unless_present = "profile", conflicts_with = "profile")]
-        file: Option<String>,
-
-        /// Saved profile name
-        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
-        profile: Option<String>,
-
-        /// Overwrite and reload an existing installation
-        #[arg(short = 'f', long)]
-        force: bool,
-    },
-    /// List installed autoconnect LaunchAgent files (alias: ls)
-    #[command(visible_alias = "ls")]
-    List,
-    /// Reload (kickstart) the autoconnect LaunchAgent
-    Reload,
-    /// Stop and unregister the autoconnect LaunchAgent
-    Uninstall,
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum StartModeArg {
+    Manual,
+    Automatic,
 }
 
 #[derive(Subcommand)]
@@ -193,6 +142,13 @@ pub enum ConnectionCommand {
         /// same-named connection exists yet.
         #[arg(long, requires = "name")]
         force: bool,
+
+        /// Bring this connection up automatically (global: at daemon boot;
+        /// per-user: on login via `connection agent`). Defaults to manual.
+        /// Setting a *global* connection's mode to automatic (whether here
+        /// or via `connection mode`) requires admin authentication.
+        #[arg(long, value_enum, default_value_t = StartModeArg::Manual)]
+        start_mode: StartModeArg,
     },
 
     /// List stored connections (alias: ls)
@@ -212,112 +168,93 @@ pub enum ConnectionCommand {
         /// Connection id, as printed by `add` or `list`
         id: String,
     },
+
+    /// Bring a stored connection up
+    Connect {
+        /// Connection id, as printed by `add` or `list`
+        id: String,
+
+        /// Enable gotatun debug logging for this connect
+        #[arg(long = "gotatun-debug")]
+        debug: bool,
+    },
+
+    /// Tear a stored connection down
+    Disconnect {
+        /// Connection id, as printed by `add` or `list`
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+
+        /// Disconnect every one of the caller's currently-connected connections
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
+
+    /// Set a stored connection's start mode
+    ///
+    /// Setting a *global* connection from manual to automatic requires
+    /// admin authentication (it's what makes a hook-bearing config
+    /// auto-run as root at every future boot). Every other transition
+    /// (per-user, or downgrading global back to manual) proceeds on
+    /// ownership alone.
+    #[command(verbatim_doc_comment)]
+    Mode {
+        /// Connection id, as printed by `add` or `list`
+        id: String,
+
+        /// New start mode
+        #[arg(value_enum)]
+        start_mode: StartModeArg,
+    },
+
+    /// Show full detail for one stored connection (owner or root only)
+    Get {
+        /// Connection id, as printed by `add` or `list`
+        id: String,
+    },
+
+    /// Manage the per-user session-reconciliation LaunchAgent
+    ///
+    /// Installs a long-lived, per-user LaunchAgent that connects this
+    /// user's `automatic` connections on login and disconnects them again
+    /// on logout, so a per-user tunnel never outlives the session that
+    /// started it.
+    #[command(verbatim_doc_comment)]
+    Agent {
+        #[command(subcommand)]
+        command: ConnectionAgentCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConnectionAgentCommand {
+    /// Install and start the per-user session-reconciliation LaunchAgent (run WITHOUT sudo)
+    Install {
+        /// Overwrite and reload an existing installation
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+    /// Show whether the session agent is installed/loaded
+    Status,
+    /// Stop and unregister the session agent
+    Uninstall,
+    /// Internal: the long-lived agent body launchd actually executes (hidden)
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Args, Clone)]
 pub struct ReloadArgs {
-    /// WireGuard .conf file the autoconnect agent should use. Defaults to the
-    /// source of the installed agent, so an existing setup needs no argument.
-    #[arg(long, conflicts_with = "profile")]
-    pub file: Option<String>,
-
-    /// Saved profile the autoconnect agent should use. Defaults to the source
-    /// of the installed agent.
-    #[arg(long, conflicts_with = "file")]
-    pub profile: Option<String>,
-
     /// Log at the usual level instead of debug, leaving only the step headers
     /// and anything the steps report at info level or above.
     #[arg(short = 's', long, conflicts_with = "verbose")]
     pub silent: bool,
 }
 
-pub type ProviderArg = crate::config::Provider;
-
-#[derive(Subcommand)]
-pub enum ConnectProviderCommand {
-    /// Connect using a WireGuard config file/profile
-    Wgconf(WgconfConnectArgs),
-}
-
-#[derive(Args, Clone)]
-pub struct WgconfConnectArgs {
-    /// WireGuard .conf file path
-    #[arg(long, required_unless_present = "profile", conflicts_with = "profile")]
-    pub file: Option<String>,
-
-    /// Saved profile name
-    #[arg(long, required_unless_present = "file", conflicts_with = "file")]
-    pub profile: Option<String>,
-
-    /// Save loaded config as a reusable profile name
-    #[arg(long)]
-    pub save_as: Option<String>,
-
-    /// WireGuard backend: userspace, kernel
-    #[arg(short = 'b', long)]
-    pub backend: Option<String>,
-
-    /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
-    #[arg(long)]
-    pub disable_ipv6: bool,
-
-    /// Set WireGuard interface MTU (direct kernel or userspace mode)
-    #[arg(long)]
-    pub mtu: Option<u16>,
-
-    /// Exit 0 without reconnecting if this same source is already the live tunnel
-    /// (direct mode). A different live source still errors. Checks presence only,
-    /// not whether the config changed on disk.
-    #[arg(long)]
-    pub if_missing: bool,
-}
-
-#[derive(Subcommand)]
-pub enum WgconfCommand {
-    /// Connect from a WireGuard config file or saved profile
-    Connect(WgconfConnectArgs),
-
-    /// Disconnect from VPN
-    Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
-        instance: Option<String>,
-
-        /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long, conflicts_with = "instance")]
-        all: bool,
-    },
-
-    /// Show wgconf connection status (and `wg show` transfer/handshake)
-    Status,
-
-    /// Save a WireGuard config file as a named profile
-    Save {
-        /// WireGuard .conf file path
-        #[arg(long)]
-        file: String,
-
-        /// Profile name
-        #[arg(long)]
-        name: String,
-    },
-
-    /// List saved profiles
-    List,
-
-    /// Remove a saved profile
-    Remove {
-        /// Profile name
-        name: String,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoconnectCommand, Cli, ConnectProviderCommand, ConnectionCommand, LaunchdCommand,
-        ProviderArg, TopCommand, WgconfCommand,
+        Cli, ConnectionAgentCommand, ConnectionCommand, LaunchdCommand, StartModeArg, TopCommand,
     };
     use clap::Parser;
 
@@ -330,119 +267,6 @@ mod tests {
         let after = Cli::try_parse_from(["tunmux", "status", "--debug"])
             .expect("parse debug after command");
         assert!(after.verbose);
-    }
-
-    #[test]
-    fn parse_connect_wgconf_with_file() {
-        let cli = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/test.conf",
-            "--backend",
-            "userspace",
-            "--disable-ipv6",
-        ])
-        .expect("parse connect wgconf file");
-
-        match cli.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Wgconf(args),
-            } => assert!(args.disable_ipv6),
-            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[test]
-    fn parse_connect_wgconf_with_profile() {
-        let cli = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--profile",
-            "work",
-            "--save-as",
-            "saved-work",
-        ])
-        .expect("parse connect wgconf profile");
-
-        match cli.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Wgconf(args),
-            } => {
-                assert_eq!(args.profile.as_deref(), Some("work"));
-                assert_eq!(args.save_as.as_deref(), Some("saved-work"));
-            }
-            _ => panic!("expected wgconf connect provider"),
-        }
-    }
-
-    #[test]
-    fn parse_connect_wgconf_requires_exactly_one_source() {
-        let missing = Cli::try_parse_from(["tunmux", "connect", "wgconf"]);
-        assert!(missing.is_err());
-
-        let both = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/a.conf",
-            "--profile",
-            "a",
-        ]);
-        assert!(both.is_err());
-    }
-
-    #[test]
-    fn parse_provider_prefixed_wgconf_commands() {
-        let cli = Cli::try_parse_from(["tunmux", "wgconf", "connect", "--profile", "home"])
-            .expect("parse wgconf connect");
-        match cli.command {
-            TopCommand::Wgconf {
-                command: WgconfCommand::Connect(args),
-            } => assert_eq!(args.profile.as_deref(), Some("home")),
-            _ => panic!("expected wgconf connect command"),
-        }
-
-        let cli = Cli::try_parse_from(["tunmux", "disconnect", "--provider", "wgconf"])
-            .expect("parse disconnect provider wgconf");
-        match cli.command {
-            TopCommand::Disconnect {
-                provider: Some(ProviderArg::Wgconf),
-                ..
-            } => {}
-            _ => panic!("expected disconnect provider wgconf"),
-        }
-    }
-
-    #[test]
-    fn parse_mtu_for_wgconf_connect_command() {
-        let wgconf = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/test.conf",
-            "--backend",
-            "kernel",
-            "--mtu",
-            "1360",
-        ])
-        .expect("parse wgconf mtu");
-        match wgconf.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Wgconf(args),
-            } => assert_eq!(args.mtu, Some(1360)),
-            _ => panic!("expected wgconf connect provider"),
-        }
-    }
-
-    #[test]
-    fn parse_provider_disconnect_rejects_instance_with_all() {
-        let wgconf = Cli::try_parse_from(["tunmux", "wgconf", "disconnect", "x", "--all"]);
-        assert!(wgconf.is_err());
     }
 
     #[test]
@@ -497,127 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_autoconnect_install_with_file() {
-        let cli =
-            Cli::try_parse_from(["tunmux", "autoconnect", "install", "--file", "/tmp/x.conf"])
-                .expect("parse autoconnect install --file");
-
-        match cli.command {
-            TopCommand::Autoconnect {
-                command:
-                    AutoconnectCommand::Install {
-                        file,
-                        profile,
-                        force,
-                    },
-            } => {
-                assert_eq!(file.as_deref(), Some("/tmp/x.conf"));
-                assert!(profile.is_none());
-                assert!(!force);
-            }
-            _ => panic!("expected autoconnect install command"),
-        }
-    }
-
-    #[test]
-    fn parse_autoconnect_install_with_profile_and_force() {
-        let cli = Cli::try_parse_from([
-            "tunmux",
-            "autoconnect",
-            "install",
-            "--profile",
-            "work",
-            "--force",
-        ])
-        .expect("parse autoconnect install --profile --force");
-
-        match cli.command {
-            TopCommand::Autoconnect {
-                command:
-                    AutoconnectCommand::Install {
-                        file,
-                        profile,
-                        force,
-                    },
-            } => {
-                assert!(file.is_none());
-                assert_eq!(profile.as_deref(), Some("work"));
-                assert!(force);
-            }
-            _ => panic!("expected autoconnect install command"),
-        }
-    }
-
-    #[test]
-    fn parse_autoconnect_install_requires_exactly_one_source() {
-        let missing = Cli::try_parse_from(["tunmux", "autoconnect", "install"]);
-        assert!(missing.is_err());
-
-        let both = Cli::try_parse_from([
-            "tunmux",
-            "autoconnect",
-            "install",
-            "--file",
-            "/tmp/a.conf",
-            "--profile",
-            "a",
-        ]);
-        assert!(both.is_err());
-    }
-
-    #[test]
-    fn parse_autoconnect_reload_and_uninstall() {
-        for (arg, want) in [
-            (
-                "reload",
-                std::mem::discriminant(&AutoconnectCommand::Reload),
-            ),
-            (
-                "uninstall",
-                std::mem::discriminant(&AutoconnectCommand::Uninstall),
-            ),
-        ] {
-            let cli =
-                Cli::try_parse_from(["tunmux", "autoconnect", arg]).expect("parse autoconnect");
-            match cli.command {
-                TopCommand::Autoconnect { command } => {
-                    assert_eq!(std::mem::discriminant(&command), want)
-                }
-                _ => panic!("expected autoconnect command"),
-            }
-        }
-    }
-
-    #[test]
-    fn parse_reload_with_optional_source() {
-        let bare = Cli::try_parse_from(["tunmux", "reload"]).expect("parse bare reload");
-        match bare.command {
-            TopCommand::Reload(args) => {
-                assert!(args.file.is_none());
-                assert!(args.profile.is_none());
-            }
-            _ => panic!("expected reload command"),
-        }
-
-        let with_profile =
-            Cli::try_parse_from(["tunmux", "reload", "--profile", "work"]).expect("parse reload");
-        match with_profile.command {
-            TopCommand::Reload(args) => assert_eq!(args.profile.as_deref(), Some("work")),
-            _ => panic!("expected reload command"),
-        }
-
-        let both = Cli::try_parse_from([
-            "tunmux",
-            "reload",
-            "--file",
-            "/tmp/a.conf",
-            "--profile",
-            "work",
-        ]);
-        assert!(both.is_err());
-    }
-
-    #[test]
     fn parse_reload_silent_flag() {
         let bare = Cli::try_parse_from(["tunmux", "reload"]).expect("parse bare reload");
         match bare.command {
@@ -635,21 +338,6 @@ mod tests {
 
         // Asking for both quiet and verbose has no sensible reading.
         assert!(Cli::try_parse_from(["tunmux", "reload", "-s", "-v"]).is_err());
-    }
-
-    #[test]
-    fn parse_autoconnect_list_and_ls_alias() {
-        for arg in ["list", "ls"] {
-            let cli = Cli::try_parse_from(["tunmux", "autoconnect", arg])
-                .expect("parse autoconnect list");
-            match cli.command {
-                TopCommand::Autoconnect { command } => assert_eq!(
-                    std::mem::discriminant(&command),
-                    std::mem::discriminant(&AutoconnectCommand::List)
-                ),
-                _ => panic!("expected autoconnect list command"),
-            }
-        }
     }
 
     #[test]
@@ -675,6 +363,7 @@ mod tests {
                     name,
                     mtu,
                     force,
+                    start_mode,
                 },
             } => {
                 assert_eq!(file, "/tmp/test.conf");
@@ -682,8 +371,139 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("direct"));
                 assert_eq!(mtu, Some(1360));
                 assert!(!force);
+                assert!(matches!(start_mode, StartModeArg::Manual));
             }
             _ => panic!("expected connection add command"),
+        }
+    }
+
+    #[test]
+    fn parse_connection_add_start_mode_automatic() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "add",
+            "--file",
+            "/tmp/test.conf",
+            "--start-mode",
+            "automatic",
+        ])
+        .expect("parse connection add --start-mode automatic");
+
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Add { start_mode, .. },
+            } => assert!(matches!(start_mode, StartModeArg::Automatic)),
+            _ => panic!("expected connection add command"),
+        }
+    }
+
+    #[test]
+    fn parse_connection_connect_and_disconnect() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "connect",
+            "some-id",
+            "--gotatun-debug",
+        ])
+        .expect("parse connection connect");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Connect { id, debug },
+            } => {
+                assert_eq!(id, "some-id");
+                assert!(debug);
+            }
+            _ => panic!("expected connection connect command"),
+        }
+
+        let cli = Cli::try_parse_from(["tunmux", "connection", "disconnect", "some-id"])
+            .expect("parse connection disconnect by id");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Disconnect { id, all },
+            } => {
+                assert_eq!(id.as_deref(), Some("some-id"));
+                assert!(!all);
+            }
+            _ => panic!("expected connection disconnect command"),
+        }
+
+        let cli = Cli::try_parse_from(["tunmux", "connection", "disconnect", "--all"])
+            .expect("parse connection disconnect --all");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Disconnect { id, all },
+            } => {
+                assert!(id.is_none());
+                assert!(all);
+            }
+            _ => panic!("expected connection disconnect command"),
+        }
+
+        assert!(Cli::try_parse_from(["tunmux", "connection", "disconnect"]).is_err());
+        assert!(Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "disconnect",
+            "some-id",
+            "--all"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parse_connection_mode_and_get() {
+        let cli = Cli::try_parse_from(["tunmux", "connection", "mode", "some-id", "automatic"])
+            .expect("parse connection mode");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Mode { id, start_mode },
+            } => {
+                assert_eq!(id, "some-id");
+                assert!(matches!(start_mode, StartModeArg::Automatic));
+            }
+            _ => panic!("expected connection mode command"),
+        }
+
+        let cli = Cli::try_parse_from(["tunmux", "connection", "get", "some-id"])
+            .expect("parse connection get");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Get { id },
+            } => assert_eq!(id, "some-id"),
+            _ => panic!("expected connection get command"),
+        }
+    }
+
+    #[test]
+    fn parse_connection_agent_subcommands() {
+        for (args, want) in [
+            (
+                vec!["tunmux", "connection", "agent", "install"],
+                std::mem::discriminant(&ConnectionAgentCommand::Install { force: false }),
+            ),
+            (
+                vec!["tunmux", "connection", "agent", "status"],
+                std::mem::discriminant(&ConnectionAgentCommand::Status),
+            ),
+            (
+                vec!["tunmux", "connection", "agent", "uninstall"],
+                std::mem::discriminant(&ConnectionAgentCommand::Uninstall),
+            ),
+            (
+                vec!["tunmux", "connection", "agent", "run"],
+                std::mem::discriminant(&ConnectionAgentCommand::Run),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse connection agent subcommand");
+            match cli.command {
+                TopCommand::Connection {
+                    command: ConnectionCommand::Agent { command },
+                } => assert_eq!(std::mem::discriminant(&command), want),
+                _ => panic!("expected connection agent command"),
+            }
         }
     }
 

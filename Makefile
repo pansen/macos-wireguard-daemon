@@ -1,4 +1,6 @@
-# Path to the WireGuard profile the login autoconnect agent connects with.
+# Path to the WireGuard profile `make install` stores as this user's
+# Automatic connection; the session agent itself just reconnects whatever is
+# currently stored that way, not this variable.
 # Override on other machines/users: make install TUNMUX_PROFILE=/path/to/your.conf
 TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
 
@@ -22,37 +24,45 @@ install/privileged: install/binary
 
 .PHONY: install/connection
 install/connection:
-	@# Exercises the new privileged connection-store RPCs (AddConnection,
-	@# and RemoveConnection via --force) for real against the daemon `reload`
-	@# just re-registered, instead of only through unit tests. Per-user (no
-	@# --global), matching the autoconnect agent's own per-user model below.
-	@# Fingerprint identity is separate from --name: --force removes any
-	@# older "direct" record left over from a previous, since-edited profile
-	@# so repeated installs don't accumulate stale connections. An unmodified
-	@# re-run of `make install` is a silent no-op either way. A genuinely
-	@# new/changed config triggers a macOS admin-authentication prompt
-	@# (password or Touch ID) for the add and, if there was a stale record to
-	@# clean up, a second one for that removal.
-	/usr/local/bin/tunmux connection add --file $(TUNMUX_PROFILE) --name direct --force
+	@# Exercises the privileged connection-store RPCs (AddConnection,
+	@# ConnectConnection, and RemoveConnection via --force) for real against
+	@# the daemon `reload` just re-registered, instead of only through unit
+	@# tests. Per-user (no --global), matching the session agent's own
+	@# per-user model below. --start-mode automatic means this user's session
+	@# agent reconnects it on every future login. Fingerprint identity is
+	@# separate from --name: --force removes any older "direct" record left
+	@# over from a previous, since-edited profile so repeated installs don't
+	@# accumulate stale connections. An unmodified re-run of `make install` is
+	@# a silent no-op either way. A genuinely new/changed config triggers a
+	@# macOS admin-authentication prompt (password or Touch ID) for the add
+	@# and, if there was a stale record to clean up, a second one for that
+	@# removal.
+	@id=$$(/usr/local/bin/tunmux connection add --file $(TUNMUX_PROFILE) --name direct --force --start-mode automatic | sed -n 's/^Connection id: //p'); \
+	echo "==> connection id: $$id"; \
+	/usr/local/bin/tunmux connection connect "$$id"
 
 .PHONY: install
 install: build.release install/binary
-	@# `tunmux reload` registers the privileged daemon (escalating on its own)
-	@# and the autoconnect agent; --file seeds the agent on a first install.
-	/usr/local/bin/tunmux reload --file $(TUNMUX_PROFILE)
+	@# `tunmux reload` registers the privileged daemon (escalating on its own),
+	@# drops any leftover tunnels, and re-registers the session agent -- do
+	@# not re-run `connection agent install` after `install/connection`
+	@# below: that would SIGTERM the instance `reload` just started (bootout
+	@# before bootstrap), disconnecting the connection `install/connection`
+	@# only just brought up, for no benefit.
+	/usr/local/bin/tunmux reload
 	$(MAKE) install/connection
 
 
 .PHONY: reload
 reload:
-	@# Re-registers both launchd services and reconnects, keeping whatever
-	@# profile the installed autoconnect agent was set up with.
+	@# Re-registers both launchd services and reconnects this user's
+	@# `automatic` connections.
 	/usr/local/bin/tunmux reload
 
 
 .PHONY: uninstall/autostart
 uninstall/autostart:
-	/usr/local/bin/tunmux autoconnect uninstall
+	/usr/local/bin/tunmux connection agent uninstall
 
 .PHONY: uninstall/dns
 uninstall/dns:
@@ -82,7 +92,7 @@ uninstall/privileged: build.release
 purge/privileged: uninstall/privileged
 	@# Destructive: after unregistering the daemon, remove the binary, all data,
 	@# logs, and the tunmux group.
-	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
+	sudo pkill -f '/usr/local/bin/tunmux connection agent run' 2>/dev/null || true
 	sudo rm -f /usr/local/bin/tunmux
 	sudo rm -rf "/Library/Application Support/tunmux"
 	sudo rm -rf /var/log/tunmux

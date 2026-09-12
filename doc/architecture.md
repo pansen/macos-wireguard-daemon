@@ -1,5 +1,16 @@
 # Architecture: how the pieces fit together
 
+> **Stale as of the connection-store migration (see
+> `doc/connection-store-plan.md`).** This document predates Phases 3-5:
+> `wgconf`/`connect`/`disconnect`/`autoconnect`, `GotaTunRun`, `ConnectionState`,
+> and the kernel backend it describes below have all been removed and replaced
+> by the privileged connection store (`tunmux connection add/connect/disconnect/
+> remove/agent`). The privileged-service role, socket transport, and
+> single-binary-three-roles structure it describes are still accurate; the CLI
+> command flow and sequence diagrams below are not. Not rewritten here to keep
+> this addendum from ballooning further — treat the plan doc as authoritative
+> for anything connection-related.
+
 **Scope:** the whole `tunmux` binary, all three roles it runs in.
 
 One binary, three roles. Which role a process takes is decided in

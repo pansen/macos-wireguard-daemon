@@ -12,20 +12,12 @@ use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, GotaTunAction,
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
     PrivilegedRequest, PrivilegedResponse,
 };
 
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
-
-/// Whether an error from a `PrivilegedClient` call is a transient
-/// transport/cold-start error worth retrying, as opposed to an authoritative
-/// failure. Exposed for callers outside this module (e.g.
-/// `wireguard::userspace`) that implement their own retry/settle loops.
-pub(crate) fn is_retryable_transport_error(err: &AppError) -> bool {
-    is_transport_error(err)
-}
 
 pub struct PrivilegedClient {
     socket_path: PathBuf,
@@ -153,22 +145,6 @@ impl PrivilegedClient {
         }
     }
 
-    pub fn gotatun_run(
-        &self,
-        action: GotaTunAction,
-        interface: &str,
-        config_content: &str,
-        mtu_override: Option<u16>,
-    ) -> Result<()> {
-        self.send_unit(PrivilegedRequest::GotaTunRun {
-            action,
-            interface: interface.to_string(),
-            config_content: config_content.to_string(),
-            mtu_override,
-            debug: crate::logging::debug_enabled(),
-        })
-    }
-
     /// Run `wg show <interface>` as root and return the output.
     /// Works for both kernel and userspace (gotatun) backends.
     #[allow(dead_code)]
@@ -202,6 +178,7 @@ impl PrivilegedClient {
     /// `interface` exists. Used for liveness checks that would otherwise be
     /// permission-blind from an unprivileged caller (the socket dir is
     /// `0750 root:daemon`).
+    #[allow(dead_code)]
     pub fn interface_active(&self, interface: &str) -> Result<bool> {
         match self.send(PrivilegedRequest::InterfaceActive {
             interface: interface.to_string(),
@@ -260,12 +237,10 @@ pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
     /// Bring up a stored connection. Ownership-gated only (see the design
     /// plan's authorization section) -- no admin-auth prompt for connecting
     /// an already-vetted connection.
-#[allow(dead_code)]
     pub fn connect_connection(&self, id: ConnectionId, debug: bool) -> Result<()> {
         self.send_unit(PrivilegedRequest::ConnectConnection { id, debug })
     }
 
-#[allow(dead_code)]
     pub fn disconnect_connection(&self, id: ConnectionId) -> Result<()> {
         self.send_unit(PrivilegedRequest::DisconnectConnection { id })
     }
@@ -273,7 +248,6 @@ pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
     /// Change a stored connection's start mode. Only transitions a global
     /// connection from `Manual` to `Automatic` require admin authentication
     /// (see the design plan); every other transition is ownership-gated.
-#[allow(dead_code)]
     pub fn set_connection_mode(&self, id: ConnectionId, start_mode: ConnectionStartMode) -> Result<()> {
         self.send_with_admin_auth_retry(|auth_external_form| PrivilegedRequest::SetConnectionMode {
             id,
@@ -283,7 +257,7 @@ pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
         .map(|_| ())
     }
 
-pub fn list_connections(&self, scope: ConnectionScope) -> Result<Vec<ConnectionSummary>> {
+    pub fn list_connections(&self, scope: ConnectionScope) -> Result<Vec<ConnectionSummary>> {
         match self.send(PrivilegedRequest::ListConnections { scope })? {
             PrivilegedResponse::ConnectionList(list) => Ok(list),
             _ => Err(AppError::Other(
@@ -292,7 +266,6 @@ pub fn list_connections(&self, scope: ConnectionScope) -> Result<Vec<ConnectionS
         }
     }
 
-#[allow(dead_code)]
     pub fn get_connection(&self, id: ConnectionId) -> Result<ConnectionSummary> {
         match self.send(PrivilegedRequest::GetConnection { id })? {
             PrivilegedResponse::Connection(summary) => Ok(summary),

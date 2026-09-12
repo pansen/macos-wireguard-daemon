@@ -3,12 +3,6 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GotaTunAction {
-    Up,
-    Down,
-}
-
 /// Opaque, randomly generated identity for a stored connection (see
 /// `privileged::connection_store`). Never derived from caller input --
 /// `AddConnection` is the only place one is minted, and interface names are
@@ -112,16 +106,6 @@ pub struct PeerSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrivilegedRequest {
-    GotaTunRun {
-        action: GotaTunAction,
-        interface: String,
-        config_content: String,
-        #[serde(default)]
-        mtu_override: Option<u16>,
-        #[serde(default)]
-        debug: bool,
-    },
-
     LeaseAcquire {
         token: String,
     },
@@ -228,8 +212,7 @@ pub enum PrivilegedResponse {
 pub const MAX_CONF_TEXT_BYTES: usize = 64 * 1024;
 
 /// Charset/length rule shared by every user-supplied *name* this API
-/// accepts (a connection's `name` here; previously duplicated as
-/// `wgconf::handlers::validate_profile_name`, which now delegates here).
+/// accepts (a connection's `name` here).
 pub(crate) fn validate_name_charset(name: &str, max_len: usize) -> Result<(), String> {
     if name.is_empty() {
         return Err("name cannot be empty".into());
@@ -251,22 +234,6 @@ pub(crate) fn validate_name_charset(name: &str, max_len: usize) -> Result<(), St
 impl PrivilegedRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::GotaTunRun {
-                action,
-                interface,
-                config_content,
-                mtu_override,
-                ..
-            } => {
-                validate_interface_name(interface)?;
-                if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
-                    return Err("config_content cannot be empty".into());
-                }
-                if let Some(mtu) = mtu_override {
-                    crate::wireguard::config::validate_mtu(*mtu).map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            }
             Self::LeaseAcquire { token } | Self::LeaseRelease { token } => {
                 validate_lease_token(token)
             }

@@ -10,12 +10,6 @@ use std::time::{Duration, Instant};
 /// How often a bounded acquisition retries a contended lock.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// The descriptor owns the advisory lock; dropping it releases the lock even
-/// on an error. Keep the lock file in place so all processes lock the same inode.
-pub fn lock(path: &Path) -> io::Result<File> {
-    acquire(path, None)
-}
-
 /// Same lock, but give up after `wait` with [`io::ErrorKind::WouldBlock`].
 ///
 /// The privileged service runs its dispatcher on the same thread that accepts
@@ -87,7 +81,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tunmux-lock-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("busy.lock");
-        let held = lock(&path).unwrap();
+        let held = acquire(&path, None).unwrap();
         let started = Instant::now();
         let error = lock_with_timeout(&path, Duration::from_millis(80)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);

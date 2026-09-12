@@ -20,15 +20,15 @@ fn socket_path(interface: &str) -> PathBuf {
     Path::new(SOCK_DIR).join(format!("{interface}.sock"))
 }
 
-/// The same lock `dispatch.rs` takes around `GotaTunRun` (Finding 5): the
-/// gotatun helper's setup/teardown mutates machine-global state (default
-/// route pinning, DNS via `networksetup` on whichever service currently owns
-/// resolution), not anything scoped to one interface, so two bring-ups/
-/// teardowns running at once -- across different connections, or against a
-/// concurrent legacy `GotaTunRun` -- can still corrupt each other's captured
-/// "previous state" or clobber each other's route/DNS changes. Per-connection
-/// locks alone do not prevent that; this does. Taken here, on the worker
-/// thread `dispatch.rs` spawns for `Connect`/`Disconnect`, not on the accept
+/// Finding 5: the gotatun helper's setup/teardown mutates machine-global
+/// state (default route pinning, DNS via `networksetup` on whichever service
+/// currently owns resolution), not anything scoped to one interface, so two
+/// bring-ups/teardowns running at once across different connections can still
+/// corrupt each other's captured "previous state" or clobber each other's
+/// route/DNS changes. Per-connection locks alone do not prevent that; this
+/// does. Taken here, on the worker thread `dispatch.rs` spawns for
+/// `Connect`/`Disconnect` (and on the boot/session reconciliation threads
+/// that call into this same `connect`/`disconnect`), not on the accept
 /// thread, so the daemon keeps serving other clients while this waits.
 fn lock_system_network_mutation() -> Result<std::fs::File> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

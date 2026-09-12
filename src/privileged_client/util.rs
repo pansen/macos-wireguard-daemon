@@ -22,7 +22,6 @@ pub(crate) fn shell_quote(value: &str) -> String {
 
 pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
     match request {
-        PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",

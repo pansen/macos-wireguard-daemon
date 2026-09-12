@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>me.pansen.tunmux.session-agent</string>
+
+    <!-- `connection agent run` is long-lived: it reconciles this user's
+         Automatic connections on start, then blocks on SIGTERM and
+         disconnects them again before exiting. launchd sends SIGTERM to
+         Aqua-session agents at logout, so this covers logout -- it does NOT
+         cover fast user switching (switching sessions does not terminate the
+         other session's agents), so a tunnel can still be live in a
+         switched-away session today. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@TUNMUX_BIN@</string>
+        <string>connection</string>
+        <string>agent</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true />
+    <key>KeepAlive</key>
+    <true />
+
+    <!-- Default is 20s; tearing down several connections serially (each with
+         its own PreDown/PostDown hooks) at logout can take longer. -->
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>   <!-- only in a real GUI login session -->
+
+    <key>StandardOutPath</key>
+    <string>@TUNMUX_HOME@/Library/Logs/tunmux-session-agent.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@TUNMUX_HOME@/Library/Logs/tunmux-session-agent.err.log</string>
+</dict>
+</plist>

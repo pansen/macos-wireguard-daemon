@@ -1,22 +1,15 @@
-use crate::config;
 use crate::error::AppError;
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, GotaTunAction,
-    PeerSummary, PrivilegedRequest, PrivilegedResponse,
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, PeerSummary,
+    PrivilegedRequest, PrivilegedResponse,
 };
 
 use super::authz;
-use super::commands::{run_gotatun_down, run_gotatun_up, run_network_overview, run_wg_show};
+use super::commands::{run_network_overview, run_wg_show};
 use super::connection_store::{self, StoredConnection};
-use super::tunnel_state::{self, Identity};
 use super::ControlState;
 use crate::wireguard::connection_config;
 use tracing::debug;
-
-/// How long a tunnel operation queues behind another privileged process before
-/// the caller is told to retry. Short enough that the service keeps answering
-/// other clients, long enough to absorb ordinary back-to-back requests.
-const MUTATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Identifies the caller for authorization purposes. `Socket(uid)` is a real
 /// peer uid from `getpeereid()` on the accepted connection; `Stdio` means the
@@ -74,79 +67,7 @@ pub(super) fn dispatch(
     control_state: &mut ControlState,
     origin: PeerOrigin,
 ) -> DispatchOutcome {
-    // Finding 5 — Incorrect tunnel adoption and connection races: socket and
-    // stdio daemons share one lock across identity check, mutation, and commit.
-    // Bounded, because this runs on the thread that also accepts connections and
-    // expires clients: report a busy daemon rather than freezing the loop.
-    let _mutation_lock = if matches!(&request, PrivilegedRequest::GotaTunRun { .. }) {
-        match crate::state_file::lock_with_timeout(
-            &config::privileged_runtime_dir().join("tunnel-operation.lock"),
-            MUTATION_LOCK_WAIT,
-        ) {
-            Ok(lock) => Some(lock),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return DispatchOutcome::Immediate(busy(
-                    "another tunnel operation is in progress; retry once it finishes",
-                ))
-            }
-            Err(error) => {
-                return DispatchOutcome::Immediate(PrivilegedResponse::Error {
-                    code: "IO".into(),
-                    message: error.to_string(),
-                })
-            }
-        }
-    } else {
-        None
-    };
     match request {
-        PrivilegedRequest::GotaTunRun {
-            action,
-            interface,
-            config_content,
-            mtu_override,
-            debug,
-        } => {
-            if let Some(response) = legacy_interface_access_denied(&interface, origin) {
-                return DispatchOutcome::Immediate(response);
-            }
-            DispatchOutcome::Immediate(match action {
-            GotaTunAction::Up => {
-                let identity = Identity {
-                    interface: interface.clone(),
-                    config_content: config_content.clone(),
-                    mtu_override,
-                };
-                let socket = std::path::PathBuf::from("/var/run/wireguard")
-                    .join(format!("{interface}.sock"));
-                match tunnel_state::connect(&tunnel_state::record_path(), identity, &socket, || {
-                    run_gotatun_up(
-                        interface.as_str(),
-                        config_content.as_str(),
-                        mtu_override,
-                        debug,
-                    )?;
-                    Ok(socket.clone())
-                }) {
-                    Ok(()) => PrivilegedResponse::Unit,
-                    Err(e) => PrivilegedResponse::Error {
-                        code: categorize_error(&e),
-                        message: e.to_string(),
-                    },
-                }
-            }
-            GotaTunAction::Down => match run_gotatun_down(interface.as_str())
-                .and_then(|()| tunnel_state::clear(&tunnel_state::record_path(), &interface))
-            {
-                Ok(()) => PrivilegedResponse::Unit,
-                Err(e) => PrivilegedResponse::Error {
-                    code: categorize_error(&e),
-                    message: e.to_string(),
-                },
-            },
-        })
-        }
-
         PrivilegedRequest::LeaseAcquire { token } => {
             control_state.prune_stale_leases();
             control_state.leases.insert(token);
@@ -545,15 +466,15 @@ fn authorize_access(record: &StoredConnection, origin: PeerOrigin) -> Option<Pri
     }
 }
 
-/// Gate for the legacy interface-string-keyed ops (`GotaTunRun`, `WgShow`,
+/// Gate for the legacy interface-string-keyed ops (`WgShow`,
 /// `NetworkOverview`, `InterfaceActive`), which predate per-connection
 /// ownership and take a bare interface name with no id to authorize against.
 /// If `interface` happens to be a stored connection's own interface (derived
 /// deterministically from its id, and in practice learnable by any reachable
 /// caller via a `ListConnections{Global}` response), apply the exact same
 /// ownership rule the new ops use; a name that matches no stored connection
-/// (e.g. `wgconf0`, or a bare `utunN` from the legacy wgconf CLI path) is not
-/// gated at all, preserving pre-existing behavior for genuinely unmanaged
+/// (e.g. `wgconf0`, or a bare `utunN`) is not gated at all, preserving
+/// pre-existing behavior for genuinely unmanaged
 /// interfaces. Without this, any reachable `tunmux`-group member could learn
 /// a global connection's interface name from `ListConnections` and then use
 /// these ungated legacy ops to read its peer/handshake data or tear it down.
@@ -909,11 +830,11 @@ mod tests {
 
     #[test]
     fn legacy_wg_show_is_gated_by_ownership_when_interface_belongs_to_a_connection() {
-        // Regression test: WgShow/NetworkOverview/InterfaceActive/GotaTunRun
-        // predate per-connection ownership and take a bare interface name;
-        // without `legacy_interface_access_denied` any reachable caller could
-        // learn a global connection's interface via ListConnections and then
-        // read (WgShow) or kill (GotaTunRun::Down) it despite not owning it.
+        // Regression test: WgShow/NetworkOverview/InterfaceActive predate
+        // per-connection ownership and take a bare interface name; without
+        // `legacy_interface_access_denied` any reachable caller could learn a
+        // global connection's interface via ListConnections and then read
+        // (WgShow) or otherwise act on it despite not owning it.
         with_test_store("legacy-gate-wgshow", || {
             let id = connection_id(&add_connection(
                 PeerOrigin::Socket(501),
@@ -952,14 +873,6 @@ mod tests {
             }
         });
     }
-
-    // GotaTunRun shares `legacy_interface_access_denied` with WgShow (see
-    // `legacy_wg_show_is_gated_by_ownership_when_interface_belongs_to_a_connection`
-    // above), so that test already covers the gate itself. A GotaTunRun-specific
-    // regression test isn't practical here: unlike every other op, it takes a
-    // second, unconditional lock (`tunnel-operation.lock`) at the real,
-    // root-owned system path before the gate ever runs, which a non-root test
-    // process cannot acquire.
 
     #[test]
     fn legacy_ops_on_an_unmanaged_interface_are_not_gated() {
