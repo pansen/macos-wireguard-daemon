@@ -114,7 +114,6 @@ pub fn disconnect_one_provider_connection(
 ) -> anyhow::Result<()> {
     let teardown = match state.backend {
         WgBackend::Kernel => wireguard::kernel::down(state),
-        WgBackend::WgQuick => wireguard::wg_quick::down(&state.interface_name, provider),
         WgBackend::Userspace => wireguard::userspace::down(&state.interface_name, provider),
     };
     if let Err(error) = teardown {

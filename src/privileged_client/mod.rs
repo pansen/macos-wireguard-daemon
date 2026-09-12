@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
-use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
+use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse};
 
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
@@ -150,23 +150,6 @@ impl PrivilegedClient {
         }
     }
 
-    pub fn wg_quick_run(
-        &self,
-        action: WgQuickAction,
-        interface: &str,
-        provider: &str,
-        config_content: &str,
-        prefer_userspace: bool,
-    ) -> Result<()> {
-        self.send_unit(PrivilegedRequest::WgQuickRun {
-            action,
-            interface: interface.to_string(),
-            provider: provider.to_string(),
-            config_content: config_content.to_string(),
-            prefer_userspace,
-        })
-    }
-
     pub fn gotatun_run(
         &self,
         action: GotaTunAction,
@@ -184,7 +167,7 @@ impl PrivilegedClient {
     }
 
     /// Run `wg show <interface>` as root and return the output.
-    /// Works for kernel, wg-quick, and userspace (gotatun) backends.
+    /// Works for both kernel and userspace (gotatun) backends.
     #[allow(dead_code)]
     pub fn wg_show(&self, interface: &str) -> Result<String> {
         match self.send(PrivilegedRequest::WgShow {
@@ -199,7 +182,7 @@ impl PrivilegedClient {
 
     /// Fetch the live route/DNS overview for a userspace tunnel, rendered by the
     /// helper that owns the interface. Returns `None` when the tunnel has no
-    /// overview to show (kernel/wg-quick backend, or the helper isn't running).
+    /// overview to show (kernel backend, or the helper isn't running).
     pub fn network_overview(&self, interface: &str) -> Result<Option<String>> {
         match self.send(PrivilegedRequest::NetworkOverview {
             interface: interface.to_string(),

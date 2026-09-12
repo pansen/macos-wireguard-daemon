@@ -21,7 +21,7 @@ pub mod trusted_exec;
 // WireGuard config-file provider (the sole provider in this build)
 pub mod wgconf;
 
-// WireGuard config and connection state, plus the userspace/wg-quick backends.
+// WireGuard config and connection state, plus the userspace/kernel backends.
 pub mod wireguard;
 
 // Privileged API types (portable serde types only, no unix deps)

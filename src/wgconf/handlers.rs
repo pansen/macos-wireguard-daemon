@@ -212,21 +212,6 @@ fn connect_direct(
         .unwrap_or_default();
 
     match backend {
-        wireguard::backend::WgBackend::WgQuick => {
-            let effective_iface =
-                wireguard::wg_quick::up(&source.config_text, INTERFACE_NAME, PROVIDER, false)?;
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: state_endpoint,
-                server_display_name: source.display_name.clone(),
-                dns_servers: state_dns_servers.clone(),
-                source_path: source.source_path.clone(),
-            };
-            state.save()?;
-        }
         wireguard::backend::WgBackend::Userspace => {
             let effective_iface = wireguard::userspace::up_with_mtu(
                 &source.config_text,
@@ -354,7 +339,7 @@ fn canonicalize_source(path: &Path) -> Option<String> {
 
 fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     let parsed = wireguard::config::parse_config(config_text)
-        .context("invalid WireGuard configuration for kernel/proxy path")?;
+        .context("invalid WireGuard configuration for kernel path")?;
 
     if parsed.private_key.trim().is_empty() {
         anyhow::bail!("Interface.PrivateKey must not be empty");
@@ -364,7 +349,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     }
     if parsed.dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy mode (direct wg-quick/userspace can use as-is config)"
+            "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
         );
     }
 
@@ -386,7 +371,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
         .collect();
     if dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy mode (direct wg-quick/userspace can use as-is config)"
+            "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
         );
     }
 

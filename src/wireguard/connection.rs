@@ -99,14 +99,11 @@ impl ConnectionState {
     /// interface and control socket no longer exist after boot).
     #[must_use]
     pub fn is_live(&self) -> bool {
-        use super::{userspace, wg_quick};
+        use super::userspace;
         match self.backend {
             WgBackend::Userspace | WgBackend::Kernel => {
                 userspace::is_interface_active(&self.interface_name)
             }
-            // Kernel and wg-quick both back a named interface (Linux) or a
-            // kernel-assigned utunN (macOS); the same probe applies.
-            WgBackend::WgQuick => wg_quick::is_interface_active(&self.interface_name),
         }
     }
 }

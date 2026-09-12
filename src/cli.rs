@@ -186,7 +186,7 @@ pub struct WgconfConnectArgs {
     #[arg(long)]
     pub save_as: Option<String>,
 
-    /// WireGuard backend: wg-quick, userspace, kernel
+    /// WireGuard backend: userspace, kernel
     #[arg(short = 'b', long)]
     pub backend: Option<String>,
 

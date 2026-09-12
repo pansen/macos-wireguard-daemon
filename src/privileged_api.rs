@@ -1,12 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WgQuickAction {
-    Up,
-    Down,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GotaTunAction {
     Up,
     Down,
@@ -15,14 +9,6 @@ pub enum GotaTunAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrivilegedRequest {
-    WgQuickRun {
-        action: WgQuickAction,
-        interface: String,
-        provider: String,
-        config_content: String,
-        #[serde(default)]
-        prefer_userspace: bool,
-    },
     GotaTunRun {
         action: GotaTunAction,
         interface: String,
@@ -77,15 +63,6 @@ pub enum PrivilegedResponse {
 impl PrivilegedRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::WgQuickRun {
-                interface,
-                provider,
-                ..
-            } => {
-                validate_interface_name(interface)?;
-                validate_provider(provider)?;
-                Ok(())
-            }
             Self::GotaTunRun {
                 action,
                 interface,
@@ -118,7 +95,7 @@ pub(crate) fn validate_interface_name(interface: &str) -> Result<(), String> {
         return Ok(());
     }
     // On macOS, WireGuard TUN interfaces are named utunN (kernel-assigned).
-    // "utun" (no number) is also accepted as the name passed to wg-quick on macOS.
+    // "utun" (no number) is also accepted as the name passed to the tunnel setup on macOS.
     if interface == "utun" {
         return Ok(());
     }
@@ -143,14 +120,6 @@ pub(crate) fn validate_interface_name(interface: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_provider(provider: &str) -> Result<(), String> {
-    if provider == "wgconf" {
-        Ok(())
-    } else {
-        Err("provider must be wgconf".into())
-    }
-}
-
 fn validate_lease_token(token: &str) -> Result<(), String> {
     if token.is_empty() || token.len() > 64 {
         return Err("lease token must be 1..=64 chars".into());
@@ -166,7 +135,7 @@ fn validate_lease_token(token: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_interface_name, validate_provider};
+    use super::validate_interface_name;
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
@@ -185,11 +154,5 @@ mod tests {
         for iface in ["utun", "utun0", "utun5", "utun99"] {
             assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
         }
-    }
-
-    #[test]
-    fn known_providers_are_allowed() {
-        assert!(validate_provider("wgconf").is_ok());
-        assert!(validate_provider("proton").is_err());
     }
 }
