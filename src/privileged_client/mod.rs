@@ -12,8 +12,8 @@ use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
-    PrivilegedRequest, PrivilegedResponse,
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, PrivilegedRequest,
+    PrivilegedResponse,
 };
 
 use self::transport::{is_transport_error, StdioSession};
@@ -197,7 +197,7 @@ impl PrivilegedClient {
     /// change is real: the first attempt carries no token, and on
     /// `AuthRequired` this triggers the standard OS prompt and retries once
     /// with the resulting token attached.
-pub fn add_connection(
+    pub fn add_connection(
         &self,
         conf_text: &str,
         global: bool,
@@ -224,12 +224,10 @@ pub fn add_connection(
 
     /// Remove a stored connection. Same admin-authentication protocol as
     /// [`Self::add_connection`].
-pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
-        self.send_with_admin_auth_retry(|auth_external_form| {
-            PrivilegedRequest::RemoveConnection {
-                id,
-                auth_external_form,
-            }
+    pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
+        self.send_with_admin_auth_retry(|auth_external_form| PrivilegedRequest::RemoveConnection {
+            id,
+            auth_external_form,
         })
         .map(|_| ())
     }
@@ -248,7 +246,11 @@ pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
     /// Change a stored connection's start mode. Only transitions a global
     /// connection from `Manual` to `Automatic` require admin authentication
     /// (see the design plan); every other transition is ownership-gated.
-    pub fn set_connection_mode(&self, id: ConnectionId, start_mode: ConnectionStartMode) -> Result<()> {
+    pub fn set_connection_mode(
+        &self,
+        id: ConnectionId,
+        start_mode: ConnectionStartMode,
+    ) -> Result<()> {
         self.send_with_admin_auth_retry(|auth_external_form| PrivilegedRequest::SetConnectionMode {
             id,
             start_mode,

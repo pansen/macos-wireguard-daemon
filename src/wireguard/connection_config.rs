@@ -168,7 +168,10 @@ pub fn public_key_from_base64(value: &str) -> Result<PublicKey> {
 }
 
 pub fn preshared_key_from_base64(value: &str) -> Result<PresharedKey> {
-    Ok(PresharedKey::from_bytes(decode_key32("PresharedKey", value)?))
+    Ok(PresharedKey::from_bytes(decode_key32(
+        "PresharedKey",
+        value,
+    )?))
 }
 
 /// Directives this backend understands in `[Interface]`. `ListenPort`,
@@ -369,8 +372,10 @@ pub fn parse_connection_config(input: &str) -> Result<ConnectionConfig> {
                         peer_public_key = Some(PublicKey::from(decode_key32("PublicKey", value)?))
                     }
                     "presharedkey" => {
-                        peer_preshared_key =
-                            Some(PresharedKey::from_bytes(decode_key32("PresharedKey", value)?))
+                        peer_preshared_key = Some(PresharedKey::from_bytes(decode_key32(
+                            "PresharedKey",
+                            value,
+                        )?))
                     }
                     "allowedips" => {
                         for entry in split_csv(value) {
@@ -383,9 +388,7 @@ pub fn parse_connection_config(input: &str) -> Result<ConnectionConfig> {
                     }
                     "persistentkeepalive" => {
                         peer_keepalive = Some(value.parse::<u16>().map_err(|_| {
-                            AppError::WireGuard(format!(
-                                "invalid PersistentKeepalive {value:?}"
-                            ))
+                            AppError::WireGuard(format!("invalid PersistentKeepalive {value:?}"))
                         })?);
                     }
                     _ => unreachable!("checked by KNOWN_PEER_KEYS above"),
@@ -411,12 +414,10 @@ pub fn parse_connection_config(input: &str) -> Result<ConnectionConfig> {
         )?;
     }
 
-    let private_key =
-        private_key.ok_or_else(|| AppError::WireGuard("missing PrivateKey in [Interface]".into()))?;
+    let private_key = private_key
+        .ok_or_else(|| AppError::WireGuard("missing PrivateKey in [Interface]".into()))?;
     if addresses.is_empty() {
-        return Err(AppError::WireGuard(
-            "missing Address in [Interface]".into(),
-        ));
+        return Err(AppError::WireGuard("missing Address in [Interface]".into()));
     }
     if peers.is_empty() {
         return Err(AppError::WireGuard("no [Peer] sections found".into()));
@@ -743,7 +744,10 @@ Endpoint = 198.51.100.1:51820\n";
             .replace("AllowedIPs", "allowedips")
             .replace("Endpoint", "endpoint");
         let parsed = parse_connection_config(&lower).expect("case-insensitive parse");
-        assert_eq!(parsed.dns_servers, vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            parsed.dns_servers,
+            vec!["1.1.1.1".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[test]

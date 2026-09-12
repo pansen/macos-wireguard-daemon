@@ -68,7 +68,11 @@ fn reparse_and_verify(stored: &StoredConnection) -> Result<ConnectionConfig> {
 
 /// Bring up one stored connection. Must be called while holding that
 /// connection's [`ConnectionLock`] (see `connection_store::lock_connection`).
-pub(super) fn connect(conn_lock: &ConnectionLock, id: ConnectionId, debug_enabled: bool) -> Result<()> {
+pub(super) fn connect(
+    conn_lock: &ConnectionLock,
+    id: ConnectionId,
+    debug_enabled: bool,
+) -> Result<()> {
     let stored = connection_store::load(id)?
         .ok_or_else(|| AppError::Other("connection not found".into()))?;
     let reparsed = reparse_and_verify(&stored)?;

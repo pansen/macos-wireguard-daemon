@@ -357,14 +357,15 @@ mod tests {
 
         match cli.command {
             TopCommand::Connection {
-                command: ConnectionCommand::Add {
-                    file,
-                    global,
-                    name,
-                    mtu,
-                    force,
-                    start_mode,
-                },
+                command:
+                    ConnectionCommand::Add {
+                        file,
+                        global,
+                        name,
+                        mtu,
+                        force,
+                        start_mode,
+                    },
             } => {
                 assert_eq!(file, "/tmp/test.conf");
                 assert!(!global);
@@ -443,14 +444,10 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["tunmux", "connection", "disconnect"]).is_err());
-        assert!(Cli::try_parse_from([
-            "tunmux",
-            "connection",
-            "disconnect",
-            "some-id",
-            "--all"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["tunmux", "connection", "disconnect", "some-id", "--all"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -510,8 +507,8 @@ mod tests {
     #[test]
     fn parse_connection_list_and_ls_alias() {
         for arg in ["list", "ls"] {
-            let cli = Cli::try_parse_from(["tunmux", "connection", arg])
-                .expect("parse connection list");
+            let cli =
+                Cli::try_parse_from(["tunmux", "connection", arg]).expect("parse connection list");
             match cli.command {
                 TopCommand::Connection {
                     command: ConnectionCommand::List { all, global },

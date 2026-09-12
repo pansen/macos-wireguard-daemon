@@ -263,7 +263,11 @@ fn wait_for_io(
     };
     if any_pending {
         let cap = PENDING_POLL_INTERVAL.as_millis() as i32;
-        timeout_ms = if timeout_ms < 0 { cap } else { timeout_ms.min(cap) };
+        timeout_ms = if timeout_ms < 0 {
+            cap
+        } else {
+            timeout_ms.min(cap)
+        };
     }
     let count =
         unsafe { nix::libc::poll(fds.as_mut_ptr(), fds.len() as nix::libc::nfds_t, timeout_ms) };
@@ -378,13 +382,17 @@ mod tests {
         let deadline = client.deadline;
         peer.write_all(b"{").unwrap();
         client
-            .step(IO_TIMEOUT, &mut |_, _, _| panic!("partial request dispatched"))
+            .step(IO_TIMEOUT, &mut |_, _, _| {
+                panic!("partial request dispatched")
+            })
             .unwrap();
         assert_eq!(client.deadline, deadline);
         client.deadline = Instant::now();
         peer.write_all(b" ").unwrap();
         assert!(client
-            .step(IO_TIMEOUT, &mut |_, _, _| panic!("expired request dispatched"))
+            .step(IO_TIMEOUT, &mut |_, _, _| panic!(
+                "expired request dispatched"
+            ))
             .is_err());
     }
 
@@ -393,7 +401,9 @@ mod tests {
         let (mut client, _peer) = client();
         client.input = vec![b'x'; MAX_REQUEST_BYTES + 1];
         assert!(client
-            .step(IO_TIMEOUT, &mut |_, _, _| panic!("oversized request dispatched"))
+            .step(IO_TIMEOUT, &mut |_, _, _| panic!(
+                "oversized request dispatched"
+            ))
             .is_err());
     }
 
@@ -446,13 +456,17 @@ mod tests {
 
         // Still nothing to write while the worker hasn't answered.
         assert!(client
-            .step(IO_TIMEOUT, &mut |_, _, _| panic!("must not re-dispatch while pending"))
+            .step(IO_TIMEOUT, &mut |_, _, _| panic!(
+                "must not re-dispatch while pending"
+            ))
             .unwrap());
         assert!(client.output.is_empty());
 
         tx.send(PrivilegedResponse::Unit).unwrap();
         assert!(client
-            .step(IO_TIMEOUT, &mut |_, _, _| panic!("must not re-dispatch while pending"))
+            .step(IO_TIMEOUT, &mut |_, _, _| panic!(
+                "must not re-dispatch while pending"
+            ))
             .unwrap());
         assert!(client.pending.is_none());
         let mut response = String::new();

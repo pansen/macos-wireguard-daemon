@@ -111,7 +111,9 @@ struct ConnectionPeerDisk {
 }
 
 fn corrupt(what: &str, value: &str) -> AppError {
-    AppError::WireGuard(format!("corrupt stored connection: invalid {what} {value:?}"))
+    AppError::WireGuard(format!(
+        "corrupt stored connection: invalid {what} {value:?}"
+    ))
 }
 
 fn parse_ipnet_field(what: &str, value: &str) -> Result<IpNet> {
@@ -192,10 +194,7 @@ fn peer_from_disk(disk: ConnectionPeerDisk) -> Result<ConnectionPeer> {
         endpoint: disk
             .endpoint
             .as_deref()
-            .map(|s| {
-                s.parse::<SocketAddr>()
-                    .map_err(|_| corrupt("endpoint", s))
-            })
+            .map(|s| s.parse::<SocketAddr>().map_err(|_| corrupt("endpoint", s)))
             .transpose()?,
         endpoint_literal: disk.endpoint_literal,
         persistent_keepalive: disk.persistent_keepalive,
@@ -274,7 +273,11 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
 }
 
 fn ensure_store_dirs_in(root: &Path) -> Result<()> {
-    for dir in [connections_dir_in(root), active_dir_in(root), locks_dir_in(root)] {
+    for dir in [
+        connections_dir_in(root),
+        active_dir_in(root),
+        locks_dir_in(root),
+    ] {
         ensure_dir_0700(&dir)?;
     }
     Ok(())
@@ -331,7 +334,10 @@ pub fn load(id: ConnectionId) -> Result<Option<StoredConnection>> {
 fn load_in(root: &Path, id: ConnectionId) -> Result<Option<StoredConnection>> {
     let path = stored_path_in(root, id);
     match fs::read(&path) {
-        Ok(bytes) => Ok(Some(from_disk_checked(id, serde_json::from_slice(&bytes)?)?)),
+        Ok(bytes) => Ok(Some(from_disk_checked(
+            id,
+            serde_json::from_slice(&bytes)?,
+        )?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -374,7 +380,9 @@ pub fn load_all() -> Result<Vec<StoredConnection>> {
 /// does not own, once that interface name is known (e.g. from a
 /// `ListConnections{Global}` response).
 pub fn find_by_interface(interface: &str) -> Result<Option<StoredConnection>> {
-    Ok(load_all()?.into_iter().find(|conn| conn.interface == interface))
+    Ok(load_all()?
+        .into_iter()
+        .find(|conn| conn.interface == interface))
 }
 
 fn load_all_in(root: &Path) -> Result<Vec<StoredConnection>> {
@@ -559,8 +567,7 @@ fn find_by_identity_in(
     owner_uid: Option<u32>,
 ) -> Result<Option<StoredConnection>> {
     for conn in load_all_strict_in(root)? {
-        if conn.fingerprint == fingerprint && conn.global == global && conn.owner_uid == owner_uid
-        {
+        if conn.fingerprint == fingerprint && conn.global == global && conn.owner_uid == owner_uid {
             return Ok(Some(conn));
         }
     }
@@ -717,7 +724,8 @@ fn already_reconciled_this_boot_in(root: &Path, boot_id: &str) -> bool {
 }
 
 fn mark_reconciled_this_boot_in(root: &Path, boot_id: &str) {
-    if let Err(error) = crate::state_file::write_atomic(&boot_marker_path_in(root), boot_id.as_bytes())
+    if let Err(error) =
+        crate::state_file::write_atomic(&boot_marker_path_in(root), boot_id.as_bytes())
     {
         tracing::warn!(error = %error, "boot_reconciliation_marker_write_failed");
     }
@@ -815,7 +823,9 @@ mod tests {
         let original_fingerprint = conn.fingerprint.clone();
         save_in(&root, &conn).unwrap();
 
-        let loaded = load_in(&root, id).unwrap().expect("saved connection exists");
+        let loaded = load_in(&root, id)
+            .unwrap()
+            .expect("saved connection exists");
         assert_eq!(loaded.id, id);
         assert!(loaded.global);
         assert_eq!(loaded.interface, id.interface_name());
@@ -927,9 +937,11 @@ mod tests {
         assert!(find_by_identity_in(&root, &fingerprint, false, Some(502))
             .unwrap()
             .is_none());
-        assert!(find_by_identity_in(&root, "sha256:deadbeef", false, Some(501))
-            .unwrap()
-            .is_none());
+        assert!(
+            find_by_identity_in(&root, "sha256:deadbeef", false, Some(501))
+                .unwrap()
+                .is_none()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1110,7 +1122,11 @@ mod tests {
         assert_eq!(loaded.len(), 8);
         let interfaces: std::collections::HashSet<_> =
             loaded.iter().map(|c| c.interface.clone()).collect();
-        assert_eq!(interfaces.len(), 8, "every connection got a distinct interface");
+        assert_eq!(
+            interfaces.len(),
+            8,
+            "every connection got a distinct interface"
+        );
         for id in ids {
             assert!(loaded.iter().any(|c| c.id == id));
         }

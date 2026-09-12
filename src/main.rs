@@ -203,10 +203,7 @@ fn cmd_status() -> anyhow::Result<()> {
                 println!("{}", color::tables(overview.trim_end()));
             }
             Ok(None) => {}
-            Err(e) => eprintln!(
-                "network overview for {} unavailable: {}",
-                conn.interface, e
-            ),
+            Err(e) => eprintln!("network overview for {} unavailable: {}", conn.interface, e),
         }
     }
 

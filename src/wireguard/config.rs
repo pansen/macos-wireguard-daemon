@@ -169,7 +169,10 @@ mod tests {
         let parsed = super::super::connection_config::parse_connection_config(&config).unwrap();
 
         assert_eq!(parsed.addresses.len(), 1);
-        assert_eq!(parsed.dns_servers, vec!["10.2.0.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            parsed.dns_servers,
+            vec!["10.2.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
         assert_eq!(parsed.mtu, None);
         assert_eq!(parsed.peers.len(), 1);
         assert!(parsed.peers[0].preshared_key.is_none());

@@ -165,9 +165,7 @@ pub(super) fn dispatch(
             handle_connect_connection(origin, id, debug)
         }
 
-        PrivilegedRequest::DisconnectConnection { id } => {
-            handle_disconnect_connection(origin, id)
-        }
+        PrivilegedRequest::DisconnectConnection { id } => handle_disconnect_connection(origin, id),
 
         PrivilegedRequest::SetConnectionMode {
             id,
@@ -478,7 +476,10 @@ fn authorize_access(record: &StoredConnection, origin: PeerOrigin) -> Option<Pri
 /// interfaces. Without this, any reachable `tunmux`-group member could learn
 /// a global connection's interface name from `ListConnections` and then use
 /// these ungated legacy ops to read its peer/handshake data or tear it down.
-fn legacy_interface_access_denied(interface: &str, origin: PeerOrigin) -> Option<PrivilegedResponse> {
+fn legacy_interface_access_denied(
+    interface: &str,
+    origin: PeerOrigin,
+) -> Option<PrivilegedResponse> {
     match connection_store::find_by_interface(interface) {
         Ok(Some(record)) => authorize_access(&record, origin),
         Ok(None) => None,
@@ -500,7 +501,11 @@ fn require_admin_auth(form: Option<&[u8]>) -> std::result::Result<(), Privileged
     }
 }
 
-fn summarize(conn: &StoredConnection, connected: bool, include_fingerprint: bool) -> ConnectionSummary {
+fn summarize(
+    conn: &StoredConnection,
+    connected: bool,
+    include_fingerprint: bool,
+) -> ConnectionSummary {
     ConnectionSummary {
         id: conn.id,
         global: conn.global,
@@ -509,8 +514,18 @@ fn summarize(conn: &StoredConnection, connected: bool, include_fingerprint: bool
         name: conn.name.clone(),
         interface: conn.interface.clone(),
         connected,
-        addresses: conn.config.addresses.iter().map(ToString::to_string).collect(),
-        dns_servers: conn.config.dns_servers.iter().map(ToString::to_string).collect(),
+        addresses: conn
+            .config
+            .addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        dns_servers: conn
+            .config
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         mtu: conn.config.mtu,
         peers: conn
             .config
@@ -625,7 +640,9 @@ fn error_response(error: AppError) -> PrivilegedResponse {
 fn lock_error_response(error: AppError) -> PrivilegedResponse {
     if let AppError::Io(io_error) = &error {
         if io_error.kind() == std::io::ErrorKind::WouldBlock {
-            return busy("another operation on this connection is in progress; retry once it finishes");
+            return busy(
+                "another operation on this connection is in progress; retry once it finishes",
+            );
         }
     }
     error_response(error)
@@ -760,7 +777,8 @@ mod tests {
     #[test]
     fn remove_connection_nonexistent_returns_not_found_without_engaging_auth() {
         with_test_store("remove-missing", || {
-            let response = handle_remove_connection(PeerOrigin::Socket(0), ConnectionId::new(), None);
+            let response =
+                handle_remove_connection(PeerOrigin::Socket(0), ConnectionId::new(), None);
             assert_eq!(error_code(&response), "NotFound");
         });
     }
@@ -781,7 +799,8 @@ mod tests {
             let owner_without_auth = handle_remove_connection(PeerOrigin::Socket(501), id, None);
             assert_eq!(error_code(&owner_without_auth), "AuthRequired");
 
-            let owner_with_auth = handle_remove_connection(PeerOrigin::Socket(501), id, valid_auth());
+            let owner_with_auth =
+                handle_remove_connection(PeerOrigin::Socket(501), id, valid_auth());
             assert!(matches!(owner_with_auth, PrivilegedResponse::Unit));
         });
     }
@@ -812,11 +831,15 @@ mod tests {
 
             match handle_connect_connection(PeerOrigin::Socket(502), id, false) {
                 DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
-                DispatchOutcome::Pending(_) => panic!("unauthorized connect must not spawn a worker"),
+                DispatchOutcome::Pending(_) => {
+                    panic!("unauthorized connect must not spawn a worker")
+                }
             }
             match handle_disconnect_connection(PeerOrigin::Socket(502), id) {
                 DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
-                DispatchOutcome::Pending(_) => panic!("unauthorized disconnect must not spawn a worker"),
+                DispatchOutcome::Pending(_) => {
+                    panic!("unauthorized disconnect must not spawn a worker")
+                }
             }
         });
     }
@@ -893,7 +916,9 @@ mod tests {
                 DispatchOutcome::Immediate(_) => {
                     panic!("expected an unauthorized-gate-free Bool response")
                 }
-                DispatchOutcome::Pending(_) => panic!("InterfaceActive must be an immediate response"),
+                DispatchOutcome::Pending(_) => {
+                    panic!("InterfaceActive must be an immediate response")
+                }
             }
         });
     }
@@ -902,8 +927,12 @@ mod tests {
     fn connect_on_nonexistent_connection_is_not_found() {
         with_test_store("connect-missing", || {
             match handle_connect_connection(PeerOrigin::Socket(0), ConnectionId::new(), false) {
-                DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "NotFound"),
-                DispatchOutcome::Pending(_) => panic!("nonexistent connection must not spawn a worker"),
+                DispatchOutcome::Immediate(response) => {
+                    assert_eq!(error_code(&response), "NotFound")
+                }
+                DispatchOutcome::Pending(_) => {
+                    panic!("nonexistent connection must not spawn a worker")
+                }
             }
         });
     }
@@ -939,10 +968,19 @@ mod tests {
     #[test]
     fn set_connection_mode_elevating_a_global_connection_requires_auth() {
         with_test_store("mode-elevate", || {
-            let id = connection_id(&add_connection(PeerOrigin::Socket(0), SAMPLE_CONF, true, valid_auth()));
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF,
+                true,
+                valid_auth(),
+            ));
 
-            let without_auth =
-                handle_set_connection_mode(PeerOrigin::Socket(0), id, ConnectionStartMode::Automatic, None);
+            let without_auth = handle_set_connection_mode(
+                PeerOrigin::Socket(0),
+                id,
+                ConnectionStartMode::Automatic,
+                None,
+            );
             assert_eq!(error_code(&without_auth), "AuthRequired");
 
             let with_auth = handle_set_connection_mode(
@@ -958,11 +996,25 @@ mod tests {
     #[test]
     fn set_connection_mode_downgrading_a_global_connection_needs_no_auth() {
         with_test_store("mode-downgrade", || {
-            let id = connection_id(&add_connection(PeerOrigin::Socket(0), SAMPLE_CONF, true, valid_auth()));
-            handle_set_connection_mode(PeerOrigin::Socket(0), id, ConnectionStartMode::Automatic, valid_auth());
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF,
+                true,
+                valid_auth(),
+            ));
+            handle_set_connection_mode(
+                PeerOrigin::Socket(0),
+                id,
+                ConnectionStartMode::Automatic,
+                valid_auth(),
+            );
 
-            let response =
-                handle_set_connection_mode(PeerOrigin::Socket(0), id, ConnectionStartMode::Manual, None);
+            let response = handle_set_connection_mode(
+                PeerOrigin::Socket(0),
+                id,
+                ConnectionStartMode::Manual,
+                None,
+            );
             assert!(matches!(response, PrivilegedResponse::Unit));
         });
     }
@@ -989,11 +1041,20 @@ mod tests {
     #[test]
     fn set_connection_mode_no_op_needs_no_auth() {
         with_test_store("mode-noop", || {
-            let id = connection_id(&add_connection(PeerOrigin::Socket(0), SAMPLE_CONF, true, valid_auth()));
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF,
+                true,
+                valid_auth(),
+            ));
             // Already Manual; re-requesting Manual is a no-op even though the
             // connection is global.
-            let response =
-                handle_set_connection_mode(PeerOrigin::Socket(0), id, ConnectionStartMode::Manual, None);
+            let response = handle_set_connection_mode(
+                PeerOrigin::Socket(0),
+                id,
+                ConnectionStartMode::Manual,
+                None,
+            );
             assert!(matches!(response, PrivilegedResponse::Unit));
         });
     }
@@ -1011,9 +1072,19 @@ mod tests {
     #[test]
     fn list_connections_mine_filters_by_owner() {
         with_test_store("list-mine", || {
-            connection_id(&add_connection(PeerOrigin::Socket(501), SAMPLE_CONF, false, valid_auth()));
+            connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
             let conf_other = SAMPLE_CONF.replace("DNS = 1.1.1.1", "DNS = 9.9.9.9");
-            connection_id(&add_connection(PeerOrigin::Socket(502), &conf_other, false, valid_auth()));
+            connection_id(&add_connection(
+                PeerOrigin::Socket(502),
+                &conf_other,
+                false,
+                valid_auth(),
+            ));
 
             let PrivilegedResponse::ConnectionList(mine) =
                 handle_list_connections(PeerOrigin::Socket(501), ConnectionScope::Mine)
@@ -1050,7 +1121,12 @@ mod tests {
     #[test]
     fn list_connections_never_includes_a_fingerprint() {
         with_test_store("list-no-fingerprint", || {
-            connection_id(&add_connection(PeerOrigin::Socket(0), SAMPLE_CONF, true, valid_auth()));
+            connection_id(&add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF,
+                true,
+                valid_auth(),
+            ));
             let PrivilegedResponse::ConnectionList(all) =
                 handle_list_connections(PeerOrigin::Socket(0), ConnectionScope::Global)
             else {

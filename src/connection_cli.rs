@@ -214,7 +214,9 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     println!("dns_servers: {}", conn.dns_servers.join(", "));
     println!(
         "mtu:         {}",
-        conn.mtu.map(|m| m.to_string()).unwrap_or_else(|| "-".to_string())
+        conn.mtu
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "-".to_string())
     );
     if let Some(fingerprint) = &conn.fingerprint {
         println!("fingerprint: {fingerprint}");

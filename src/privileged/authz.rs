@@ -179,13 +179,19 @@ impl Drop for ClientAuthorization {
 /// resulting opaque external form (to attach to the retried request) and the
 /// live session it came from. This is the call that actually shows UI.
 pub fn client_authorize() -> Result<ClientAuthorization> {
-    let name =
-        CString::new(RIGHT_NAME).map_err(|e| AppError::Other(format!("invalid right name: {e}")))?;
+    let name = CString::new(RIGHT_NAME)
+        .map_err(|e| AppError::Other(format!("invalid right name: {e}")))?;
     let rights = one_right_set(&name);
 
     let mut auth: AuthorizationRef = ptr::null_mut();
-    let create_status =
-        unsafe { AuthorizationCreate(ptr::null(), ptr::null(), K_AUTHORIZATION_FLAG_DEFAULTS, &mut auth) };
+    let create_status = unsafe {
+        AuthorizationCreate(
+            ptr::null(),
+            ptr::null(),
+            K_AUTHORIZATION_FLAG_DEFAULTS,
+            &mut auth,
+        )
+    };
     if create_status != ERR_SECURITY_SUCCESS {
         unsafe { free_one_right_set(rights) };
         return Err(os_status_error("AuthorizationCreate", create_status));
@@ -219,7 +225,10 @@ pub fn client_authorize() -> Result<ClientAuthorization> {
     let form_status = unsafe { AuthorizationMakeExternalForm(auth, &mut ext_form) };
     if form_status != ERR_SECURITY_SUCCESS {
         unsafe { AuthorizationFree(auth, K_AUTHORIZATION_FLAG_DEFAULTS) };
-        return Err(os_status_error("AuthorizationMakeExternalForm", form_status));
+        return Err(os_status_error(
+            "AuthorizationMakeExternalForm",
+            form_status,
+        ));
     }
 
     Ok(ClientAuthorization {
@@ -240,7 +249,8 @@ pub fn client_authorize() -> Result<ClientAuthorization> {
 /// section). Only recognized in test builds; production code never sees it
 /// because `client_authorize` never produces it.
 #[cfg(test)]
-pub(crate) const TEST_VALID_EXTERNAL_FORM: [u8; EXTERNAL_FORM_LENGTH] = [0xABu8; EXTERNAL_FORM_LENGTH];
+pub(crate) const TEST_VALID_EXTERNAL_FORM: [u8; EXTERNAL_FORM_LENGTH] =
+    [0xABu8; EXTERNAL_FORM_LENGTH];
 
 pub fn verify_external_form(external_form: &[u8]) -> Result<()> {
     if external_form.len() != EXTERNAL_FORM_LENGTH {
@@ -267,8 +277,8 @@ pub fn verify_external_form(external_form: &[u8]) -> Result<()> {
         ));
     }
 
-    let name =
-        CString::new(RIGHT_NAME).map_err(|e| AppError::Other(format!("invalid right name: {e}")))?;
+    let name = CString::new(RIGHT_NAME)
+        .map_err(|e| AppError::Other(format!("invalid right name: {e}")))?;
     let rights = one_right_set(&name);
     let mut authorized: *mut AuthorizationRights = ptr::null_mut();
     // `kAuthorizationFlagInteractionAllowed` IS included here, matching

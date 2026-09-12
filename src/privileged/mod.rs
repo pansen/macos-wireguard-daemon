@@ -318,7 +318,9 @@ fn process_request_payload(
     };
 
     match dispatch(request, control_state, origin) {
-        dispatch::DispatchOutcome::Immediate(response) => RequestOutcome::Immediate(Vec::new(), response),
+        dispatch::DispatchOutcome::Immediate(response) => {
+            RequestOutcome::Immediate(Vec::new(), response)
+        }
         dispatch::DispatchOutcome::Pending(rx) => RequestOutcome::Pending(rx),
     }
 }
@@ -425,5 +427,4 @@ mod protocol_tests {
             assert_eq!(frame["log"], serde_json::json!(expected));
         }
     }
-
 }
