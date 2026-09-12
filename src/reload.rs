@@ -37,6 +37,13 @@ pub async fn run(args: ReloadArgs, config: &AppConfig) -> anyhow::Result<()> {
         config,
     )
     .await?;
+    // The disconnect above only acts on what this process's own connection
+    // state believes is connected. Also reset the privileged daemon's own
+    // record directly, so a record left behind by a crashed or desynced
+    // prior run can't silently survive this reload.
+    if let Err(error) = crate::wgconf::handlers::force_reset_direct_interface() {
+        eprintln!("Warning: could not confirm privileged tunnel state was reset: {error:#}");
+    }
 
     step("re-registering the autoconnect agent");
     crate::autoconnect::reinstall(args.file, args.profile)?;

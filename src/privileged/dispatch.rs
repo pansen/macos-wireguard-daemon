@@ -76,7 +76,7 @@ pub(super) fn dispatch(
                 }
             }
             GotaTunAction::Down => match run_gotatun_down(interface.as_str())
-                .and_then(|()| tunnel_state::clear(&interface))
+                .and_then(|()| tunnel_state::clear(&tunnel_state::record_path(), &interface))
             {
                 Ok(()) => PrivilegedResponse::Unit,
                 Err(e) => PrivilegedResponse::Error {

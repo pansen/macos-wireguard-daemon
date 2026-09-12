@@ -30,6 +30,23 @@ struct ActiveTunnel {
     changed_nsec: i64,
 }
 
+// The same on-disk shape, but tolerant of an unrecognized identity (e.g. a
+// record written by a since-removed backend generation, which still carries
+// fields serde's `deny_unknown_fields` on `Identity` now rejects). Used only
+// to find the socket a record we can no longer trust once named, so we can
+// tell a merely stale record apart from one describing a tunnel that might
+// still be running -- never to compare identities.
+#[derive(Deserialize)]
+struct UnrecognizedRecord {
+    identity: UnrecognizedIdentity,
+    socket: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct UnrecognizedIdentity {
+    interface: String,
+}
+
 pub(super) fn record_path() -> PathBuf {
     crate::config::privileged_runtime_dir().join("active-tunnel.json")
 }
@@ -50,26 +67,43 @@ where
         Err(error) => return Err(error.into()),
     };
     if let Some(bytes) = existing {
-        // A corrupt private record must not permit taking over an unknown tunnel.
-        let active: ActiveTunnel = serde_json::from_slice(&bytes).map_err(|_| conflict())?;
-        let metadata = match fs::metadata(&active.socket) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        if let Some(metadata) = metadata {
-            if metadata.dev() != active.device
-                || metadata.ino() != active.inode
-                || metadata.ctime() != active.changed_sec
-                || metadata.ctime_nsec() != active.changed_nsec
-            {
-                return Err(conflict());
+        match serde_json::from_slice::<ActiveTunnel>(&bytes) {
+            Ok(active) => {
+                // A corrupt private record must not permit taking over an unknown tunnel.
+                let metadata = match fs::metadata(&active.socket) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(metadata) = metadata {
+                    if metadata.dev() != active.device
+                        || metadata.ino() != active.inode
+                        || metadata.ctime() != active.changed_sec
+                        || metadata.ctime_nsec() != active.changed_nsec
+                    {
+                        return Err(conflict());
+                    }
+                    return if active.identity == identity {
+                        Ok(())
+                    } else {
+                        Err(conflict())
+                    };
+                }
+                // The recorded socket is gone: stale record, fall through to start a fresh tunnel.
             }
-            return if active.identity == identity {
-                Ok(())
-            } else {
-                Err(conflict())
-            };
+            Err(_) => {
+                // The record doesn't match the current shape (e.g. it was written
+                // by a since-removed backend generation). Its identity can never
+                // be trusted again, so it can never be adopted -- but if the
+                // socket it names is gone, the tunnel it described no longer
+                // exists either, and the record is safe to discard instead of
+                // wedging every future connect forever.
+                let legacy: UnrecognizedRecord =
+                    serde_json::from_slice(&bytes).map_err(|_| conflict())?;
+                if legacy.socket.try_exists()? {
+                    return Err(conflict());
+                }
+            }
         }
     }
     if socket.try_exists()? {
@@ -91,14 +125,20 @@ where
     Ok(())
 }
 
-pub(super) fn clear(interface: &str) -> Result<()> {
-    let path = record_path();
-    if let Ok(bytes) = fs::read(&path) {
-        if let Ok(active) = serde_json::from_slice::<ActiveTunnel>(&bytes) {
-            if active.identity.interface == interface {
-                fs::remove_file(path)?;
-            }
-        }
+pub(super) fn clear(path: &Path, interface: &str) -> Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(()),
+    };
+    let should_remove = match serde_json::from_slice::<ActiveTunnel>(&bytes) {
+        Ok(active) => active.identity.interface == interface,
+        Err(_) => match serde_json::from_slice::<UnrecognizedRecord>(&bytes) {
+            Ok(legacy) if legacy.identity.interface == interface => !legacy.socket.try_exists()?,
+            _ => false,
+        },
+    };
+    if should_remove {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -167,6 +207,64 @@ mod tests {
         fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(connect(&record, identity("A"), &socket, || panic!(
             "legacy wg-quick record must not be silently adopted"
+        ))
+        .is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_record_with_missing_socket_is_recovered() {
+        let dir = directory("legacy-stale");
+        let record = dir.join("active.json");
+        let socket = dir.join("wgconf0.sock");
+        let legacy = serde_json::json!({
+            "identity": { "interface": "wgconf0", "wg_quick": true },
+            "socket": socket,
+        });
+        fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut started = false;
+        connect(&record, identity("A"), &socket, || {
+            started = true;
+            fs::write(&socket, "socket")?;
+            Ok(socket.clone())
+        })
+        .unwrap();
+        assert!(
+            started,
+            "a stale legacy record must not block a fresh connect"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_record_is_cleared_by_clear_once_stale() {
+        let dir = directory("legacy-clear");
+        let record = dir.join("active.json");
+        let socket = dir.join("wgconf0.sock");
+        let legacy = serde_json::json!({
+            "identity": { "interface": "wgconf0", "wg_quick": true },
+            "socket": socket,
+        });
+        fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        clear(&record, "wgconf0").unwrap();
+        assert!(!record.exists(), "a stale legacy record must be cleared");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_record_with_live_socket_is_still_rejected() {
+        let dir = directory("legacy-live");
+        let record = dir.join("active.json");
+        let socket = dir.join("wgconf0.sock");
+        fs::write(&socket, "socket").unwrap();
+        let legacy = serde_json::json!({
+            "identity": { "interface": "wgconf0", "wg_quick": true },
+            "socket": socket,
+        });
+        fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(connect(&record, identity("A"), &socket, || panic!(
+            "a live but unverifiable tunnel must not be adopted"
         ))
         .is_err());
         fs::remove_dir_all(dir).unwrap();

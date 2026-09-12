@@ -294,6 +294,16 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
     connection_ops::cmd_disconnect_provider(PROVIDER, instance, all)
 }
 
+/// Reset the privileged daemon's own tunnel record for the direct interface,
+/// independent of whatever this process's local `ConnectionState` currently
+/// believes. Used by `tunmux reload`, whose whole point is discarding
+/// pre-reload state: a desynced privileged-side record must not be able to
+/// survive a reload untouched just because the local connection state was
+/// already stale or missing. Idempotent when nothing is up.
+pub(crate) fn force_reset_direct_interface() -> anyhow::Result<()> {
+    wireguard::userspace::down_raw(INTERFACE_NAME).map_err(Into::into)
+}
+
 fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<ConfigSource> {
     match (file, profile) {
         (Some(path), None) => {
