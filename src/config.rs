@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -211,19 +211,6 @@ pub fn ensure_privileged_runtime_dir() -> Result<()> {
         &dir,
         crate::trusted_exec::TrustedPath::Directory,
     )?;
-    Ok(())
-}
-
-#[must_use]
-pub fn privileged_wg_dir() -> PathBuf {
-    privileged_runtime_dir().join("wg")
-}
-
-pub fn ensure_privileged_directory(path: &Path) -> Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
     Ok(())
 }
 

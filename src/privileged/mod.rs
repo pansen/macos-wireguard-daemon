@@ -432,7 +432,6 @@ fn leading_timestamp(line: &str) -> Option<&str> {
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
     match request {
-        PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
         PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",

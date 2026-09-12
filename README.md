@@ -99,27 +99,20 @@ actually talk to each other, see [doc/architecture.md](doc/architecture.md).
 
 ## Backends
 
-There are three ways to bring the tunnel up:
+There are two ways to bring the tunnel up:
 
-- `userspace` (default) and `wg-quick` use your config as written.
+- `userspace` (default) uses your config as written.
 - `kernel` brings the tunnel up from a regenerated minimal config.
 
-All three run on the same embedded userspace engine; the backend only changes
-how the tunnel is set up.
+Both run on the same embedded userspace engine; the backend only changes how
+the tunnel is set up. Neither needs any external WireGuard tools.
 
 Privileged subprocesses use a restricted system PATH, followed by `/usr/local/bin`
 when that directory and its ancestors are root-owned, are not symlinks, and have
 no group or other write access. This permits the normal `/usr/local/bin/tunmux`
 installation; daemon and helper launches also use absolute executable paths.
-The `userspace` and `kernel`
-backends need no external WireGuard tools. The external `wg-quick` backend requires
-an administrator-installed `bash` (version 4 or later), `wg-quick`, `wg`, and
-`wireguard-go` in `/Library/Application Support/tunmux/bin`. These must be regular
-root-owned files with no group or other write access, and their parent directories
-must also be root-owned and protected against writes. Their runtime dependencies
-must be installed in equally protected locations. Symlinks into Homebrew are
-rejected. The installed tunmux daemon and its parent directories have the same
-ownership requirements.
+Symlinks into Homebrew are rejected. The installed tunmux daemon and its parent
+directories have the same ownership requirements.
 
 The daemon records the running tunnel's configuration in a private, root-owned
 state file. `connect --if-missing` verifies configuration contents and MTU settings

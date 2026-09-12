@@ -14,7 +14,6 @@ pub(super) struct Identity {
     pub interface: String,
     pub config_content: String,
     pub mtu_override: Option<u16>,
-    pub wg_quick: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,7 +109,6 @@ mod tests {
             interface: "wgconf0".into(),
             config_content: config.into(),
             mtu_override: None,
-            wg_quick: false,
         }
     }
 

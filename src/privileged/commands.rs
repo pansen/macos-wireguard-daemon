@@ -1,4 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -11,61 +10,8 @@ use crate::error::{AppError, Result};
 
 use super::daemon::self_executable_for_spawn;
 
-pub(super) fn run_wg_quick_up(
-    path: &std::path::Path,
-    config_content: &[u8],
-    prefer_userspace: bool,
-) -> Result<()> {
-    std::fs::write(path, config_content)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-
-    let mut command = crate::trusted_exec::wg_quick_command(prefer_userspace)?;
-    if prefer_userspace {
-        command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
-        command.env("TUNMUX_GOTATUN_HELPER", "1");
-        if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
-            command.env(crate::logging::COLOR_ENV, color);
-        }
-        let helper_exe = self_executable_for_spawn()?;
-        command.env("WG_QUICK_USERSPACE_IMPLEMENTATION", &helper_exe);
-        debug!(
-            helper = ?helper_exe.display().to_string(),
-            "wg_quick_userspace_helper"
-        );
-    }
-
-    debug!(cmd = format!("wg-quick up {}", path.display()), "exec");
-    let status = command
-        .args(["up", path.to_string_lossy().as_ref()])
-        .status()
-        .map_err(|e| AppError::Other(format!("wg-quick up failed: {}", e)))?;
-    if !status.success() {
-        let _ = std::fs::remove_file(path);
-        return Err(AppError::WireGuard(format!(
-            "wg-quick up exited {}",
-            status
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
-    debug!(cmd = format!("wg-quick down {}", path.display()), "exec");
-    let status = crate::trusted_exec::wg_quick_command(true)?
-        .args(["down", path.to_string_lossy().as_ref()])
-        .status()
-        .map_err(|e| AppError::Other(format!("wg-quick down failed: {}", e)))?;
-    if !status.success() {
-        return Err(AppError::WireGuard(format!(
-            "wg-quick down exited {}",
-            status
-        )));
-    }
-    Ok(())
-}
-
 /// Fetch the live network overview from a userspace helper's query socket.
-/// Returns `Ok(None)` when there is no such socket (kernel/wg-quick backend, or
+/// Returns `Ok(None)` when there is no such socket (kernel backend, or
 /// the tunnel isn't a gotatun userspace one) so the caller can quietly skip it.
 pub(super) fn run_network_overview(interface: &str) -> Result<Option<String>> {
     use std::io::Read;

@@ -249,7 +249,7 @@ async fn dispatch_provider_disconnect(
 
 fn cmd_status() -> anyhow::Result<()> {
     // Probe liveness across every backend, not just userspace: a reboot/crash
-    // leaves stale kernel/wg-quick state behind too, and `is_live()` already
+    // leaves stale kernel state behind too, and `is_live()` already
     // knows the right probe per backend.
     let mut connections: Vec<ConnectionState> = ConnectionState::load_all()?
         .into_iter()

@@ -82,12 +82,10 @@ classDiagram
     }
     class WgBackend {
         <<enum>>
-        WgQuick
         Userspace
         Kernel
     }
     class PrivilegedClient {
-        +wg_quick_run()
         +gotatun_run()
         +wg_show()
         +network_overview()
@@ -95,7 +93,7 @@ classDiagram
     }
     class PrivilegedRequest {
         <<enum>>
-        WgQuickRun · GotaTunRun
+        GotaTunRun
         LeaseAcquire · LeaseRelease · ShutdownIfIdle
         InterfaceActive · WgShow · NetworkOverview
         +validate() Result
@@ -108,7 +106,6 @@ classDiagram
         +String interface
         +String config_content
         +Option~u16~ mtu_override
-        +bool wg_quick
     }
     class RunningDevice {
         +String interface_name
@@ -122,7 +119,7 @@ classDiagram
     ConnectionState --> WgBackend
     PrivilegedClient ..> PrivilegedRequest : sends
     PrivilegedClient ..> PrivilegedResponse : receives
-    PrivilegedRequest ..> Identity : GotaTunRun/WgQuickRun become
+    PrivilegedRequest ..> Identity : GotaTunRun becomes
     Identity --> RunningDevice : realized by a helper
 ```
 
@@ -263,9 +260,8 @@ by a reboot instead of letting it wedge future connects.
 
 ## Backends
 
-All three backends terminate at the same daemon and the same embedded gotatun
-engine. What differs is which request they send and what config they send with
-it.
+Both backends terminate at the same daemon and the same embedded gotatun
+engine. What differs is what config they send with the `GotaTunRun` request.
 
 ```mermaid
 flowchart TB
@@ -273,27 +269,21 @@ flowchart TB
 
     B -->|Userspace| U["wireguard::userspace::up_with_mtu<br/>config passed through verbatim"]
     B -->|Kernel| K["wireguard::kernel::up<br/>parse -> WgConfigParams -> generate_config"]
-    B -->|WgQuick| Q["wireguard::wg_quick::up<br/>iface name mapped to utunN"]
 
     K --> U2["userspace::up_raw"]
     U --> GR["PrivilegedClient::gotatun_run"]
     U2 --> GR
-    Q --> WQ["PrivilegedClient::wg_quick_run"]
 
     GR --> D1["dispatch: GotaTunRun"]
-    WQ --> D2["dispatch: WgQuickRun"]
     D1 --> RG["commands::run_gotatun_up<br/>spawns the helper directly"]
-    D2 --> RQ["commands::run_wg_quick_up<br/>execs wg-quick with<br/>WG_QUICK_USERSPACE_IMPLEMENTATION=tunmux"]
     RG --> ENG["gotatun engine in a helper process"]
-    RQ --> ENG
 ```
 
 `kernel` is a misnomer inherited from Linux: macOS has no in-kernel WireGuard,
 so `wireguard::kernel::up` regenerates a minimal config from the parsed one and
-hands it to the same userspace path (`src/wireguard/kernel.rs:15`). `wg-quick`
-is the only backend that needs externally installed tools, and those must live
-in `/Library/Application Support/tunmux/bin` and pass `trusted_exec`
-validation.
+hands it to the same userspace path (`src/wireguard/kernel.rs:15`). Neither
+backend needs externally installed tools; `trusted_exec` only ever resolves a
+fixed set of system binaries.
 
 `ConnectionState::is_live()` collapses back to one probe for all three: ask the
 daemon whether `/var/run/wireguard/<iface>.sock` exists. A local `exists()`
@@ -320,7 +310,7 @@ flowchart TB
     CAP --> DISP["dispatch"]
 
     DISP --> MUT{"mutating<br/>request?"}
-    MUT -->|"WgQuickRun / GotaTunRun"| LOCK["flock tunnel-operation.lock<br/>2s, else Busy"]
+    MUT -->|"GotaTunRun"| LOCK["flock tunnel-operation.lock<br/>2s, else Busy"]
     MUT -->|no| SKIP[" "]
     LOCK --> TS["tunnel_state::connect / clear"]
     TS --> CMD["commands::run_*"]
