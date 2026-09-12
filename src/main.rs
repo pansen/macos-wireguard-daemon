@@ -2,6 +2,7 @@ mod autoconnect;
 mod cli;
 mod color;
 mod config;
+mod connection_cli;
 mod error;
 mod launchctl;
 mod launchd;
@@ -84,6 +85,14 @@ fn main() {
             }
         }
 
+        TopCommand::Connection { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = connection_cli::dispatch(command) {
+                error!(command = ?"connection", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
         // All other commands use the multi-threaded tokio runtime.
         other => {
             init_logging(cli.verbose);
@@ -125,6 +134,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         TopCommand::Status
         | TopCommand::Launchd { .. }
         | TopCommand::Autoconnect { .. }
+        | TopCommand::Connection { .. }
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }
@@ -356,6 +366,17 @@ fn cmd_status() -> anyhow::Result<()> {
                 conn.interface_name, e
             ),
         }
+    }
+
+    // The new connection-store backend (see `connection_cli`) has no
+    // CLI-driven connect/disconnect of its own yet, so its records are
+    // "stored" rather than "active" here -- shown for visibility while it's
+    // built out, alongside the legacy per-provider table above. Best-effort:
+    // an unreachable daemon (e.g. autostart disabled) shouldn't fail `status`.
+    println!();
+    println!("Stored connections (new connection-store backend, not yet connectable via the CLI):");
+    if let Err(e) = connection_cli::print_connections(privileged_api::ConnectionScope::Mine) {
+        eprintln!("stored connection list unavailable: {e}");
     }
 
     Ok(())

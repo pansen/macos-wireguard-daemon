@@ -29,6 +29,13 @@ pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::InterfaceActive { .. } => "InterfaceActive",
         PrivilegedRequest::WgShow { .. } => "WgShow",
         PrivilegedRequest::NetworkOverview { .. } => "NetworkOverview",
+        PrivilegedRequest::AddConnection { .. } => "AddConnection",
+        PrivilegedRequest::RemoveConnection { .. } => "RemoveConnection",
+        PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
+        PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",
+        PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
+        PrivilegedRequest::ListConnections { .. } => "ListConnections",
+        PrivilegedRequest::GetConnection { .. } => "GetConnection",
     }
 }
 

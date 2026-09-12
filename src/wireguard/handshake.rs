@@ -1,5 +1,3 @@
-use std::net::IpAddr;
-
 use tracing::warn;
 
 use crate::error::Result;
@@ -15,12 +13,11 @@ pub fn wait_for_handshake(interface: &str, dns_servers: &[String]) -> Result<()>
 
 #[must_use]
 pub fn dns_servers_from_config(config_content: &str) -> Vec<String> {
-    match super::config::parse_config(config_content) {
+    match super::connection_config::parse_connection_config(config_content) {
         Ok(parsed) => parsed
             .dns_servers
             .into_iter()
-            .map(|server| server.trim().to_string())
-            .filter(|server| server.parse::<IpAddr>().is_ok())
+            .map(|server| server.to_string())
             .collect(),
         Err(err) => {
             warn!(

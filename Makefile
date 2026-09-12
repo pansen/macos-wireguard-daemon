@@ -20,11 +20,27 @@ install/privileged: install/binary
 	sudo /usr/local/bin/tunmux launchd install
 
 
+.PHONY: install/connection
+install/connection:
+	@# Exercises the new privileged connection-store RPCs (AddConnection,
+	@# and RemoveConnection via --force) for real against the daemon `reload`
+	@# just re-registered, instead of only through unit tests. Per-user (no
+	@# --global), matching the autoconnect agent's own per-user model below.
+	@# Fingerprint identity is separate from --name: --force removes any
+	@# older "direct" record left over from a previous, since-edited profile
+	@# so repeated installs don't accumulate stale connections. An unmodified
+	@# re-run of `make install` is a silent no-op either way. A genuinely
+	@# new/changed config triggers a macOS admin-authentication prompt
+	@# (password or Touch ID) for the add and, if there was a stale record to
+	@# clean up, a second one for that removal.
+	/usr/local/bin/tunmux connection add --file $(TUNMUX_PROFILE) --name direct --force
+
 .PHONY: install
 install: build.release install/binary
 	@# `tunmux reload` registers the privileged daemon (escalating on its own)
 	@# and the autoconnect agent; --file seeds the agent on a first install.
 	/usr/local/bin/tunmux reload --file $(TUNMUX_PROFILE)
+	$(MAKE) install/connection
 
 
 .PHONY: reload

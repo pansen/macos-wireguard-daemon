@@ -59,6 +59,14 @@ pub enum TopCommand {
         command: AutoconnectCommand,
     },
 
+    /// Manage privileged connection-store records (new multi-connection
+    /// backend; CLI surface still minimal while the wgconf commands above
+    /// remain the primary way to connect/disconnect)
+    Connection {
+        #[command(subcommand)]
+        command: ConnectionCommand,
+    },
+
     /// Re-bootstrap both launchd services and bring the tunnel back up
     ///
     /// Runs, in order:
@@ -144,6 +152,66 @@ pub enum AutoconnectCommand {
     Reload,
     /// Stop and unregister the autoconnect LaunchAgent
     Uninstall,
+}
+
+#[derive(Subcommand)]
+pub enum ConnectionCommand {
+    /// Parse and store a WireGuard .conf under the privileged daemon
+    ///
+    /// A byte-for-byte-identical resubmission of an already-stored config
+    /// (same file content, same --global) is a no-op that returns the
+    /// existing connection's id without prompting again. A new or changed
+    /// config -- different fingerprint, e.g. after editing the .conf -- is a
+    /// *distinct* connection: fingerprint identity has nothing to do with
+    /// --name, so without --force it is added alongside any older,
+    /// same-named record rather than replacing it. Each of add/remove
+    /// individually triggers its own macOS admin-authentication prompt
+    /// (password or Touch ID) when it represents a real change.
+    #[command(verbatim_doc_comment)]
+    Add {
+        /// WireGuard .conf file path
+        #[arg(long)]
+        file: String,
+
+        /// Store as a global (system-wide, root-owned, live as soon as the
+        /// daemon is) connection instead of a per-user one
+        #[arg(long)]
+        global: bool,
+
+        /// Display name. Required by --force (it's what --force matches on).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override the config's own MTU
+        #[arg(long)]
+        mtu: Option<u16>,
+
+        /// Before adding, remove any existing connection (same scope) with
+        /// the same --name, so re-running `add` after editing the .conf
+        /// replaces the old record instead of accumulating a new one
+        /// alongside it. Requires --name. A no-op (nothing to remove) if no
+        /// same-named connection exists yet.
+        #[arg(long, requires = "name")]
+        force: bool,
+    },
+
+    /// List stored connections (alias: ls)
+    #[command(visible_alias = "ls")]
+    List {
+        /// List every user's connections (root only)
+        #[arg(long, conflicts_with = "global")]
+        all: bool,
+
+        /// List only global connections
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Remove a stored connection by id (must not be currently connected)
+    Remove {
+        /// Connection id, as printed by `add` or `list`
+        id: String,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -248,8 +316,8 @@ pub enum WgconfCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoconnectCommand, Cli, ConnectProviderCommand, LaunchdCommand, ProviderArg, TopCommand,
-        WgconfCommand,
+        AutoconnectCommand, Cli, ConnectProviderCommand, ConnectionCommand, LaunchdCommand,
+        ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
 
@@ -581,6 +649,107 @@ mod tests {
                 ),
                 _ => panic!("expected autoconnect list command"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_connection_add() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "add",
+            "--file",
+            "/tmp/test.conf",
+            "--name",
+            "direct",
+            "--mtu",
+            "1360",
+        ])
+        .expect("parse connection add");
+
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Add {
+                    file,
+                    global,
+                    name,
+                    mtu,
+                    force,
+                },
+            } => {
+                assert_eq!(file, "/tmp/test.conf");
+                assert!(!global);
+                assert_eq!(name.as_deref(), Some("direct"));
+                assert_eq!(mtu, Some(1360));
+                assert!(!force);
+            }
+            _ => panic!("expected connection add command"),
+        }
+    }
+
+    #[test]
+    fn parse_connection_list_and_ls_alias() {
+        for arg in ["list", "ls"] {
+            let cli = Cli::try_parse_from(["tunmux", "connection", arg])
+                .expect("parse connection list");
+            match cli.command {
+                TopCommand::Connection {
+                    command: ConnectionCommand::List { all, global },
+                } => {
+                    assert!(!all);
+                    assert!(!global);
+                }
+                _ => panic!("expected connection list command"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_connection_list_rejects_all_with_global() {
+        let result = Cli::try_parse_from(["tunmux", "connection", "list", "--all", "--global"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_connection_add_force_requires_name() {
+        let missing_name = Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "add",
+            "--file",
+            "/tmp/test.conf",
+            "--force",
+        ]);
+        assert!(missing_name.is_err());
+
+        let with_name = Cli::try_parse_from([
+            "tunmux",
+            "connection",
+            "add",
+            "--file",
+            "/tmp/test.conf",
+            "--name",
+            "direct",
+            "--force",
+        ])
+        .expect("parse connection add --force --name");
+        match with_name.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Add { force, .. },
+            } => assert!(force),
+            _ => panic!("expected connection add command"),
+        }
+    }
+
+    #[test]
+    fn parse_connection_remove() {
+        let cli = Cli::try_parse_from(["tunmux", "connection", "remove", "some-id"])
+            .expect("parse connection remove");
+        match cli.command {
+            TopCommand::Connection {
+                command: ConnectionCommand::Remove { id },
+            } => assert_eq!(id, "some-id"),
+            _ => panic!("expected connection remove command"),
         }
     }
 }

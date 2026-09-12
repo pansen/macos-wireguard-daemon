@@ -729,97 +729,34 @@ fn apply_mtu_override(config: &mut ParsedUserspaceConfig, value: &str) -> anyhow
     Ok(())
 }
 
+/// Delegates to the shared [`crate::wireguard::connection_config`] parser (the
+/// only WireGuard `.conf` parser in the codebase) and narrows its fully
+/// general, multi-peer result down to the single peer this helper's gotatun
+/// device can actually drive. A config with more than one `[Peer]` section is
+/// an explicit error here rather than the old silent single-peer overwrite.
 #[cfg(unix)]
 fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> {
-    enum Section {
-        None,
-        Interface,
-        Peer,
-    }
-
-    let mut section = Section::None;
-    let mut private_key = None;
-    let mut addresses: Vec<String> = Vec::new();
-    let mut dns_servers: Vec<String> = Vec::new();
-    let mut mtu = None;
-    let mut peer_public_key = None;
-    let mut peer_preshared_key = None;
-    let mut allowed_ips: Vec<String> = Vec::new();
-    let mut endpoint = None;
-
-    for raw_line in config.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = match &line[1..line.len() - 1] {
-                "Interface" => Section::Interface,
-                "Peer" => Section::Peer,
-                _ => Section::None,
-            };
-            continue;
-        }
-
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = raw_value.trim();
-        if value.is_empty() {
-            continue;
-        }
-
-        match section {
-            Section::Interface => match key {
-                "PrivateKey" => private_key = Some(decode_key32("PrivateKey", value)?),
-                "Address" => addresses = split_csv(value),
-                "DNS" => dns_servers = split_csv(value),
-                "MTU" => mtu = Some(crate::wireguard::config::parse_mtu(value)?),
-                _ => {}
-            },
-            Section::Peer => match key {
-                "PublicKey" => peer_public_key = Some(decode_key32("PublicKey", value)?),
-                "PresharedKey" => peer_preshared_key = Some(decode_key32("PresharedKey", value)?),
-                "AllowedIPs" => allowed_ips = split_csv(value),
-                "Endpoint" => endpoint = Some(parse_endpoint(value)?),
-                _ => {}
-            },
-            Section::None => {}
-        }
-    }
-
-    let private_key = private_key.ok_or_else(|| anyhow::anyhow!("missing Interface.PrivateKey"))?;
-    if addresses.is_empty() {
-        anyhow::bail!("missing Interface.Address");
-    }
-    let peer_public_key =
-        peer_public_key.ok_or_else(|| anyhow::anyhow!("missing Peer.PublicKey"))?;
-    if allowed_ips.is_empty() {
-        anyhow::bail!("missing Peer.AllowedIPs");
-    }
-    let endpoint = endpoint.ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
+    let parsed = crate::wireguard::connection_config::parse_connection_config(config)?;
+    anyhow::ensure!(
+        parsed.peers.len() == 1,
+        "gotatun userspace backend supports exactly one [Peer] section, found {}",
+        parsed.peers.len()
+    );
+    let peer = &parsed.peers[0];
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
 
     Ok(ParsedUserspaceConfig {
-        private_key,
-        addresses,
-        dns_servers,
-        mtu,
-        peer_public_key,
-        peer_preshared_key,
-        allowed_ips,
+        private_key: parsed.private_key.to_bytes(),
+        addresses: parsed.addresses.iter().map(ToString::to_string).collect(),
+        dns_servers: parsed.dns_servers.iter().map(ToString::to_string).collect(),
+        mtu: parsed.mtu,
+        peer_public_key: peer.public_key.to_bytes(),
+        peer_preshared_key: peer.preshared_key.as_ref().map(|psk| *psk.as_bytes()),
+        allowed_ips: peer.allowed_ips.iter().map(ToString::to_string).collect(),
         endpoint,
     })
-}
-
-#[cfg(unix)]
-fn split_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToString::to_string)
-        .collect()
 }
 
 #[cfg(all(test, unix))]
@@ -846,37 +783,6 @@ mod userspace_config_tests {
         apply_mtu_override(&mut parsed, "1420").expect("apply override");
         assert_eq!(parsed.mtu, Some(1420));
     }
-}
-
-#[cfg(unix)]
-fn decode_key32(field: &str, value: &str) -> anyhow::Result<[u8; 32]> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .with_context(|| format!("failed to decode {}", field))?;
-    if decoded.len() != 32 {
-        anyhow::bail!("{} must decode to 32 bytes", field);
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
-}
-
-#[cfg(unix)]
-fn parse_endpoint(value: &str) -> anyhow::Result<SocketAddr> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    let (host, port) = value
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid endpoint {}", value))?;
-    let ip: IpAddr = host
-        .trim_matches(['[', ']'])
-        .parse()
-        .with_context(|| format!("invalid endpoint IP {}", host))?;
-    let port: u16 = port
-        .parse()
-        .with_context(|| format!("invalid endpoint port {}", port))?;
-    Ok(SocketAddr::new(ip, port))
 }
 
 #[cfg(unix)]

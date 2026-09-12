@@ -1,15 +1,16 @@
 use std::fs;
-use std::net::ToSocketAddrs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use base64::Engine;
 
 use crate::cli::{WgconfCommand, WgconfConnectArgs};
 use crate::config::{self, AppConfig, Provider};
 use crate::shared::connection_ops;
 use crate::wireguard;
+use crate::wireguard::connection_config::ConnectionPeer;
 
 const PROVIDER: Provider = Provider::Wgconf;
 const INTERFACE_NAME: &str = "wgconf0";
@@ -207,9 +208,10 @@ fn connect_direct(
     let state_endpoint = routed
         .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
         .unwrap_or_else(|| best_effort_endpoint(&source.config_text));
-    let state_dns_servers = wireguard::config::parse_config(&source.config_text)
-        .map(|parsed| parsed.dns_servers)
-        .unwrap_or_default();
+    let state_dns_servers: Vec<String> =
+        wireguard::connection_config::parse_connection_config(&source.config_text)
+            .map(|parsed| parsed.dns_servers.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
 
     match backend {
         wireguard::backend::WgBackend::Userspace => {
@@ -348,119 +350,47 @@ fn canonicalize_source(path: &Path) -> Option<String> {
 }
 
 fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
-    let parsed = wireguard::config::parse_config(config_text)
+    let parsed = wireguard::connection_config::parse_connection_config(config_text)
         .context("invalid WireGuard configuration for kernel path")?;
 
-    if parsed.private_key.trim().is_empty() {
-        anyhow::bail!("Interface.PrivateKey must not be empty");
-    }
-    if parsed.addresses.is_empty() {
-        anyhow::bail!("Interface.Address is required");
-    }
     if parsed.dns_servers.is_empty() {
         anyhow::bail!(
             "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
         );
     }
 
-    let addresses: Vec<String> = parsed
-        .addresses
-        .iter()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect();
-    if addresses.is_empty() {
-        anyhow::bail!("Interface.Address is required");
-    }
-
-    let dns_servers: Vec<String> = parsed
-        .dns_servers
-        .iter()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect();
-    if dns_servers.is_empty() {
-        anyhow::bail!(
-            "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
-        );
-    }
-
-    let (server_public_key, preshared_key, allowed_ips, server_ip, server_port) = {
-        let peer = select_peer_with_endpoint(&parsed)?;
-        let endpoint = peer
-            .endpoint
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("peer endpoint missing"))?;
-        let (server_ip, server_port) = parse_endpoint(endpoint)?;
-
-        (
-            peer.public_key.clone(),
-            peer.preshared_key.clone(),
-            peer.allowed_ips.trim().to_string(),
-            server_ip.to_string(),
-            server_port,
-        )
-    };
+    let peer = select_peer_with_endpoint(&parsed.peers)?;
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| anyhow::anyhow!("peer endpoint missing"))?;
 
     Ok(RoutedConfig {
-        private_key: parsed.private_key.clone(),
-        addresses,
-        dns_servers,
+        private_key: base64_encode(parsed.private_key.as_bytes()),
+        addresses: parsed.addresses.iter().map(ToString::to_string).collect(),
+        dns_servers: parsed.dns_servers.iter().map(ToString::to_string).collect(),
         mtu: parsed.mtu,
-        server_public_key,
-        server_ip,
-        server_port,
-        preshared_key,
-        allowed_ips,
+        server_public_key: base64_encode(peer.public_key.as_bytes()),
+        server_ip: endpoint.ip().to_string(),
+        server_port: endpoint.port(),
+        preshared_key: peer.preshared_key.as_ref().map(|psk| base64_encode(psk.as_bytes())),
+        allowed_ips: peer
+            .allowed_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
     })
 }
 
-fn select_peer_with_endpoint(
-    parsed: &wireguard::config::WgParsedConfig,
-) -> anyhow::Result<&wireguard::config::WgParsedPeer> {
-    parsed
-        .peers
+fn select_peer_with_endpoint(peers: &[ConnectionPeer]) -> anyhow::Result<&ConnectionPeer> {
+    peers
         .iter()
-        .find(|peer| {
-            !peer.public_key.trim().is_empty()
-                && !peer.allowed_ips.trim().is_empty()
-                && peer
-                    .endpoint
-                    .as_deref()
-                    .is_some_and(|ep| !ep.trim().is_empty())
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no usable peer found: require PublicKey, AllowedIPs, and a valid Endpoint"
-            )
-        })
+        .find(|peer| peer.endpoint.is_some())
+        .ok_or_else(|| anyhow::anyhow!("no usable peer found: require a valid Endpoint"))
 }
 
-fn parse_endpoint(value: &str) -> anyhow::Result<(IpAddr, u16)> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok((addr.ip(), addr.port()));
-    }
-
-    let (host, port) = value
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid endpoint {}", value))?;
-    let port: u16 = port
-        .parse()
-        .with_context(|| format!("invalid endpoint port {}", port))?;
-
-    let host = host.trim_matches(['[', ']']);
-    let ip: IpAddr = host
-        .parse()
-        .ok()
-        .or_else(|| {
-            (host, port)
-                .to_socket_addrs()
-                .ok()?
-                .next()
-                .map(|addr| addr.ip())
-        })
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve endpoint host {}", host))?;
-    Ok((ip, port))
+fn base64_encode(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn routed_param_refs(routed: &RoutedConfig) -> (Vec<&str>, Vec<&str>) {
@@ -478,12 +408,10 @@ fn has_ipv6_interface_address(addresses: &[String]) -> bool {
 }
 
 fn best_effort_endpoint(config_text: &str) -> String {
-    if let Ok(parsed) = wireguard::config::parse_config(config_text) {
+    if let Ok(parsed) = wireguard::connection_config::parse_connection_config(config_text) {
         for peer in parsed.peers {
             if let Some(endpoint) = peer.endpoint {
-                if let Ok((ip, port)) = parse_endpoint(&endpoint) {
-                    return format_endpoint(&ip.to_string(), port);
-                }
+                return format_endpoint(&endpoint.ip().to_string(), endpoint.port());
             }
         }
     }
@@ -628,8 +556,8 @@ fn remove_profile_in(provider: &Path, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_ipv6_interface_address, list_profiles_in, parse_endpoint, parse_routed_config,
-        remove_profile_in, save_profile_content_in, validate_profile_name,
+        has_ipv6_interface_address, list_profiles_in, parse_routed_config, remove_profile_in,
+        save_profile_content_in, validate_profile_name,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -657,43 +585,30 @@ mod tests {
         assert!(validate_profile_name("").is_err());
     }
 
-    #[test]
-    fn endpoint_parsing_supports_ipv4_and_bracketed_ipv6() {
-        let (ip4, port4) = parse_endpoint("198.51.100.1:51820").expect("parse ipv4 endpoint");
-        assert_eq!(ip4.to_string(), "198.51.100.1");
-        assert_eq!(port4, 51820);
-
-        let (ip6, port6) =
-            parse_endpoint("[2001:db8::1]:51820").expect("parse bracketed ipv6 endpoint");
-        assert_eq!(ip6.to_string(), "2001:db8::1");
-        assert_eq!(port6, 51820);
-
-        let (_host_ip, host_port) =
-            parse_endpoint("localhost:51820").expect("parse hostname endpoint");
-        assert_eq!(host_port, 51820);
-    }
+    const PRIVATE_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PUBLIC_KEY_B64: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
     #[test]
     fn routed_parse_requires_dns_and_valid_peer_endpoint() {
-        let no_dns = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n";
-        let err = parse_routed_config(no_dns).expect_err("dns should be required");
+        let no_dns = format!("[Interface]\nPrivateKey = {PRIVATE_KEY_B64}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {PUBLIC_KEY_B64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n");
+        let err = parse_routed_config(&no_dns).expect_err("dns should be required");
         assert!(err.to_string().contains("Interface.DNS"));
 
-        let with_dns = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = [2001:db8::1]:51820\n";
-        let parsed = parse_routed_config(with_dns).expect("parse routed config");
+        let with_dns = format!("[Interface]\nPrivateKey = {PRIVATE_KEY_B64}\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {PUBLIC_KEY_B64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = [2001:db8::1]:51820\n");
+        let parsed = parse_routed_config(&with_dns).expect("parse routed config");
         assert_eq!(parsed.server_ip, "2001:db8::1");
         assert_eq!(parsed.server_port, 51820);
         assert_eq!(parsed.mtu, None);
 
-        let with_dns_hostname = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = localhost:51820\n";
-        let parsed = parse_routed_config(with_dns_hostname).expect("parse hostname endpoint");
+        let with_dns_hostname = format!("[Interface]\nPrivateKey = {PRIVATE_KEY_B64}\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {PUBLIC_KEY_B64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = localhost:51820\n");
+        let parsed = parse_routed_config(&with_dns_hostname).expect("parse hostname endpoint");
         assert_eq!(parsed.server_port, 51820);
     }
 
     #[test]
     fn routed_parse_retains_interface_mtu() {
-        let config = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n";
-        let parsed = parse_routed_config(config).expect("parse routed config");
+        let config = format!("[Interface]\nPrivateKey = {PRIVATE_KEY_B64}\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\n[Peer]\nPublicKey = {PUBLIC_KEY_B64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n");
+        let parsed = parse_routed_config(&config).expect("parse routed config");
         assert_eq!(parsed.mtu, Some(1280));
     }
 

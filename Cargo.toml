@@ -45,6 +45,18 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 
+# Connection identity: UUIDv4 connection IDs, config fingerprinting, typed
+# addresses. Key *types* (StaticSecret/PublicKey) come from gotatun's own
+# re-export (see src/wireguard/connection_config.rs); this direct dependency
+# only pins the same resolved version and makes the "zeroize" feature this
+# code relies on explicit rather than incidental to gotatun's own choice of
+# features -- cargo unifies both onto the single resolved x25519-dalek crate.
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+ipnet = "2"
+zeroize = { version = "1", features = ["derive"] }
+x25519-dalek = { version = "2.0.1", features = ["zeroize", "static_secrets"] }
+
 [target.'cfg(unix)'.dependencies]
 # Process/signal/user lookups for the privileged service and helper management.
 nix = { version = "0.29", features = ["fs", "signal", "process", "user"] }

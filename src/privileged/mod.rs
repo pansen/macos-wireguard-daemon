@@ -1,4 +1,10 @@
+// `pub(crate)` rather than private: `client_authorize` runs client-side (in
+// the unprivileged CLI process, not the daemon) and is called directly from
+// `privileged_client`, which needs to reach past this module's usual privacy.
+pub(crate) mod authz;
 mod commands;
+mod connection_ops;
+mod connection_store;
 mod daemon;
 mod dispatch;
 mod managed_pids;
@@ -68,6 +74,7 @@ pub fn serve(
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
+    connection_store::ensure_store_dirs()?;
 
     // Resolve group GID for chown of socket dir and file.
     let group_gid = authorized_group
@@ -135,6 +142,7 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
+    connection_store::ensure_store_dirs()?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -154,7 +162,19 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
             return Ok(());
         }
 
-        let (logs, response) = process_request_payload(&payload, &mut control_state, None);
+        // stdio is one request at a time: a `Pending` (Connect/Disconnect)
+        // outcome is simply awaited here rather than interleaved with other
+        // clients the way the socket transport (`socket.rs`) has to.
+        let (logs, response) = match process_request_payload(&payload, &mut control_state, None) {
+            RequestOutcome::Immediate(logs, response) => (logs, response),
+            RequestOutcome::Pending(rx) => (
+                Vec::new(),
+                rx.recv().unwrap_or_else(|_| PrivilegedResponse::Error {
+                    code: "Other".into(),
+                    message: "worker thread ended without a response".into(),
+                }),
+            ),
+        };
         let buffer = encode_response_frames(&logs, &response)?;
         writer.write_all(&buffer)?;
         writer.flush()?;
@@ -226,13 +246,23 @@ fn encode_response_frames(
     Ok(buffer)
 }
 
+/// Outcome of one dispatch call, as seen by the transport layer. `Pending` is
+/// produced only for `ConnectConnection`/`DisconnectConnection` (see
+/// `dispatch::DispatchOutcome`); the stdio transport just blocks on it
+/// (stdio is inherently one-request-at-a-time), while the socket transport
+/// (`socket.rs`) keeps polling other clients while it waits.
+pub(super) enum RequestOutcome {
+    Immediate(Vec<String>, PrivilegedResponse),
+    Pending(std::sync::mpsc::Receiver<PrivilegedResponse>),
+}
+
 fn process_request_payload(
     payload: &str,
     control_state: &mut ControlState,
     peer: Option<(u32, u32)>,
-) -> (Vec<String>, PrivilegedResponse) {
+) -> RequestOutcome {
     if payload.trim().is_empty() {
-        return (
+        return RequestOutcome::Immediate(
             Vec::new(),
             PrivilegedResponse::Error {
                 code: "Protocol".into(),
@@ -244,7 +274,7 @@ fn process_request_payload(
     let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(payload) {
         Ok(req) => req,
         Err(e) => {
-            return (
+            return RequestOutcome::Immediate(
                 Vec::new(),
                 PrivilegedResponse::Error {
                     code: "Protocol".into(),
@@ -257,7 +287,7 @@ fn process_request_payload(
     // Finding 2 — Protected log disclosure: reject untrusted names before any
     // capture constructs a path or opens a file, including on the error path.
     if let Err(e) = request.validate() {
-        return (
+        return RequestOutcome::Immediate(
             Vec::new(),
             PrivilegedResponse::Error {
                 code: "Validation".into(),
@@ -272,21 +302,32 @@ fn process_request_payload(
     let gotatun_capture = gotatun_capture_for(&request);
 
     let request_kind = describe_request(&request);
-    if let Some((uid, gid)) = peer {
-        info!(
-            transport = ?"socket",
-            uid = ?uid,
-            gid = ?gid,
-            request = ?request_kind, "privileged_request_received");
-    } else {
-        info!(
-            transport = ?"stdio",
-            request = ?request_kind, "privileged_request_received");
-    }
+    // `None` (stdio) means the caller has already proven root by reaching
+    // this process at all -- see `dispatch::PeerOrigin`'s doc comment.
+    let origin = match peer {
+        Some((uid, gid)) => {
+            info!(
+                transport = ?"socket",
+                uid = ?uid,
+                gid = ?gid,
+                request = ?request_kind, "privileged_request_received");
+            dispatch::PeerOrigin::Socket(uid)
+        }
+        None => {
+            info!(
+                transport = ?"stdio",
+                request = ?request_kind, "privileged_request_received");
+            dispatch::PeerOrigin::Stdio
+        }
+    };
 
-    let response = dispatch(request, control_state);
-    let logs = finish_gotatun_capture(gotatun_capture);
-    (logs, response)
+    match dispatch(request, control_state, origin) {
+        dispatch::DispatchOutcome::Immediate(response) => {
+            let logs = finish_gotatun_capture(gotatun_capture);
+            RequestOutcome::Immediate(logs, response)
+        }
+        dispatch::DispatchOutcome::Pending(rx) => RequestOutcome::Pending(rx),
+    }
 }
 
 struct HelperLogCapture {
@@ -439,6 +480,13 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::InterfaceActive { .. } => "InterfaceActive",
         PrivilegedRequest::WgShow { .. } => "WgShow",
         PrivilegedRequest::NetworkOverview { .. } => "NetworkOverview",
+        PrivilegedRequest::AddConnection { .. } => "AddConnection",
+        PrivilegedRequest::RemoveConnection { .. } => "RemoveConnection",
+        PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
+        PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",
+        PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
+        PrivilegedRequest::ListConnections { .. } => "ListConnections",
+        PrivilegedRequest::GetConnection { .. } => "GetConnection",
     }
 }
 
@@ -482,8 +530,11 @@ mod protocol_tests {
                 "config_content": "unused"
             })
             .to_string();
-            let (logs, response) =
-                process_request_payload(&payload, &mut ControlState::new(false), None);
+            let RequestOutcome::Immediate(logs, response) =
+                process_request_payload(&payload, &mut ControlState::new(false), None)
+            else {
+                panic!("validation failure must be an immediate response");
+            };
             assert!(logs.is_empty());
             assert!(
                 matches!(response, PrivilegedResponse::Error { code, .. } if code == "Validation")
