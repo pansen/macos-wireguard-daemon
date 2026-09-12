@@ -285,7 +285,7 @@ hands it to the same userspace path (`src/wireguard/kernel.rs:15`). Neither
 backend needs externally installed tools; `trusted_exec` only ever resolves a
 fixed set of system binaries.
 
-`ConnectionState::is_live()` collapses back to one probe for all three: ask the
+`ConnectionState::is_live()` collapses back to one probe for both: ask the
 daemon whether `/var/run/wireguard/<iface>.sock` exists. A local `exists()`
 would be permission-blind, since that directory is `0750 root:daemon`, and the
 false negative used to drive a reconnect storm from the autoconnect agent

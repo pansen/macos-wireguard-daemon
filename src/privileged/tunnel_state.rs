@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
 
+// `deny_unknown_fields` rejects legacy `active-tunnel.json` records that still
+// carry the removed `wg_quick` discriminator instead of silently dropping it
+// and letting an old externally-managed tunnel be adopted as a match.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Identity {
     pub interface: String,
     pub config_content: String,
@@ -137,6 +141,34 @@ mod tests {
             panic!("must not restart A")
         })
         .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_wg_quick_record_is_not_adopted() {
+        let dir = directory("legacy");
+        let record = dir.join("active.json");
+        let socket = dir.join("wgconf0.sock");
+        fs::write(&socket, "socket").unwrap();
+        let metadata = fs::metadata(&socket).unwrap();
+        let legacy = serde_json::json!({
+            "identity": {
+                "interface": "wgconf0",
+                "config_content": "A",
+                "mtu_override": null,
+                "wg_quick": true
+            },
+            "socket": socket,
+            "device": metadata.dev(),
+            "inode": metadata.ino(),
+            "changed_sec": metadata.ctime(),
+            "changed_nsec": metadata.ctime_nsec(),
+        });
+        fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(connect(&record, identity("A"), &socket, || panic!(
+            "legacy wg-quick record must not be silently adopted"
+        ))
+        .is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

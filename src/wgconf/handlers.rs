@@ -339,7 +339,7 @@ fn canonicalize_source(path: &Path) -> Option<String> {
 
 fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     let parsed = wireguard::config::parse_config(config_text)
-        .context("invalid WireGuard configuration for kernel/proxy path")?;
+        .context("invalid WireGuard configuration for kernel path")?;
 
     if parsed.private_key.trim().is_empty() {
         anyhow::bail!("Interface.PrivateKey must not be empty");
@@ -349,7 +349,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
     }
     if parsed.dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy mode (direct userspace mode can use as-is config)"
+            "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
         );
     }
 
@@ -371,7 +371,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
         .collect();
     if dns_servers.is_empty() {
         anyhow::bail!(
-            "Interface.DNS is required for kernel/proxy mode (direct userspace mode can use as-is config)"
+            "Interface.DNS is required for kernel mode (direct userspace mode can use as-is config)"
         );
     }
 
