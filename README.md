@@ -1,4 +1,4 @@
-# macOS Wireguard Daemon
+# macOS WireGuard Daemon
 
 `wgd` is a command-line WireGuard VPN client for macOS, written in Rust,
 built around a privileged, multi-connection store.
@@ -200,4 +200,4 @@ make hooks
 
 MIT
 
-Copyright (c) 2026 Contributors to macOS Wireguard Daemon
+Copyright (c) 2026 Contributors to macOS WireGuard Daemon
