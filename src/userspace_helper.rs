@@ -2545,6 +2545,10 @@ struct ForeignTunnel {
     addresses: Vec<String>,
     /// Carries a 100.64.0.0/10 (CGNAT) address — the Tailscale tailnet signature.
     cgnat: bool,
+    /// Carries an address that matches one of tunmux's own stored connections
+    /// (see [`tunmux_known_addresses`]) — ours, just not the interface this
+    /// overview is currently reporting on.
+    own: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -2556,7 +2560,28 @@ fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
-    parse_foreign_tunnels(&String::from_utf8_lossy(&output.stdout), own_interface)
+    parse_foreign_tunnels(
+        &String::from_utf8_lossy(&output.stdout),
+        own_interface,
+        &tunmux_known_addresses(),
+    )
+}
+
+/// Every address tunmux has assigned to one of its own stored connections,
+/// active or not. A leftover interface from a connection that isn't the one
+/// currently driving this overview (e.g. an orphaned utun from a previous
+/// connect cycle) still carries one of these addresses, which is what tells
+/// it apart from an actually-foreign VPN sharing the same CGNAT space.
+#[cfg(target_os = "macos")]
+fn tunmux_known_addresses() -> std::collections::HashSet<IpAddr> {
+    crate::privileged::connection_store::load_all()
+        .map(|conns| {
+            conns
+                .iter()
+                .flat_map(|conn| conn.config.addresses.iter().map(|net| net.addr()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// True for interface names that belong to a tunnel/VPN (vs en0, lo0, bridge…).
@@ -2576,7 +2601,11 @@ fn is_cgnat_v4(ip: Ipv4Addr) -> bool {
 /// Parse `ifconfig` into the foreign tunnel interfaces (UP, tunnel-named, not
 /// our own). Pure so it can be unit-tested against captured fixtures.
 #[cfg(target_os = "macos")]
-fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunnel> {
+fn parse_foreign_tunnels(
+    ifconfig: &str,
+    own_interface: &str,
+    own_addresses: &std::collections::HashSet<IpAddr>,
+) -> Vec<ForeignTunnel> {
     let mut tunnels: Vec<ForeignTunnel> = Vec::new();
     let mut current: Option<ForeignTunnel> = None;
 
@@ -2601,6 +2630,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                     mtu,
                     addresses: Vec::new(),
                     cgnat: false,
+                    own: false,
                 });
             }
             continue;
@@ -2614,6 +2644,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                 if let Ok(ip) = addr.parse::<Ipv4Addr>() {
                     tunnel.addresses.push(addr.to_string());
                     tunnel.cgnat |= is_cgnat_v4(ip);
+                    tunnel.own |= own_addresses.contains(&IpAddr::V4(ip));
                 }
             }
         } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
@@ -2623,6 +2654,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                     // Skip link-local; it says nothing about what the tunnel routes.
                     if !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80 {
                         tunnel.addresses.push(bare.to_string());
+                        tunnel.own |= own_addresses.contains(&IpAddr::V6(ip));
                     }
                 }
             }
@@ -2655,7 +2687,9 @@ fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
                 } else {
                     t.addresses.join(", ")
                 },
-                if t.cgnat {
+                if t.own {
+                    "tunmux (own address; another/stale connection)".to_string()
+                } else if t.cgnat {
                     "CGNAT 100.64/10 (Tailscale?)".to_string()
                 } else {
                     "-".to_string()
@@ -3493,7 +3527,7 @@ utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
 utun7: flags=0<> mtu 1500
 \tinet 10.9.9.9 netmask 0xffffffff
 ";
-        let tunnels = parse_foreign_tunnels(ifconfig, "utun4");
+        let tunnels = parse_foreign_tunnels(ifconfig, "utun4", &std::collections::HashSet::new());
 
         assert_eq!(
             tunnels,
@@ -3503,18 +3537,41 @@ utun7: flags=0<> mtu 1500
                     mtu: Some(1380),
                     addresses: vec![], // link-local only
                     cgnat: false,
+                    own: false,
                 },
                 ForeignTunnel {
                     interface: "utun6".to_string(),
                     mtu: Some(1280),
                     addresses: vec!["100.96.10.5".to_string()],
                     cgnat: true,
+                    own: false,
                 },
             ]
         );
         // utun4 (self) excluded; en0/lo0 not tunnels; utun7 is DOWN (no UP flag).
         assert!(!tunnels.iter().any(|t| t.interface == "utun4"));
         assert!(!tunnels.iter().any(|t| t.interface == "utun7"));
+    }
+
+    #[test]
+    fn parse_foreign_tunnels_recognizes_own_other_connection_by_address() {
+        // utun6 carries a CGNAT address that happens to belong to one of
+        // tunmux's own stored connections (e.g. an orphaned interface from a
+        // previous connect cycle) — it should be identified as ours, not
+        // flagged as a possible Tailscale tailnet.
+        let ifconfig = "\
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1384
+\tinet 100.64.1.2 --> 100.64.1.2 netmask 0xffffffff
+";
+        let own_addresses: std::collections::HashSet<IpAddr> =
+            [IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))]
+                .into_iter()
+                .collect();
+        let tunnels = parse_foreign_tunnels(ifconfig, "utun7", &own_addresses);
+
+        assert_eq!(tunnels.len(), 1);
+        assert!(tunnels[0].cgnat);
+        assert!(tunnels[0].own);
     }
 
     #[test]
@@ -3533,10 +3590,23 @@ utun7: flags=0<> mtu 1500
             mtu: Some(1280),
             addresses: vec!["100.96.10.5".to_string()],
             cgnat: true,
+            own: false,
         }]);
         assert_eq!(rows[0][0], "utun6");
         assert_eq!(rows[0][1], "1280");
         assert_eq!(rows[0][3], "CGNAT 100.64/10 (Tailscale?)");
+    }
+
+    #[test]
+    fn foreign_tunnel_rows_render_own_address_distinctly() {
+        let rows = foreign_tunnel_overview_rows(&[ForeignTunnel {
+            interface: "utun6".to_string(),
+            mtu: Some(1384),
+            addresses: vec!["100.64.1.2".to_string()],
+            cgnat: true,
+            own: true,
+        }]);
+        assert_eq!(rows[0][3], "tunmux (own address; another/stale connection)");
     }
 
     #[test]

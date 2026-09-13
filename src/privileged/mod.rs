@@ -4,7 +4,10 @@
 pub(crate) mod authz;
 mod commands;
 mod connection_ops;
-mod connection_store;
+// `pub(crate)` so `userspace_helper`'s network overview can cross-reference a
+// foreign-looking tunnel's address against every stored connection (not just
+// the active one) before guessing it's an unrelated VPN like Tailscale.
+pub(crate) mod connection_store;
 mod daemon;
 mod dispatch;
 mod managed_pids;
