@@ -19,8 +19,10 @@
 //!
 //! The custom right this module authorizes against
 //! (`me.pansen.tunmux.modify-connection`) is registered in the system
-//! authorization database at `tunmux launchd install` time (see
-//! `launchd.rs`), with rule `authenticate-admin`.
+//! authorization database at `tunmux launchd install` time and before either
+//! privileged transport serves requests (see `launchd.rs`), requiring an
+//! admin credential with a 60-second, non-shared
+//! lifetime for the client-to-daemon handoff. Verification never opens UI.
 //!
 //! Links `Security.framework` directly: the privileged daemon is macOS-only
 //! throughout (hardcoded `/var/run/wireguard`, `networksetup`, launchd, ...),
@@ -46,6 +48,7 @@ type AuthorizationRef = *mut std::ffi::c_void;
 type AuthorizationFlags = u32;
 
 const ERR_SECURITY_SUCCESS: OSStatus = 0;
+const ERR_AUTHORIZATION_INTERACTION_NOT_ALLOWED: OSStatus = -60007;
 
 // Values match Security.framework's Authorization.h exactly (verified
 // against the installed SDK header, not from memory: it is easy to get an
@@ -115,6 +118,22 @@ extern "C" {
 
 fn os_status_error(context: &str, status: OSStatus) -> AppError {
     AppError::Auth(format!("{context} failed (OSStatus {status})"))
+}
+
+fn verification_error(status: OSStatus) -> AppError {
+    if status == ERR_AUTHORIZATION_INTERACTION_NOT_ALLOWED {
+        return AppError::Auth(format!(
+            "admin authorization could not be verified without another prompt \
+             (AuthorizationCopyRights OSStatus {status}); the credential may have expired \
+             or the installed authorization rule may be outdated. Retry the command; \
+             if this persists after an upgrade, run `tunmux reload` to update the rule \
+             and restart the privileged daemon"
+        ));
+    }
+    AppError::Auth(format!(
+        "supplied authorization token does not grant the required right \
+         (AuthorizationCopyRights OSStatus {status})"
+    ))
 }
 
 fn one_right_set(name: &CString) -> AuthorizationRights {
@@ -281,22 +300,17 @@ pub fn verify_external_form(external_form: &[u8]) -> Result<()> {
         .map_err(|e| AppError::Other(format!("invalid right name: {e}")))?;
     let rights = one_right_set(&name);
     let mut authorized: *mut AuthorizationRights = ptr::null_mut();
-    // `kAuthorizationFlagInteractionAllowed` IS included here, matching
-    // Apple's own reference helper-tool implementation (BetterAuthorizationSample's
-    // `HandleConnection`) exactly: without it, `AuthorizationCopyRights` takes a
-    // stricter cache-only path that fails with `errAuthorizationInteractionNotAllowed`
-    // (-60007) even when the client already satisfied the right moments ago via
-    // `client_authorize`'s own `AuthorizationCopyRights(..., ExtendRights|InteractionAllowed)`
-    // call -- confirmed empirically (see git history for this comment). This is
-    // still safe: the credential is already cached and valid from the client's
-    // prompt, so this finds it immediately: the daemon has no GUI session to
-    // display a *second* prompt in even if the flag technically permits one.
+    // Verify only the credential obtained by the client. The authorization
+    // session retains GUI access even in this daemon, so allowing interaction
+    // here really can display a second prompt. The installed rule must have
+    // a nonzero timeout: `authenticate-admin` expires credentials immediately
+    // and caused the historical -60007 failure on this non-interactive path.
     let copy_status = unsafe {
         AuthorizationCopyRights(
             auth,
             &rights,
             ptr::null(),
-            K_AUTHORIZATION_FLAG_EXTEND_RIGHTS | K_AUTHORIZATION_FLAG_INTERACTION_ALLOWED,
+            K_AUTHORIZATION_FLAG_EXTEND_RIGHTS,
             &mut authorized,
         )
     };
@@ -317,16 +331,7 @@ pub fn verify_external_form(external_form: &[u8]) -> Result<()> {
     unsafe { AuthorizationFree(auth, free_flags) };
 
     if copy_status != ERR_SECURITY_SUCCESS {
-        // Surface the raw OSStatus rather than a generic message: which of
-        // Apple's documented codes this is (e.g. -60007
-        // errAuthorizationInteractionNotAllowed vs -60006
-        // errAuthorizationDenied vs something else) determines the actual
-        // fix, and guessing without it wastes a real macOS admin-auth round
-        // trip (a UI prompt) per attempt.
-        return Err(AppError::Auth(format!(
-            "supplied authorization token does not grant the required right \
-             (AuthorizationCopyRights OSStatus {copy_status})"
-        )));
+        return Err(verification_error(copy_status));
     }
     Ok(())
 }
@@ -334,6 +339,24 @@ pub fn verify_external_form(external_form: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_not_allowed_explains_retry_and_upgrade_recovery() {
+        let error = verification_error(ERR_AUTHORIZATION_INTERACTION_NOT_ALLOWED);
+        assert!(matches!(error, AppError::Auth(_)));
+        let message = error.to_string();
+        assert!(message.contains("OSStatus -60007"));
+        assert!(message.contains("expired"));
+        assert!(message.contains("Retry the command"));
+        assert!(message.contains("tunmux reload"));
+    }
+
+    #[test]
+    fn other_verification_failures_keep_their_status_without_upgrade_advice() {
+        let message = verification_error(-60005).to_string();
+        assert!(message.contains("OSStatus -60005"));
+        assert!(!message.contains("tunmux reload"));
+    }
 
     #[test]
     fn malformed_external_form_length_is_rejected_before_any_ffi_call() {
@@ -349,5 +372,47 @@ mod tests {
         // manual check, not a unit test -- see the plan's Verification section).
         let err = verify_external_form(&[0u8; EXTERNAL_FORM_LENGTH]).unwrap_err();
         assert!(matches!(err, AppError::Auth(_)));
+    }
+
+    #[test]
+    fn live_but_unauthenticated_external_form_is_rejected() {
+        let mut auth = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                AuthorizationCreate(
+                    ptr::null(),
+                    ptr::null(),
+                    K_AUTHORIZATION_FLAG_DEFAULTS,
+                    &mut auth,
+                )
+            },
+            ERR_SECURITY_SUCCESS
+        );
+        let mut form = AuthorizationExternalFormRaw {
+            bytes: [0; EXTERNAL_FORM_LENGTH],
+        };
+        let status = unsafe { AuthorizationMakeExternalForm(auth, &mut form) };
+        let authorization = ClientAuthorization {
+            auth,
+            external_form: form.bytes.to_vec(),
+        };
+        assert_eq!(status, ERR_SECURITY_SUCCESS);
+        // A real, live session is insufficient without an authenticated
+        // admin credential. Verification must reject it without opening UI.
+        assert!(matches!(
+            verify_external_form(authorization.external_form()),
+            Err(AppError::Auth(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "opens one macOS admin prompt; requires the updated authorization rule installed"]
+    fn authenticated_external_form_verifies_once_without_reprompting() {
+        let authorization = client_authorize().expect("client authentication");
+        verify_external_form(authorization.external_form()).expect("non-interactive verification");
+        assert!(matches!(
+            verify_external_form(authorization.external_form()),
+            Err(AppError::Auth(_))
+        ));
     }
 }

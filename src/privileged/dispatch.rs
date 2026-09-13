@@ -269,7 +269,10 @@ fn handle_add_connection(
     // A genuinely new/changed configuration: requires admin authentication
     // (see `authz`) regardless of `global`, since this is the only path
     // through which root-executed hook content can enter the store.
-    if let Err(response) = require_admin_auth(auth_external_form.as_deref()) {
+    if let Err(response) = require_admin_auth(
+        auth_external_form.as_deref(),
+        "storing a new or changed connection configuration that may contain hooks executed as root",
+    ) {
         return response;
     }
 
@@ -357,7 +360,10 @@ fn reconcile_existing_add(
         && existing.start_mode == ConnectionStartMode::Manual
         && start_mode == ConnectionStartMode::Automatic;
     if elevating {
-        if let Err(response) = require_admin_auth(auth_external_form) {
+        if let Err(response) = require_admin_auth(
+            auth_external_form,
+            "enabling automatic startup of a global connection and its hooks as root at every boot",
+        ) {
             return response;
         }
     }
@@ -410,7 +416,10 @@ fn handle_remove_connection(
         Ok(false) => {}
         Err(error) => return error_response(error),
     }
-    if let Err(response) = require_admin_auth(auth_external_form.as_deref()) {
+    if let Err(response) = require_admin_auth(
+        auth_external_form.as_deref(),
+        "removing a stored connection configuration from the privileged connection store",
+    ) {
         return response;
     }
     match connection_store::remove(&index_lock, &conn_lock, id) {
@@ -509,7 +518,10 @@ fn handle_set_connection_mode(
         && stored.start_mode == ConnectionStartMode::Manual
         && start_mode == ConnectionStartMode::Automatic;
     if elevating {
-        if let Err(response) = require_admin_auth(auth_external_form.as_deref()) {
+        if let Err(response) = require_admin_auth(
+            auth_external_form.as_deref(),
+            "enabling automatic startup of a global connection and its hooks as root at every boot",
+        ) {
             return response;
         }
     }
@@ -610,9 +622,12 @@ fn legacy_interface_access_denied(
 // return value for dispatch handlers (matching their own return type), not
 // propagated through a real error chain, so its size is not a concern here.
 #[allow(clippy::result_large_err)]
-fn require_admin_auth(form: Option<&[u8]>) -> std::result::Result<(), PrivilegedResponse> {
+fn require_admin_auth(
+    form: Option<&[u8]>,
+    cause: &str,
+) -> std::result::Result<(), PrivilegedResponse> {
     match form {
-        None => Err(auth_required()),
+        None => Err(auth_required(cause)),
         Some(bytes) => authz::verify_external_form(bytes).map_err(|error| match error {
             AppError::Auth(message) => auth_denied(message),
             other => auth_denied(other.to_string()),
@@ -728,10 +743,10 @@ fn auth_denied(message: impl Into<String>) -> PrivilegedResponse {
     }
 }
 
-fn auth_required() -> PrivilegedResponse {
+fn auth_required(cause: &str) -> PrivilegedResponse {
     PrivilegedResponse::Error {
         code: "AuthRequired".into(),
-        message: "admin authentication required for this change".into(),
+        message: format!("admin authentication required: {cause}"),
     }
 }
 

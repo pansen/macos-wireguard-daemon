@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
@@ -303,8 +303,16 @@ impl PrivilegedClient {
         &self,
         mut build_request: impl FnMut(Option<Vec<u8>>) -> PrivilegedRequest,
     ) -> Result<PrivilegedResponse> {
-        match self.send(build_request(None)) {
-            Err(AppError::AuthRequired(_)) => {
+        let request = build_request(None);
+        let action = request_kind(&request);
+        match self.send(request) {
+            Err(AppError::AuthRequired(cause)) => {
+                warn!(
+                    action,
+                    method = "authorization_services",
+                    cause = %cause,
+                    "admin_authentication_requested"
+                );
                 eprintln!("tunmux: admin authentication required for this change.");
                 // The `ClientAuthorization` guard must outlive the retried
                 // `send` call: freeing it (which happens automatically at

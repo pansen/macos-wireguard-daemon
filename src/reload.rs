@@ -78,6 +78,12 @@ fn install_privileged_daemon(exe: &Path) -> anyhow::Result<()> {
 
     // Inherited stdio: sudo needs the terminal to prompt for a password, and
     // the installer's own output belongs in this command's output.
+    tracing::warn!(
+        action = "install_privileged_daemon",
+        method = "sudo",
+        cause = "reload must re-register the privileged daemon in the system launchd domain, which requires root",
+        "admin_authentication_requested"
+    );
     let status = command
         .status()
         .context("failed to run sudo for the privileged daemon install")?;
