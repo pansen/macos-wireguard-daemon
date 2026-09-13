@@ -186,8 +186,17 @@ fn cmd_status() -> anyhow::Result<()> {
     // Beneath the summary table, print per-connected-interface detail: the
     // WireGuard tunnel state from `wg show`, and the live route/DNS overview.
     // Both live behind the privileged service and are best-effort: a fetch
-    // failure prints to stderr but never fails `status`.
-    for conn in connections.iter().filter(|c| c.connected) {
+    // failure prints to stderr but never fails `status`. A non-root caller
+    // is denied these two calls for a *global* connection by the daemon's
+    // own `legacy_interface_access_denied` (global detail is root-only,
+    // matching every other global mutation/read), so skip them here rather
+    // than printing an `Auth` error to stderr for every global connection on
+    // every plain `tunmux status` a non-admin user runs.
+    let is_root = nix::unistd::geteuid().is_root();
+    for conn in connections
+        .iter()
+        .filter(|c| c.connected && (is_root || !c.global))
+    {
         match client.wg_show(&conn.interface) {
             Ok(output) if !output.trim().is_empty() => {
                 println!();

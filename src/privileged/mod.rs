@@ -142,9 +142,20 @@ pub fn serve(
     // only once the listener above is already bound and accepting -- doing
     // this serially beforehand would delay every client behind N
     // helper-startup handshakes (see `connection_store::reconcile_boot`'s
-    // doc comment).
-    std::thread::spawn(connection_store::reconcile_boot);
-    socket::serve(listener, &mut control_state, idle_timeout)
+    // doc comment). `background_work` tells the idle-exit check in
+    // `socket::serve` not to shut the daemon down while this thread is still
+    // running, even with no clients connected -- otherwise the idle timer
+    // could fire mid-reconcile and kill the daemon right after it started a
+    // gotatun helper, before `active/<id>.json` is ever written for it.
+    let background_work = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    {
+        let background_work = background_work.clone();
+        std::thread::spawn(move || {
+            connection_store::reconcile_boot();
+            background_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    socket::serve(listener, &mut control_state, idle_timeout, &background_work)
 }
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {

@@ -5,6 +5,7 @@
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -168,6 +169,7 @@ pub(super) fn serve(
     listener: UnixListener,
     state: &mut ControlState,
     idle_timeout: Option<Duration>,
+    background_work: &AtomicUsize,
 ) -> anyhow::Result<()> {
     listener.set_nonblocking(true)?;
     let mut clients = Vec::new();
@@ -199,13 +201,26 @@ pub(super) fn serve(
         });
         // Finish queued responses before honoring shutdown. A lease release
         // from one client must not cut off another client's active session.
+        // Also never exit while background work (e.g. Phase 3's boot
+        // reconciliation) is still running on its own thread: it holds no
+        // client connection, so without this check the idle timer could fire
+        // mid-reconcile and kill the daemon while the gotatun helper it just
+        // started is still coming up, leaving a connected tunnel with no
+        // `active/<id>.json` record for it.
         if clients.is_empty()
+            && background_work.load(Ordering::SeqCst) == 0
             && (state.should_exit_now()
                 || idle_timeout.is_some_and(|timeout| last_activity.elapsed() >= timeout))
         {
             return Ok(());
         }
-        wait_for_io(&listener, &clients, last_activity, idle_timeout);
+        wait_for_io(
+            &listener,
+            &clients,
+            last_activity,
+            idle_timeout,
+            background_work,
+        );
     }
 }
 
@@ -222,6 +237,7 @@ fn wait_for_io(
     clients: &[Client],
     last_activity: Instant,
     idle_timeout: Option<Duration>,
+    background_work: &AtomicUsize,
 ) {
     let mut fds = Vec::with_capacity(clients.len() + 1);
     fds.push(nix::libc::pollfd {
@@ -234,7 +250,14 @@ fn wait_for_io(
     // client is watched for neither: it already sent its complete request and
     // has no response to write yet, so its own fd has nothing new to report.
     let mut wake_at = clients.iter().map(|client| client.deadline).min();
-    let any_pending = clients.iter().any(|client| client.pending.is_some());
+    // Background work (e.g. boot reconciliation) completes on its own thread,
+    // not a file descriptor this poll() can watch, and can be running with no
+    // clients connected at all -- treat it like a pending client worker so
+    // the wait is capped instead of either busy-spinning (once the idle
+    // deadline has already passed) or blocking forever (with no idle timeout
+    // and no clients).
+    let any_pending = background_work.load(Ordering::SeqCst) != 0
+        || clients.iter().any(|client| client.pending.is_some());
     for client in clients {
         let events = if client.pending.is_some() {
             0
@@ -293,8 +316,15 @@ mod tests {
 
         // No clients and 150ms left on the idle timer: the wait must consume it
         // rather than returning at a fixed poll interval.
+        let no_background_work = AtomicUsize::new(0);
         let started = Instant::now();
-        wait_for_io(&listener, &[], started, Some(Duration::from_millis(150)));
+        wait_for_io(
+            &listener,
+            &[],
+            started,
+            Some(Duration::from_millis(150)),
+            &no_background_work,
+        );
         let waited = started.elapsed();
         assert!(
             waited >= Duration::from_millis(120),
@@ -309,6 +339,7 @@ mod tests {
             &[],
             Instant::now(),
             Some(Duration::from_secs(30)),
+            &no_background_work,
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(peer);
@@ -330,6 +361,7 @@ mod tests {
                 listener,
                 &mut ControlState::new(false),
                 Some(Duration::from_millis(20)),
+                &AtomicUsize::new(0),
             )
             .unwrap();
         });
@@ -486,9 +518,34 @@ mod tests {
         client.pending = Some(rx);
 
         let started = Instant::now();
-        wait_for_io(&listener, std::slice::from_ref(&client), started, None);
+        wait_for_io(
+            &listener,
+            std::slice::from_ref(&client),
+            started,
+            None,
+            &AtomicUsize::new(0),
+        );
         // No idle timeout and no client deadline near, but a pending worker
         // still forces a bounded (short) wait rather than blocking forever.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wait_for_io_polls_frequently_while_background_work_is_in_flight() {
+        let path = std::env::temp_dir().join(format!(
+            "tunmux-background-wait-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let background_work = AtomicUsize::new(1);
+
+        let started = Instant::now();
+        wait_for_io(&listener, &[], started, None, &background_work);
+        // No clients, no idle timeout, but background work in flight still
+        // forces a bounded (short) wait rather than blocking forever.
         assert!(started.elapsed() < Duration::from_secs(5));
         std::fs::remove_file(path).unwrap();
     }

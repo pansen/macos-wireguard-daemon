@@ -500,6 +500,21 @@ pub struct ConnectionLock(#[allow(dead_code)] fs::File);
 /// instead of freezing the daemon.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// [`lock_connection_patient`]'s timeout. `ConnectConnection`/
+/// `DisconnectConnection` run on their own spawned worker thread (see
+/// `dispatch.rs`), not the accept loop, so waiting longer here doesn't cost
+/// the daemon's responsiveness to other clients the way it would for a lock
+/// taken directly on the accept thread. A real deployment can otherwise hit
+/// this: `make install`'s `reload` step reinstalls and starts the per-user
+/// session agent, whose own initial reconciliation takes this same lock to
+/// connect an `automatic` connection, moments before `install.connection`
+/// issues its own `connection connect` for that same id. `LOCK_TIMEOUT`'s 2s
+/// budget exists to bound a stuck accept-thread caller, not to race a
+/// same-process helper bring-up; kept comfortably under
+/// `socket::PENDING_WORKER_TIMEOUT` (60s) so a timeout here still surfaces as
+/// a clean error to the client instead of the client just giving up first.
+const PATIENT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Guards interface-name allocation and connection creation/removal. Callers
 /// must take this lock for the full duration of an `AddConnection`/
 /// `RemoveConnection` operation and release it before taking a per-connection
@@ -517,16 +532,28 @@ fn lock_index_in(root: &Path) -> Result<IndexLock> {
     )?))
 }
 
-/// Guards `Connect`/`Disconnect`/`SetConnectionMode` on one connection id.
+/// Guards `RemoveConnection`/`SetConnectionMode` on one connection id; both
+/// run synchronously on the accept-loop thread, so this stays bounded to
+/// `LOCK_TIMEOUT` to keep the daemon responsive to other clients.
 pub fn lock_connection(id: ConnectionId) -> Result<ConnectionLock> {
-    lock_connection_in(&root_dir(), id)
+    lock_connection_with_timeout(id, LOCK_TIMEOUT)
 }
 
-fn lock_connection_in(root: &Path, id: ConnectionId) -> Result<ConnectionLock> {
+/// Guards `Connect`/`Disconnect` on one connection id, from the spawned
+/// worker thread that runs them -- see [`PATIENT_LOCK_TIMEOUT`].
+pub fn lock_connection_patient(id: ConnectionId) -> Result<ConnectionLock> {
+    lock_connection_with_timeout(id, PATIENT_LOCK_TIMEOUT)
+}
+
+fn lock_connection_with_timeout(id: ConnectionId, timeout: Duration) -> Result<ConnectionLock> {
+    lock_connection_in(&root_dir(), id, timeout)
+}
+
+fn lock_connection_in(root: &Path, id: ConnectionId, timeout: Duration) -> Result<ConnectionLock> {
     ensure_dir_0700(&locks_dir_in(root))?;
     Ok(ConnectionLock(crate::state_file::lock_with_timeout(
         &lock_path_in(root, id),
-        LOCK_TIMEOUT,
+        timeout,
     )?))
 }
 
@@ -743,33 +770,49 @@ pub fn is_active(id: ConnectionId) -> Result<bool> {
 /// not block the others or the daemon's availability. Per-user connections
 /// are out of scope here -- they are only ever brought up by that user's own
 /// session (the per-user session agent), never by the daemon at boot.
+///
+/// The "reconciled this boot" marker is only written once every candidate in
+/// this pass actually connected. A candidate whose config is genuinely broken
+/// will therefore be retried on every subsequent daemon wake within the same
+/// boot (harmless -- it never succeeds, so it never becomes wrongly "already
+/// active"), while a merely *transient* failure (e.g. DNS not up yet moments
+/// after boot) gets picked up on the next wake instead of being stuck down
+/// for the rest of the boot. This doesn't reopen the race the marker exists
+/// to close: an admin's explicit `disconnect` can only happen after a fully
+/// successful reconciliation pass, at which point the marker is already set.
 pub fn reconcile_boot() {
     let root = root_dir();
     if let Some(boot_id) = boot_id() {
         if already_reconciled_this_boot_in(&root, &boot_id) {
             return;
         }
-        reconcile_boot_once();
-        mark_reconciled_this_boot_in(&root, &boot_id);
+        if reconcile_boot_once() {
+            mark_reconciled_this_boot_in(&root, &boot_id);
+        }
     } else {
         tracing::warn!("boot_reconciliation_boot_id_unavailable_reconciling_anyway");
         reconcile_boot_once();
     }
 }
 
-fn reconcile_boot_once() {
+/// Returns `true` iff every candidate this pass attempted actually connected
+/// (including the trivial case of no candidates at all).
+fn reconcile_boot_once() -> bool {
     let connections = match load_all() {
         Ok(connections) => connections,
         Err(error) => {
             tracing::warn!(error = %error, "boot_reconciliation_listing_failed");
-            return;
+            return false;
         }
     };
+    let mut all_succeeded = true;
     for id in boot_reconcile_candidates(&connections) {
         if let Err(error) = reconcile_connect(id) {
             tracing::warn!(id = %id, error = %error, "boot_reconciliation_connect_failed");
+            all_succeeded = false;
         }
     }
+    all_succeeded
 }
 
 fn boot_marker_path_in(root: &Path) -> PathBuf {
@@ -1178,6 +1221,47 @@ mod tests {
         // fail fast rather than hang or block the caller indefinitely).
         reconcile_boot();
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_boot_does_not_mark_the_boot_reconciled_after_a_failed_attempt() {
+        // A real environment has no gotatun/root privileges available to a
+        // unit test, so this candidate's connect attempt fails -- exactly
+        // the same as a merely *transient* failure (e.g. DNS not up yet) in
+        // the real daemon. Regression test for the retry gap: a failed
+        // attempt must not write the "reconciled this boot" marker, so the
+        // very next daemon wake retries instead of leaving the connection
+        // down for the rest of the boot.
+        let root = temp_root("boot-retry");
+        set_test_root(root.clone());
+
+        let global_auto = ConnectionId::new();
+        let mut c1 = sample(global_auto, true, None);
+        c1.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &c1).unwrap();
+
+        assert!(
+            !reconcile_boot_once(),
+            "a failing candidate must report overall failure"
+        );
+
+        reconcile_boot();
+        assert!(
+            !boot_marker_path_in(&root).exists(),
+            "reconcile_boot() must not persist the marker on a failed pass, \
+             so the next daemon wake retries instead of leaving the \
+             connection down for the rest of the boot"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_boot_once_trivially_succeeds_with_no_candidates() {
+        let root = temp_root("boot-empty");
+        set_test_root(root.clone());
+        assert!(reconcile_boot_once());
         let _ = fs::remove_dir_all(root);
     }
 
