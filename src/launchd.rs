@@ -14,6 +14,8 @@ use nix::unistd::{chown, geteuid, Gid, Group, Uid, User};
 use crate::cli::LaunchdCommand;
 use crate::config;
 use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failure, xml_escape};
+use crate::privileged_api::ConnectionScope;
+use crate::privileged_client::PrivilegedClient;
 
 pub(crate) const LABEL: &str = "me.pansen.tunmux.privileged";
 pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist";
@@ -213,6 +215,14 @@ fn cmd_restart() -> anyhow::Result<()> {
 fn cmd_uninstall() -> anyhow::Result<()> {
     require_root("uninstall")?;
 
+    // Bootout has no graceful shutdown path of its own (unlike the session
+    // agent, the privileged daemon installs no SIGTERM handler), so any
+    // tunnel still up at this point would be orphaned: its userspace helper,
+    // routes, and DNS override left running with no socket left to reach
+    // them through. Disconnect everything -- `Global` too, since this runs
+    // as root -- while the daemon can still hear us.
+    disconnect_all_connections();
+
     run_ignore_failure("/bin/launchctl", &["bootout", &format!("system/{LABEL}")]);
     // Parity with the old Makefile-based uninstall: leave the label
     // disabled. `cmd_install`'s `launchctl enable` clears this again on
@@ -232,6 +242,49 @@ fn cmd_uninstall() -> anyhow::Result<()> {
         config::privileged_socket_dir().display()
     );
     Ok(())
+}
+
+/// Disconnect every currently-connected stored connection, `Mine` and
+/// `Global` alike, before the daemon that's the only thing able to stop
+/// them goes away. Best-effort per connection, matching `connection
+/// disconnect --all`: one stuck connection must not abort the rest of the
+/// uninstall.
+///
+/// No autostart: a missing/refusing socket already means there is nothing
+/// running to disconnect, and autostarting one here -- this command has no
+/// `CommandScopeGuard` in scope to ask it to shut back down -- would leave
+/// behind a daemon `launchctl bootout` below never touches (it was spawned
+/// directly via `sudo`, not through launchd) and that runs forever under
+/// the default `privileged_autostop_mode = Never`.
+///
+/// Runs the sweep twice: the daemon's own `reconcile_boot()` (see
+/// `connection_store::reconcile_boot`) can race a *freshly spawned* daemon
+/// reconnecting a `Global` `Automatic` record just after this lists it as
+/// disconnected (only possible on the first daemon start of the boot, or
+/// after a boot reconcile pass that had a failure -- `reconcile_boot` is a
+/// no-op on every later spawn this boot). A second pass catches that without
+/// needing to distinguish the rare case from the common one.
+fn disconnect_all_connections() {
+    for _ in 0..2 {
+        disconnect_all_connections_once();
+    }
+}
+
+fn disconnect_all_connections_once() {
+    let client = PrivilegedClient::new().without_autostart();
+    let connected = match client.list_connections(ConnectionScope::All) {
+        Ok(connections) => connections.into_iter().filter(|conn| conn.connected),
+        Err(error) => {
+            eprintln!("Warning: failed to list connections before uninstall: {error:#}");
+            return;
+        }
+    };
+    for conn in connected {
+        match client.disconnect_connection(conn.id) {
+            Ok(()) => println!("Disconnected {}", conn.id),
+            Err(error) => eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id),
+        }
+    }
 }
 
 /// Bail unless running as root, with a hint on how to re-invoke this command.

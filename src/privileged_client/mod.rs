@@ -145,6 +145,20 @@ impl PrivilegedClient {
         }
     }
 
+    /// Disable autostart on this client: a connect finding no socket just
+    /// fails instead of spawning a fresh daemon. For callers (like `launchd
+    /// uninstall`'s pre-bootout disconnect sweep) that run as root with no
+    /// `CommandScopeGuard` in scope to ask a spawned daemon to shut back
+    /// down afterward, and where "nothing is listening" already means
+    /// "nothing to disconnect" -- autostarting one here would leave behind
+    /// a daemon with no idle timeout (the default `privileged_autostop_mode`
+    /// is `Never`) that `launchctl bootout` never touches, since it was
+    /// spawned directly via `sudo`, not through launchd.
+    pub(crate) fn without_autostart(mut self) -> Self {
+        self.autostart_enabled = false;
+        self
+    }
+
     /// Run `wg show <interface>` as root and return the output.
     /// Works for both kernel and userspace (gotatun) backends.
     #[allow(dead_code)]
