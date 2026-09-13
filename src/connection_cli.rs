@@ -139,7 +139,7 @@ fn cmd_add(
 /// whole disconnect-then-remove sequence while the daemon reports `Busy`.
 ///
 /// The race this guards against is wider than a single check-then-act gap:
-/// `tunmux reload` reinstalls the per-user session agent with `RunAtLoad`,
+/// `tunmux launchd reload` reinstalls the per-user session agent with `RunAtLoad`,
 /// and the agent's one-shot startup reconcile (`session_agent::run` ->
 /// `reconcile_connect_mine`) can reconnect this exact `Automatic` record via
 /// a full `ConnectConnection` round trip (WireGuard handshake, routes, DNS)

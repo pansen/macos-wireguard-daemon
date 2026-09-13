@@ -2,7 +2,7 @@
 //! privileged launchd daemon plist. This module provides both the
 //! plist-rendering / binary-location-validation logic and the
 //! `tunmux launchd install|restart|uninstall` command handlers, which own
-//! every system-domain launchd operation (the Makefile and `tunmux reload`
+//! every system-domain launchd operation (the Makefile and `tunmux launchd reload`
 //! both go through them).
 
 use std::fs;
@@ -144,6 +144,14 @@ pub fn dispatch(command: LaunchdCommand) -> anyhow::Result<()> {
     match command {
         LaunchdCommand::Install { plist_template } => cmd_install(plist_template),
         LaunchdCommand::Restart => cmd_restart(),
+        LaunchdCommand::Reload(args) => {
+            let config = config::load_config();
+            let _command_scope = crate::privileged_client::CommandScopeGuard::begin(
+                config.general.privileged_autostop_mode,
+            );
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(crate::reload::run(args, &config))
+        }
         LaunchdCommand::Uninstall => cmd_uninstall(),
     }
 }

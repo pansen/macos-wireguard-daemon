@@ -231,9 +231,9 @@ flowchart LR
 
     PARSE --> PRIV["Privileged --serve (hidden)<br/>privileged::serve / serve_stdio"]
     PARSE --> STATUS["Status<br/>cmd_status (sync, no tokio)"]
-    PARSE --> LAUNCHD["Launchd<br/>launchd::dispatch (sync)"]
+    PARSE --> LAUNCHD["Launchd<br/>launchd::dispatch"]
     PARSE --> CONN["Connection<br/>connection_cli::dispatch (sync)"]
-    PARSE --> RELOAD["Reload<br/>tokio runtime + CommandScopeGuard<br/>reload::run"]
+    LAUNCHD --> RELOAD["Reload<br/>tokio runtime + CommandScopeGuard<br/>reload::run"]
 
     CONN --> AGENT["Agent subcommand<br/>session_agent::dispatch"]
     CONN --> RPC["Add / List / Remove / Connect /<br/>Disconnect / Mode / Get<br/>-> PrivilegedClient"]
@@ -243,9 +243,9 @@ flowchart LR
     RELOAD --> AGENT
 ```
 
-`Status`, `Launchd`, and `Connection` are synchronous and skip the tokio
-runtime entirely, since none of them holds a privileged session open across
-an `await`. `Reload` is the one command that needs a runtime: it re-execs
+`Status`, `Connection`, and the `Launchd` install/restart/uninstall commands
+are synchronous and skip the tokio runtime entirely. `Launchd Reload` creates
+a runtime and a `CommandScopeGuard` inside `launchd::dispatch`: it re-execs
 itself under `sudo` for the daemon-install step, calls `PrivilegedClient`
 directly to disconnect every one of the caller's connected connections, then
 re-renders and re-bootstraps the session agent.
@@ -344,7 +344,7 @@ still use fresh sessions and require their own authentication. The built-in
 `authenticate-admin` rule has a zero timeout, which caused a second prompt
 when the daemon previously allowed interaction during verification.
 
-Replacing the binary does not change an already-running daemon; `tunmux reload`
+Replacing the binary does not change an already-running daemon; `tunmux launchd reload`
 updates both the registered rule and the daemon immediately, while the next
 normal daemon startup updates the rule automatically. A non-interactive
 verification failure (`-60007`) reports that the credential may have expired or
@@ -618,7 +618,7 @@ never makes `status` fail.
 ```mermaid
 flowchart TB
     MAKE["make install"] --> BUILD["cargo build --release<br/>-> /usr/local/bin/tunmux"]
-    BUILD --> RELOAD["tunmux reload"]
+    BUILD --> RELOAD["tunmux launchd reload"]
     RELOAD --> LI["sudo tunmux launchd install"]
     RELOAD --> DISC["connection disconnect --all (mine)"]
     RELOAD --> AI["connection agent install -f"]

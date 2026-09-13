@@ -126,7 +126,7 @@ fn verification_error(status: OSStatus) -> AppError {
             "admin authorization could not be verified without another prompt \
              (AuthorizationCopyRights OSStatus {status}); the credential may have expired \
              or the installed authorization rule may be outdated. Retry the command; \
-             if this persists after an upgrade, run `tunmux reload` to update the rule \
+             if this persists after an upgrade, run `tunmux launchd reload` to update the rule \
              and restart the privileged daemon"
         ));
     }
@@ -348,14 +348,14 @@ mod tests {
         assert!(message.contains("OSStatus -60007"));
         assert!(message.contains("expired"));
         assert!(message.contains("Retry the command"));
-        assert!(message.contains("tunmux reload"));
+        assert!(message.contains("tunmux launchd reload"));
     }
 
     #[test]
     fn other_verification_failures_keep_their_status_without_upgrade_advice() {
         let message = verification_error(-60005).to_string();
         assert!(message.contains("OSStatus -60005"));
-        assert!(!message.contains("tunmux reload"));
+        assert!(!message.contains("tunmux launchd reload"));
     }
 
     #[test]

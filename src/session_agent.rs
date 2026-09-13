@@ -69,7 +69,7 @@ fn render_plist(template: &str, bin: &str, home: &str) -> anyhow::Result<String>
     Ok(rendered)
 }
 
-/// Re-render and re-bootstrap the agent, for `tunmux reload`.
+/// Re-render and re-bootstrap the agent, for `tunmux launchd reload`.
 pub(crate) fn reinstall() -> anyhow::Result<()> {
     cmd_install(true)
 }

@@ -21,7 +21,7 @@ pub enum TopCommand {
     /// Show active VPN connections, including WireGuard tunnel state
     Status,
 
-    /// Manage the privileged launchd daemon (system domain)
+    /// Manage the privileged launchd daemon and reload both launchd services
     Launchd {
         #[command(subcommand)]
         command: LaunchdCommand,
@@ -34,18 +34,6 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: ConnectionCommand,
     },
-
-    /// Re-bootstrap both launchd services and bring stored connections back up
-    ///
-    /// Runs, in order:
-    ///   sudo tunmux launchd install         (re-registers the privileged daemon)
-    ///   tunmux connection disconnect --all  (drops tunnels left over from before)
-    ///   tunmux connection agent install -f  (re-registers the session agent, reconnects)
-    ///
-    /// Run as your normal user; only the daemon step escalates via sudo.
-    /// Logs at debug level unless -s is given.
-    #[command(verbatim_doc_comment)]
-    Reload(ReloadArgs),
 
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
@@ -91,8 +79,28 @@ pub enum LaunchdCommand {
         #[arg(long, value_name = "PATH")]
         plist_template: Option<PathBuf>,
     },
-    /// Restart the privileged daemon (launchctl kickstart -k)
+    /// Restart only the privileged daemon using its existing registration (run with sudo); use when the daemon hangs or misbehaves but its registration is intact
+    ///
+    /// Runs launchctl kickstart -k. Use this to restart an already-registered
+    /// daemon. It does not re-register either service, restart the session
+    /// agent, or explicitly reconnect stored connections.
+    /// For service recovery and reconnection, use tunmux launchd reload.
     Restart,
+    /// Re-register the daemon and session agent, then reconnect automatic connections; use after an upgrade or when services are disabled, unregistered, or broken
+    ///
+    /// Use this after an upgrade or when services are disabled, unregistered,
+    /// or behaving unexpectedly. Rebuilds both launchd registrations and clears
+    /// stale connections before the session agent reconnects automatic connections.
+    ///
+    /// Runs, in order:
+    ///   sudo tunmux launchd install         (re-registers the privileged daemon)
+    ///   tunmux connection disconnect --all  (drops this user's active connections)
+    ///   tunmux connection agent install -f  (re-registers the session agent, reconnects)
+    ///
+    /// Run as your normal user, without sudo; only the daemon step escalates.
+    /// Logs at debug level unless -s is given.
+    #[command(verbatim_doc_comment)]
+    Reload(ReloadArgs),
     /// Stop and unregister the privileged daemon (keeps binary, group, logs)
     Uninstall,
 }
@@ -321,23 +329,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_reload_silent_flag() {
-        let bare = Cli::try_parse_from(["tunmux", "reload"]).expect("parse bare reload");
+    fn parse_launchd_reload_silent_flag() {
+        let bare = Cli::try_parse_from(["tunmux", "launchd", "reload"]).expect("parse bare reload");
         match bare.command {
-            TopCommand::Reload(args) => assert!(!args.silent),
+            TopCommand::Launchd {
+                command: LaunchdCommand::Reload(args),
+            } => assert!(!args.silent),
             _ => panic!("expected reload command"),
         }
 
         for arg in ["-s", "--silent"] {
-            let cli = Cli::try_parse_from(["tunmux", "reload", arg]).expect("parse reload silent");
+            let cli = Cli::try_parse_from(["tunmux", "launchd", "reload", arg])
+                .expect("parse reload silent");
             match cli.command {
-                TopCommand::Reload(args) => assert!(args.silent),
+                TopCommand::Launchd {
+                    command: LaunchdCommand::Reload(args),
+                } => assert!(args.silent),
                 _ => panic!("expected reload command"),
             }
         }
 
+        assert!(Cli::try_parse_from(["tunmux", "reload"]).is_err());
+
         // Asking for both quiet and verbose has no sensible reading.
-        assert!(Cli::try_parse_from(["tunmux", "reload", "-s", "-v"]).is_err());
+        assert!(Cli::try_parse_from(["tunmux", "launchd", "reload", "-s", "-v"]).is_err());
     }
 
     #[test]

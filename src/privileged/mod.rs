@@ -80,7 +80,7 @@ pub fn serve(
     // Upgrade authorizationdb before any client can authenticate against the
     // old zero-timeout rule. Do not serve mutations with an incompatible rule.
     crate::launchd::register_authorization_right()
-        .context("failed to initialize the privileged service authorization rule; run `tunmux reload` to repair the installation")?;
+        .context("failed to initialize the privileged service authorization rule; run `tunmux launchd reload` to repair the installation")?;
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
@@ -169,7 +169,7 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     // Stdio helpers can start without ever going through launchd install.
     crate::launchd::register_authorization_right()
-        .context("failed to initialize the privileged stdio authorization rule; run `tunmux reload` to repair the installation")?;
+        .context("failed to initialize the privileged stdio authorization rule; run `tunmux launchd reload` to repair the installation")?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
     connection_store::ensure_store_dirs()?;

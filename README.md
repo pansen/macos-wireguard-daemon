@@ -40,7 +40,7 @@ make install TUNMUX_PROFILE=/path/to/your.conf CONNECTION_NAME=home
 This does, in order:
 
 - Builds the release binary and installs it to `/usr/local/bin/tunmux`.
-- Runs `tunmux reload` (see below), which registers the privileged launchd
+- Runs `tunmux launchd reload` (see below), which registers the privileged launchd
   daemon, disconnects anything already connected under your account, and
   installs the per-user session agent.
 - Adds your config as a per-user connection named `CONNECTION_NAME` with
@@ -67,7 +67,7 @@ A macOS update can leave the launchd services booted out or disabled. To put
 both of them back and reconnect, run:
 
 ```bash
-tunmux reload
+tunmux launchd reload
 ```
 
 It re-registers the privileged daemon (escalating via `sudo` for that one
@@ -75,8 +75,14 @@ step), disconnects every one of your currently-connected connections, and
 reinstalls the session agent, which then reconnects whatever automatic
 connections are stored for you. `make reload` is the same command.
 
-Unlike the rest of the CLI, `reload` logs its own steps at debug level by
-default; `tunmux reload -s` keeps only the step headers. The daemon's own
+For a daemon-only restart using its existing launchd registration, run
+`sudo tunmux launchd restart`. This leaves service registrations and the
+session agent unchanged and does not explicitly reconnect stored connections.
+Use `tunmux launchd reload` for the full recovery sequence above; run it as
+your normal user, without sudo.
+
+Unlike the rest of the CLI, `launchd reload` logs its own steps at debug level by
+default; `tunmux launchd reload -s` keeps only the step headers. The daemon's own
 output goes to `/var/log/tunmux/privileged.{out,err}.log`, and each
 connection's helper logs to `/var/log/tunmux/<interface>.log` (`tunmux
 connection get <id>` prints the interface name).
