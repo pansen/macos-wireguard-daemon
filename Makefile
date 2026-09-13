@@ -3,6 +3,7 @@
 # currently stored that way, not this variable.
 # Override on other machines/users: make install TUNMUX_PROFILE=/path/to/your.conf
 TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
+CONNECTION_NAME ?= andi_split
 
 .PHONY: hooks
 hooks:
@@ -37,9 +38,12 @@ install/connection:
 	@# macOS admin-authentication prompt (password or Touch ID) for the add
 	@# and, if there was a stale record to clean up, a second one for that
 	@# removal.
-	@id=$$(/usr/local/bin/tunmux connection add --file $(TUNMUX_PROFILE) --name direct --force --start-mode automatic | sed -n 's/^Connection id: //p'); \
-	echo "==> connection id: $$id"; \
-	/usr/local/bin/tunmux connection connect "$$id"
+	/usr/local/bin/tunmux connection add \
+		--file $(TUNMUX_PROFILE) \
+		--name $(CONNECTION_NAME) \
+		--force \
+		--start-mode automatic
+	/usr/local/bin/tunmux connection connect $(CONNECTION_NAME)
 
 .PHONY: install
 install: build.release install/binary
