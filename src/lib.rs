@@ -7,6 +7,9 @@
 pub mod cli;
 pub mod color;
 pub mod config;
+// Also home to the `<ID>` completer `cli` attaches to its connection
+// positionals, so `cli` cannot compile without it.
+pub mod connection_cli;
 pub mod error;
 pub mod launchctl;
 pub mod launchd;

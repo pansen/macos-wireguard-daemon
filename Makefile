@@ -46,6 +46,27 @@ install.connection:
 		--start-mode automatic
 	$(TUNMUX_BIN) connection connect $(CONNECTION_NAME)
 
+.PHONY: install.completion
+install.completion:
+	@# Bash completion. `tunmux` serves its own completions: run with
+	@# COMPLETE=bash it prints the registration script, and the shell then
+	@# calls back into the binary for candidates, so completions follow the
+	@# CLI without a checked-in script to regenerate. Appended only when
+	@# absent, so repeated `make install` runs don't stack duplicate lines.
+	@#
+	@# `eval "$$(...)"` rather than clap_complete's documented
+	@# `source <(COMPLETE=bash tunmux)`: process substitution loses the
+	@# script under macOS's system bash 3.2 (/bin/bash), leaving the
+	@# completion function undefined. The eval form registers correctly on
+	@# both 3.2 and bash 5. stderr is dropped so a removed binary (see
+	@# `make purge`) leaves a dead no-op here instead of an error on every
+	@# new shell.
+	@#
+	@# zsh and fish use the same mechanism (`COMPLETE=zsh`/`COMPLETE=fish`);
+	@# only bash is wired up here.
+	@grep -qxF 'eval "$$(COMPLETE=bash tunmux 2>/dev/null)"' "$(HOME)/.bashrc" 2>/dev/null || \
+		echo 'eval "$$(COMPLETE=bash tunmux 2>/dev/null)"' >> "$(HOME)/.bashrc"
+
 .PHONY: uninstall.legacy-autoconnect
 uninstall.legacy-autoconnect:
 	@# One-time migration cleanup: `me.pansen.tunmux.autoconnect` was replaced
@@ -66,6 +87,7 @@ install: build.release install.binary uninstall.legacy-autoconnect
 	@# only just brought up, for no benefit.
 	$(TUNMUX_BIN) launchd reload
 	$(MAKE) install.connection
+	$(MAKE) install.completion
 
 
 .PHONY: reload

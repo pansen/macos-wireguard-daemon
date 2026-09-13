@@ -19,6 +19,13 @@ path = "src/main.rs"
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
+# Shell completion. `unstable-dynamic` provides the completion engine that
+# introspects the live `clap::Command` at completion time (so completions
+# can't drift from `--help`) and lets individual args compute their candidates
+# at runtime -- which is what connection ids/names need, since those only
+# exist in the privileged daemon's store. The feature is semver-exempt and may
+# change on a clap_complete minor bump.
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
