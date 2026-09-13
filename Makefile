@@ -58,13 +58,13 @@ uninstall.legacy-autoconnect:
 
 .PHONY: install
 install: build.release install.binary uninstall.legacy-autoconnect
-	@# `tunmux reload` registers the privileged daemon (escalating on its own),
+	@# `tunmux launchd reload` registers the privileged daemon (escalating on its own),
 	@# drops any leftover tunnels, and re-registers the session agent -- do
 	@# not re-run `connection agent install` after `install.connection`
 	@# below: that would SIGTERM the instance `reload` just started (bootout
 	@# before bootstrap), disconnecting the connection `install.connection`
 	@# only just brought up, for no benefit.
-	$(TUNMUX_BIN) reload
+	$(TUNMUX_BIN) launchd reload
 	$(MAKE) install.connection
 
 
@@ -72,7 +72,7 @@ install: build.release install.binary uninstall.legacy-autoconnect
 reload:
 	@# Re-registers both launchd services and reconnects this user's
 	@# `automatic` connections.
-	$(TUNMUX_BIN) reload
+	$(TUNMUX_BIN) launchd reload
 
 
 .PHONY: uninstall.autostart

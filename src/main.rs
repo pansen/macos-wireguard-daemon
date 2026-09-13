@@ -19,7 +19,7 @@ mod wireguard;
 use clap::Parser;
 use tracing::error;
 
-use cli::{Cli, TopCommand};
+use cli::{Cli, LaunchdCommand, TopCommand};
 use privileged_api::ConnectionScope;
 
 fn main() {
@@ -80,21 +80,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-
-        // All other commands use the multi-threaded tokio runtime.
-        other => {
-            init_logging(cli.verbose);
-            let config = config::load_config();
-            let _command_scope = privileged_client::CommandScopeGuard::begin(
-                config.general.privileged_autostop_mode,
-            );
-
-            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            if let Err(e) = rt.block_on(run(other, config)) {
-                error!( error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
-            }
-        }
     }
 }
 
@@ -102,23 +87,11 @@ fn init_logging(verbose: bool) {
     logging::init_terminal(verbose);
 }
 
-/// Commands that log at debug level without being asked. `reload` is the one:
+/// Commands that log at debug level without being asked. `launchd reload` is the one:
 /// you run it because something is off, so the daemon and helper detail is the
 /// point. `-s` opts back out.
 fn defaults_to_debug(command: &TopCommand) -> bool {
-    matches!(command, TopCommand::Reload(args) if !args.silent)
-}
-
-async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
-    match command {
-        TopCommand::Reload(args) => reload::run(args, &config).await,
-        TopCommand::Status
-        | TopCommand::Launchd { .. }
-        | TopCommand::Connection { .. }
-        | TopCommand::Privileged { .. } => {
-            unreachable!()
-        }
-    }
+    matches!(command, TopCommand::Launchd { command: LaunchdCommand::Reload(args) } if !args.silent)
 }
 
 /// `tunmux status`: built entirely from the privileged connection store --
@@ -222,26 +195,27 @@ fn cmd_status() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::defaults_to_debug;
-    use crate::cli::{Cli, ReloadArgs, TopCommand};
+    use crate::cli::{Cli, LaunchdCommand, ReloadArgs, TopCommand};
     use clap::Parser;
 
     #[test]
     fn reload_logs_at_debug_unless_silenced() {
-        assert!(defaults_to_debug(&TopCommand::Reload(ReloadArgs {
-            silent: false,
-        })));
-        assert!(!defaults_to_debug(&TopCommand::Reload(ReloadArgs {
-            silent: true,
-        })));
+        assert!(defaults_to_debug(&TopCommand::Launchd {
+            command: LaunchdCommand::Reload(ReloadArgs { silent: false }),
+        }));
+        assert!(!defaults_to_debug(&TopCommand::Launchd {
+            command: LaunchdCommand::Reload(ReloadArgs { silent: true }),
+        }));
         assert!(!defaults_to_debug(&TopCommand::Status));
     }
 
     #[test]
     fn parsed_reload_command_asks_for_debug_logging() {
-        let cli = Cli::try_parse_from(["tunmux", "reload"]).expect("parse reload");
+        let cli = Cli::try_parse_from(["tunmux", "launchd", "reload"]).expect("parse reload");
         assert!(defaults_to_debug(&cli.command));
 
-        let quiet = Cli::try_parse_from(["tunmux", "reload", "-s"]).expect("parse silent reload");
+        let quiet = Cli::try_parse_from(["tunmux", "launchd", "reload", "-s"])
+            .expect("parse silent reload");
         assert!(!defaults_to_debug(&quiet.command));
     }
 }

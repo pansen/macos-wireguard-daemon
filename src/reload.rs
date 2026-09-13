@@ -1,4 +1,4 @@
-//! `tunmux reload`: put both launchd services back into a known-good state
+//! `tunmux launchd reload`: put both launchd services back into a known-good state
 //! and bring stored connections back up. This is the recovery path after a
 //! macOS update (which can leave the system daemon booted out or disabled)
 //! or after anything else that left tunmux behaving oddly.
@@ -37,7 +37,7 @@ pub async fn run(_args: ReloadArgs, _config: &AppConfig) -> anyhow::Result<()> {
     crate::session_agent::reinstall()?;
 
     println!();
-    println!("tunmux reload complete. Check with: tunmux status");
+    println!("tunmux launchd reload complete. Check with: tunmux status");
     Ok(())
 }
 
@@ -105,7 +105,7 @@ fn step(what: &str) {
 fn refuse_if_root() -> anyhow::Result<()> {
     if geteuid().is_root() {
         anyhow::bail!(
-            "run `tunmux reload` as your normal user, not with sudo; it escalates the \
+            "run `tunmux launchd reload` as your normal user, not with sudo; it escalates the \
              privileged daemon step on its own"
         );
     }
