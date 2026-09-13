@@ -111,7 +111,7 @@ tunmux connection connect <id-or-name> [--gotatun-debug]
 tunmux connection disconnect <id-or-name> | -a/--all
 tunmux connection mode <id-or-name> <manual|automatic>
 tunmux connection remove <id-or-name>
-tunmux connection agent {install,status,uninstall}
+tunmux launchd agent {install,status,uninstall}
 ```
 
 Adding or removing a connection, and elevating a global connection's mode

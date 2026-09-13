@@ -1,11 +1,11 @@
 //! `tunmux connection ...`: the CLI surface over the privileged
 //! connection-store RPCs (`AddConnection`/`ListConnections`/
 //! `RemoveConnection`/`ConnectConnection`/`DisconnectConnection`/
-//! `SetConnectionMode`/`GetConnection`), plus `agent` (Phase 4's per-user
-//! session-reconciliation LaunchAgent, see `session_agent.rs`). This is the
-//! Phase 5 CLI: the legacy `wgconf`/`connect`/`disconnect`/`autoconnect`
-//! surface has been retired in favor of it (see
-//! `doc/connection-store-plan.md`'s Phase 5 addendum for the mapping).
+//! `SetConnectionMode`/`GetConnection`). This is the Phase 5 CLI: the legacy
+//! `wgconf`/`connect`/`disconnect`/`autoconnect` surface has been retired in
+//! favor of it (see `doc/connection-store-plan.md`'s Phase 5 addendum for the
+//! mapping). The per-user session-reconciliation LaunchAgent lives under
+//! `tunmux launchd agent ...` instead (see `session_agent.rs`).
 use std::time::Duration;
 
 use anyhow::Context;
@@ -42,7 +42,6 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
         ConnectionCommand::Disconnect { id, all } => cmd_disconnect(id.as_deref(), all),
         ConnectionCommand::Mode { id, start_mode } => cmd_mode(&id, start_mode.into()),
         ConnectionCommand::Get { id } => cmd_get(&id),
-        ConnectionCommand::Agent { command } => crate::session_agent::dispatch(command),
     }
 }
 

@@ -3,7 +3,9 @@
 //! plist-rendering / binary-location-validation logic and the
 //! `tunmux launchd install|restart|uninstall` command handlers, which own
 //! every system-domain launchd operation (the Makefile and `tunmux launchd reload`
-//! both go through them).
+//! both go through them). `tunmux launchd agent ...` is dispatched from here
+//! too, but its own installer/body live in `session_agent.rs` since it's a
+//! per-user (GUI domain) LaunchAgent, not this module's system daemon.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -153,6 +155,7 @@ pub fn dispatch(command: LaunchdCommand) -> anyhow::Result<()> {
             rt.block_on(crate::reload::run(args, &config))
         }
         LaunchdCommand::Uninstall => cmd_uninstall(),
+        LaunchdCommand::Agent { command } => crate::session_agent::dispatch(command),
     }
 }
 

@@ -1,4 +1,4 @@
-//! `tunmux connection agent ...`: installer + long-lived body for the Phase 4
+//! `tunmux launchd agent ...`: installer + long-lived body for the Phase 4
 //! per-user session-reconciliation LaunchAgent. It never bakes a connect
 //! source into its plist -- on every start it just asks the privileged
 //! daemon for whatever is currently `Mine` + `Automatic` and connects it, so
@@ -24,7 +24,7 @@ use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::{geteuid, getuid};
 use tracing::warn;
 
-use crate::cli::ConnectionAgentCommand;
+use crate::cli::AgentCommand;
 use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failure, xml_escape};
 use crate::privileged_api::{ConnectionScope, ConnectionStartMode};
 use crate::privileged_client::PrivilegedClient;
@@ -35,12 +35,12 @@ const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.tunmux.session-agent
 const BIN_PLACEHOLDER: &str = "@TUNMUX_BIN@";
 const HOME_PLACEHOLDER: &str = "@TUNMUX_HOME@";
 
-pub fn dispatch(command: ConnectionAgentCommand) -> anyhow::Result<()> {
+pub fn dispatch(command: AgentCommand) -> anyhow::Result<()> {
     match command {
-        ConnectionAgentCommand::Install { force } => cmd_install(force),
-        ConnectionAgentCommand::Uninstall => cmd_uninstall(),
-        ConnectionAgentCommand::Status => cmd_status(),
-        ConnectionAgentCommand::Run => run(),
+        AgentCommand::Install { force } => cmd_install(force),
+        AgentCommand::Uninstall => cmd_uninstall(),
+        AgentCommand::Status => cmd_status(),
+        AgentCommand::Run => run(),
     }
 }
 
@@ -226,7 +226,7 @@ fn reconcile_disconnect_mine() {
 
 /// Block `SIGTERM` for the calling thread so it queues as pending instead of
 /// running the default disposition (process termination) the moment it
-/// arrives. This process has no other threads on the `connection agent run`
+/// arrives. This process has no other threads on the `launchd agent run`
 /// path (no tokio runtime, no spawned workers), so blocking it here blocks
 /// it process-wide in practice.
 fn block_sigterm() -> anyhow::Result<()> {
@@ -300,7 +300,7 @@ fn domain_target(uid: u32) -> String {
 fn refuse_if_root() -> anyhow::Result<()> {
     if geteuid().is_root() {
         anyhow::bail!(
-            "run `tunmux connection agent install` as your normal user, not with sudo \
+            "run `tunmux launchd agent install` as your normal user, not with sudo \
              (the session agent is per-user)"
         );
     }
