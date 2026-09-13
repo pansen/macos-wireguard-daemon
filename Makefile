@@ -64,8 +64,15 @@ install.completion:
 	@#
 	@# zsh and fish use the same mechanism (`COMPLETE=zsh`/`COMPLETE=fish`);
 	@# only bash is wired up here.
-	@grep -qxF 'eval "$$(COMPLETE=bash tunmux 2>/dev/null)"' "$(HOME)/.bashrc" 2>/dev/null || \
-		echo 'eval "$$(COMPLETE=bash tunmux 2>/dev/null)"' >> "$(HOME)/.bashrc"
+	@#
+	@# Invoked by the same `TUNMUX_BIN` path the rest of this file installs to,
+	@# not a bare `tunmux`, so a custom install location that isn't on PATH
+	@# still registers. The generated script binds to the command name
+	@# `tunmux` either way -- clap uses its own command name there, not the
+	@# path it was invoked by -- so completion works for whichever `tunmux`
+	@# the user's PATH resolves.
+	@grep -qxF 'eval "$$(COMPLETE=bash $(TUNMUX_BIN) 2>/dev/null)"' "$(HOME)/.bashrc" 2>/dev/null || \
+		echo 'eval "$$(COMPLETE=bash $(TUNMUX_BIN) 2>/dev/null)"' >> "$(HOME)/.bashrc"
 
 .PHONY: uninstall.legacy-autoconnect
 uninstall.legacy-autoconnect:
