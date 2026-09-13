@@ -21,15 +21,16 @@ pub enum TopCommand {
     /// Show active VPN connections, including WireGuard tunnel state
     Status,
 
-    /// Manage the privileged launchd daemon and reload both launchd services
+    /// Manage the privileged launchd daemon, the per-user session-
+    /// reconciliation agent (`launchd agent ...`), and reload both launchd
+    /// services
     Launchd {
         #[command(subcommand)]
         command: LaunchdCommand,
     },
 
     /// Manage privileged connection-store records: add/list/remove stored
-    /// WireGuard configs and connect/disconnect them, plus the per-user
-    /// session-reconciliation agent (`connection agent ...`)
+    /// WireGuard configs and connect/disconnect them
     Connection {
         #[command(subcommand)]
         command: ConnectionCommand,
@@ -95,7 +96,7 @@ pub enum LaunchdCommand {
     /// Runs, in order:
     ///   sudo tunmux launchd install         (re-registers the privileged daemon)
     ///   tunmux connection disconnect --all  (drops this user's active connections)
-    ///   tunmux connection agent install -f  (re-registers the session agent, reconnects)
+    ///   tunmux launchd agent install -f     (re-registers the session agent, reconnects)
     ///
     /// Run as your normal user, without sudo; only the daemon step escalates.
     /// Logs at debug level unless -s is given.
@@ -103,6 +104,18 @@ pub enum LaunchdCommand {
     Reload(ReloadArgs),
     /// Stop and unregister the privileged daemon (keeps binary, group, logs)
     Uninstall,
+
+    /// Manage the per-user session-reconciliation LaunchAgent
+    ///
+    /// Installs a long-lived, per-user LaunchAgent that connects this
+    /// user's `automatic` connections on login and disconnects them again
+    /// on logout, so a per-user tunnel never outlives the session that
+    /// started it.
+    #[command(verbatim_doc_comment)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -152,7 +165,7 @@ pub enum ConnectionCommand {
         force: bool,
 
         /// Bring this connection up automatically (global: at daemon boot;
-        /// per-user: on login via `connection agent`). Defaults to manual.
+        /// per-user: on login via `launchd agent`). Defaults to manual.
         /// Setting a *global* connection's mode to automatic (whether here
         /// or via `connection mode`) requires admin authentication.
         #[arg(long, value_enum, default_value_t = StartModeArg::Manual)]
@@ -220,22 +233,10 @@ pub enum ConnectionCommand {
         /// Connection id or name, as printed by `add` or `list`
         id: String,
     },
-
-    /// Manage the per-user session-reconciliation LaunchAgent
-    ///
-    /// Installs a long-lived, per-user LaunchAgent that connects this
-    /// user's `automatic` connections on login and disconnects them again
-    /// on logout, so a per-user tunnel never outlives the session that
-    /// started it.
-    #[command(verbatim_doc_comment)]
-    Agent {
-        #[command(subcommand)]
-        command: ConnectionAgentCommand,
-    },
 }
 
 #[derive(Subcommand)]
-pub enum ConnectionAgentCommand {
+pub enum AgentCommand {
     /// Install and start the per-user session-reconciliation LaunchAgent (run WITHOUT sudo)
     Install {
         /// Overwrite and reload an existing installation
@@ -261,9 +262,7 @@ pub struct ReloadArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cli, ConnectionAgentCommand, ConnectionCommand, LaunchdCommand, StartModeArg, TopCommand,
-    };
+    use super::{AgentCommand, Cli, ConnectionCommand, LaunchdCommand, StartModeArg, TopCommand};
     use clap::Parser;
 
     #[test]
@@ -490,31 +489,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_connection_agent_subcommands() {
+    fn parse_launchd_agent_subcommands() {
         for (args, want) in [
             (
-                vec!["tunmux", "connection", "agent", "install"],
-                std::mem::discriminant(&ConnectionAgentCommand::Install { force: false }),
+                vec!["tunmux", "launchd", "agent", "install"],
+                std::mem::discriminant(&AgentCommand::Install { force: false }),
             ),
             (
-                vec!["tunmux", "connection", "agent", "status"],
-                std::mem::discriminant(&ConnectionAgentCommand::Status),
+                vec!["tunmux", "launchd", "agent", "status"],
+                std::mem::discriminant(&AgentCommand::Status),
             ),
             (
-                vec!["tunmux", "connection", "agent", "uninstall"],
-                std::mem::discriminant(&ConnectionAgentCommand::Uninstall),
+                vec!["tunmux", "launchd", "agent", "uninstall"],
+                std::mem::discriminant(&AgentCommand::Uninstall),
             ),
             (
-                vec!["tunmux", "connection", "agent", "run"],
-                std::mem::discriminant(&ConnectionAgentCommand::Run),
+                vec!["tunmux", "launchd", "agent", "run"],
+                std::mem::discriminant(&AgentCommand::Run),
             ),
         ] {
-            let cli = Cli::try_parse_from(args).expect("parse connection agent subcommand");
+            let cli = Cli::try_parse_from(args).expect("parse launchd agent subcommand");
             match cli.command {
-                TopCommand::Connection {
-                    command: ConnectionCommand::Agent { command },
+                TopCommand::Launchd {
+                    command: LaunchdCommand::Agent { command },
                 } => assert_eq!(std::mem::discriminant(&command), want),
-                _ => panic!("expected connection agent command"),
+                _ => panic!("expected launchd agent command"),
             }
         }
     }

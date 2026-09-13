@@ -6,7 +6,7 @@
     <key>Label</key>
     <string>me.pansen.tunmux.session-agent</string>
 
-    <!-- `connection agent run` is long-lived: it reconciles this user's
+    <!-- `launchd agent run` is long-lived: it reconciles this user's
          Automatic connections on start, then blocks on SIGTERM and
          disconnects them again before exiting. launchd sends SIGTERM to
          Aqua-session agents at logout, so this covers logout -- it does NOT
@@ -16,7 +16,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>@TUNMUX_BIN@</string>
-        <string>connection</string>
+        <string>launchd</string>
         <string>agent</string>
         <string>run</string>
     </array>

@@ -49,7 +49,7 @@ install.connection:
 .PHONY: uninstall.legacy-autoconnect
 uninstall.legacy-autoconnect:
 	@# One-time migration cleanup: `me.pansen.tunmux.autoconnect` was replaced
-	@# by the session agent (`connection agent install`, wired up via `reload`
+	@# by the session agent (`launchd agent install`, wired up via `reload`
 	@# below) in the Phase 5 CLI migration. src/autoconnect.rs is gone, so
 	@# there's no `tunmux` subcommand left to tear down a plist installed by
 	@# an older checkout. Safe to delete once no dev machine still has one.
@@ -60,7 +60,7 @@ uninstall.legacy-autoconnect:
 install: build.release install.binary uninstall.legacy-autoconnect
 	@# `tunmux launchd reload` registers the privileged daemon (escalating on its own),
 	@# drops any leftover tunnels, and re-registers the session agent -- do
-	@# not re-run `connection agent install` after `install.connection`
+	@# not re-run `launchd agent install` after `install.connection`
 	@# below: that would SIGTERM the instance `reload` just started (bootout
 	@# before bootstrap), disconnecting the connection `install.connection`
 	@# only just brought up, for no benefit.
@@ -77,7 +77,7 @@ reload:
 
 .PHONY: uninstall.autostart
 uninstall.autostart:
-	$(TUNMUX_BIN) connection agent uninstall
+	$(TUNMUX_BIN) launchd agent uninstall
 
 .PHONY: uninstall.dns
 uninstall.dns:
@@ -107,7 +107,7 @@ uninstall.privileged: build.release
 purge.privileged: uninstall.privileged
 	@# Destructive: after unregistering the daemon, remove the binary, all data,
 	@# logs, and the tunmux group.
-	sudo pkill -f '$(TUNMUX_BIN) connection agent run' 2>/dev/null || true
+	sudo pkill -f '$(TUNMUX_BIN) launchd agent run' 2>/dev/null || true
 	sudo rm -f $(TUNMUX_BIN)
 	sudo rm -rf "/Library/Application Support/tunmux"
 	sudo rm -rf /var/log/tunmux

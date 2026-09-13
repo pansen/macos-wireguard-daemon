@@ -376,7 +376,7 @@ matching the two connection kinds:
   retried on the daemon's next wake instead of being stuck down for the rest
   of the boot.
 - Per-user connections reconcile for the session's lifetime. The session
-  agent (`tunmux connection agent run`, installed as a long-lived, per-user
+  agent (`tunmux launchd agent run`, installed as a long-lived, per-user
   LaunchAgent with `RunAtLoad`+`KeepAlive`) blocks `SIGTERM` (`pthread_sigmask`
   via `SigSet::thread_block`) as the very first statement it runs, before
   doing anything else, then calls `ListConnections{Mine}` and connects every
@@ -621,7 +621,7 @@ flowchart TB
     BUILD --> RELOAD["tunmux launchd reload"]
     RELOAD --> LI["sudo tunmux launchd install"]
     RELOAD --> DISC["connection disconnect --all (mine)"]
-    RELOAD --> AI["connection agent install -f"]
+    RELOAD --> AI["launchd agent install -f"]
     BUILD --> ADD["connection add --file --name --force --start-mode automatic"]
     ADD --> CONNECT["connection connect &lt;name&gt;"]
 
