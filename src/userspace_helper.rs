@@ -2533,9 +2533,11 @@ struct MacosForeignSnapshot {
     tailscaled_present: bool,
 }
 
-/// A non-tunmux tunnel interface sharing the host (another VPN). Surfaced in the
-/// overview so an interfering peer (kernel-mode Tailscale, another WireGuard,
-/// IPSec, …) is visible instead of needing manual `ifconfig`/`netstat`.
+/// A tunnel interface other than the one this overview is currently
+/// reporting on. Surfaced so an interfering peer (kernel-mode Tailscale,
+/// another WireGuard, IPSec, …) is visible instead of needing manual
+/// `ifconfig`/`netstat` -- though (see `own` below) it may turn out to be
+/// tunmux's own after all, just not this overview's active connection.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq)]
 struct ForeignTunnel {
@@ -2546,8 +2548,8 @@ struct ForeignTunnel {
     /// Carries a 100.64.0.0/10 (CGNAT) address — the Tailscale tailnet signature.
     cgnat: bool,
     /// Carries an address that matches one of tunmux's own stored connections
-    /// (see [`tunmux_known_addresses`]) — ours, just not the interface this
-    /// overview is currently reporting on.
+    /// (see `crate::privileged::known_addresses`) -- ours, just not the
+    /// interface this overview is currently reporting on.
     own: bool,
 }
 
@@ -2560,28 +2562,17 @@ fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
+    // `crate::privileged::known_addresses()` is every address tunmux has
+    // assigned to one of its own stored connections, active or not. A
+    // leftover interface from a connection that isn't the one currently
+    // driving this overview (e.g. an orphaned utun from a previous connect
+    // cycle) still carries one of these addresses, which is what tells it
+    // apart from an actually-foreign VPN sharing the same CGNAT space.
     parse_foreign_tunnels(
         &String::from_utf8_lossy(&output.stdout),
         own_interface,
-        &tunmux_known_addresses(),
+        &crate::privileged::known_addresses(),
     )
-}
-
-/// Every address tunmux has assigned to one of its own stored connections,
-/// active or not. A leftover interface from a connection that isn't the one
-/// currently driving this overview (e.g. an orphaned utun from a previous
-/// connect cycle) still carries one of these addresses, which is what tells
-/// it apart from an actually-foreign VPN sharing the same CGNAT space.
-#[cfg(target_os = "macos")]
-fn tunmux_known_addresses() -> std::collections::HashSet<IpAddr> {
-    crate::privileged::connection_store::load_all()
-        .map(|conns| {
-            conns
-                .iter()
-                .flat_map(|conn| conn.config.addresses.iter().map(|net| net.addr()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// True for interface names that belong to a tunnel/VPN (vs en0, lo0, bridge…).

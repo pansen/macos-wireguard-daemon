@@ -153,6 +153,15 @@ pub enum PrivilegedRequest {
         name: Option<String>,
         #[serde(default)]
         mtu_override: Option<u16>,
+        /// Waives the default rule that `name` must be unique within its
+        /// `(global, owner_uid)` namespace (kept so `ConnectConnection`-by-
+        /// name stays unambiguous): with `force`, this call proceeds even if
+        /// an existing, different connection already has `name`. It does
+        /// *not* remove that other connection itself -- the caller (see
+        /// `connection_cli::cmd_add`) is expected to `RemoveConnection` it
+        /// in a follow-up call, now that it knows this one's id.
+        #[serde(default)]
+        force: bool,
         /// Present once the caller has completed the macOS admin-auth
         /// challenge for a genuinely new/changed configuration (see
         /// `privileged::authz`); absent on the first attempt.
@@ -226,6 +235,16 @@ pub(crate) fn validate_name_charset(name: &str, max_len: usize) -> Result<(), St
     {
         return Err(format!(
             "invalid name {name:?}; use only lowercase letters, digits, '-', '_' or '.'"
+        ));
+    }
+    // The CLI resolves a `connection connect`/etc. argument by trying it as a
+    // `ConnectionId` first and only falling back to a by-name lookup (see
+    // `connection_cli::resolve_id`); a hyphenated-or-simple-form UUID (both
+    // fit the charset above) would parse as an id and so could never be
+    // reached by name.
+    if name.parse::<ConnectionId>().is_ok() {
+        return Err(format!(
+            "name {name:?} looks like a connection id; choose a different name"
         ));
     }
     Ok(())

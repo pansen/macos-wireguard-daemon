@@ -165,13 +165,13 @@ pub enum ConnectionCommand {
 
     /// Remove a stored connection by id (must not be currently connected)
     Remove {
-        /// Connection id, as printed by `add` or `list`
+        /// Connection id or name, as printed by `add` or `list`
         id: String,
     },
 
     /// Bring a stored connection up
     Connect {
-        /// Connection id, as printed by `add` or `list`
+        /// Connection id or name, as printed by `add` or `list`
         id: String,
 
         /// Enable gotatun debug logging for this connect
@@ -181,7 +181,7 @@ pub enum ConnectionCommand {
 
     /// Tear a stored connection down
     Disconnect {
-        /// Connection id, as printed by `add` or `list`
+        /// Connection id or name, as printed by `add` or `list`
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         id: Option<String>,
 
@@ -199,7 +199,7 @@ pub enum ConnectionCommand {
     /// ownership alone.
     #[command(verbatim_doc_comment)]
     Mode {
-        /// Connection id, as printed by `add` or `list`
+        /// Connection id or name, as printed by `add` or `list`
         id: String,
 
         /// New start mode
@@ -209,7 +209,7 @@ pub enum ConnectionCommand {
 
     /// Show full detail for one stored connection (owner or root only)
     Get {
-        /// Connection id, as printed by `add` or `list`
+        /// Connection id or name, as printed by `add` or `list`
         id: String,
     },
 
