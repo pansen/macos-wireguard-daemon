@@ -46,8 +46,18 @@ install.connection:
 		--start-mode automatic
 	$(TUNMUX_BIN) connection connect $(CONNECTION_NAME)
 
+.PHONY: uninstall.legacy-autoconnect
+uninstall.legacy-autoconnect:
+	@# One-time migration cleanup: `me.pansen.tunmux.autoconnect` was replaced
+	@# by the session agent (`connection agent install`, wired up via `reload`
+	@# below) in the Phase 5 CLI migration. src/autoconnect.rs is gone, so
+	@# there's no `tunmux` subcommand left to tear down a plist installed by
+	@# an older checkout. Safe to delete once no dev machine still has one.
+	@launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
+	@rm -f "$(HOME)/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist"
+
 .PHONY: install
-install: build.release install.binary
+install: build.release install.binary uninstall.legacy-autoconnect
 	@# `tunmux reload` registers the privileged daemon (escalating on its own),
 	@# drops any leftover tunnels, and re-registers the session agent -- do
 	@# not re-run `connection agent install` after `install.connection`
