@@ -27,6 +27,7 @@ pub struct PrivilegedClient {
     authorized_group: String,
     autostop_mode: PrivilegedAutostopMode,
     daemon_idle_timeout_ms: Option<u64>,
+    request_timeout: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -142,7 +143,35 @@ impl PrivilegedClient {
             ),
             autostop_mode,
             daemon_idle_timeout_ms,
+            request_timeout: None,
         }
+    }
+
+    /// Bound how long a single socket request may block, instead of waiting
+    /// on the daemon indefinitely.
+    ///
+    /// Off by default: a connect or a config change legitimately takes as
+    /// long as it takes (a WireGuard handshake, a patient lock wait, an admin
+    /// prompt), and capping those would turn slow into broken. It exists for
+    /// callers that are themselves on a deadline -- shell completion, which
+    /// runs on a keystroke and must not leave the terminal hanging if the
+    /// daemon accepted the connection but never answered.
+    pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Apply [`Self::with_request_timeout`] to a freshly connected stream.
+    /// A socket that rejects the timeout is unusable for a deadline-bound
+    /// caller, so report that rather than silently blocking forever.
+    fn apply_request_timeout(&self, stream: &UnixStream) -> Result<()> {
+        let Some(timeout) = self.request_timeout else {
+            return Ok(());
+        };
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|e| AppError::Other(format!("failed to set privileged request timeout: {e}")))
     }
 
     /// Disable autostart on this client: a connect finding no socket just
@@ -342,6 +371,7 @@ impl PrivilegedClient {
             PrivilegedTransport::Socket => {
                 self.ensure_command_lease_if_enabled()?;
                 let mut stream = self.connect_or_autostart()?;
+                self.apply_request_timeout(&stream)?;
                 self.send_on_stream(&mut stream, &request)
             }
             PrivilegedTransport::Stdio => {

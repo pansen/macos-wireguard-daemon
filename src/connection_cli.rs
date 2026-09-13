@@ -86,6 +86,94 @@ fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<Con
     }
 }
 
+/// How long a completion lookup will wait on the daemon before giving up.
+///
+/// A <TAB> that hangs the terminal is worse than one that offers nothing, and
+/// the daemon can accept a connection and then stall (a connect holding the
+/// connection lock, a wedged helper). The plain `connection` subcommands
+/// deliberately have no such cap -- they are allowed to wait -- so this bound
+/// lives here rather than on the client's default.
+const COMPLETION_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Completion candidates for the `<ID>` positional of `remove`/`connect`/
+/// `disconnect`/`mode`/`get`: every connection the caller can name, offered
+/// both by id and by `--name`, since `resolve_id` accepts either.
+///
+/// This runs on every <TAB>, so it stays quiet and bounded. Every failure --
+/// no daemon, no socket, a timeout, a denied scope -- collapses to "no
+/// candidates" rather than printing an error into the shell's completion
+/// buffer.
+///
+/// It does *not* promise to leave the daemon alone. Completion never
+/// escalates (see the autostart and transport guards below), but the control
+/// socket is held by launchd with `RunAtLoad` false, so merely connecting to
+/// it can start the daemon on demand, exactly as any other `tunmux` command
+/// does. That daemon exits on the idle timeout its plist sets.
+pub fn complete_connection_id(
+    current: &std::ffi::OsStr,
+) -> Vec<clap_complete::engine::CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    // The stdio transport reaches the daemon by running
+    // `sudo tunmux privileged --serve --stdio` for *every* request, which
+    // would put a password prompt behind every <TAB>. `without_autostart`
+    // below does not cover it: it only gates the socket transport's own
+    // spawn-a-daemon fallback. So don't complete at all under stdio.
+    if !matches!(
+        crate::config::load_config().general.privileged_transport,
+        crate::config::PrivilegedTransport::Socket
+    ) {
+        return Vec::new();
+    }
+    let client = PrivilegedClient::new()
+        .without_autostart()
+        .with_request_timeout(COMPLETION_TIMEOUT);
+    let mine = client
+        .list_connections(ConnectionScope::Mine)
+        .unwrap_or_default();
+    let global = client
+        .list_connections(ConnectionScope::Global)
+        .unwrap_or_default();
+
+    // Ids are unique, so every connection contributes one. Names are not:
+    // `resolve_id` searches `Mine` first and only falls back to `Global`, so
+    // a global connection sharing a name with one of the caller's own can
+    // never be selected by that name. Offering it would both duplicate the
+    // entry in the picker and point at a record the name doesn't reach.
+    let mut offered_names: Vec<&str> = Vec::new();
+    let mut candidates = Vec::new();
+    for conn in mine.iter().chain(global.iter()) {
+        // Shells that render candidate help (zsh, fish) show the same fields
+        // `connection list` prints, so the picker is readable on its own.
+        // bash discards it.
+        let help = format!(
+            "name={name} global={global} mode={mode:?} connected={connected} interface={interface}",
+            name = conn.name.as_deref().unwrap_or("-"),
+            global = conn.global,
+            mode = conn.start_mode,
+            connected = conn.connected,
+            interface = conn.interface,
+        );
+        let mut push = |value: String| {
+            if value.starts_with(current) {
+                candidates.push(
+                    clap_complete::engine::CompletionCandidate::new(value)
+                        .help(Some(help.clone().into())),
+                );
+            }
+        };
+        push(conn.id.to_string());
+        if let Some(name) = conn.name.as_deref() {
+            if !offered_names.contains(&name) {
+                offered_names.push(name);
+                push(name.to_string());
+            }
+        }
+    }
+    candidates
+}
+
 fn cmd_add(
     file: &str,
     global: bool,

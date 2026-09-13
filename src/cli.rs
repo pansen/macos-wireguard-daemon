@@ -187,12 +187,18 @@ pub enum ConnectionCommand {
     /// Remove a stored connection by id (must not be currently connected)
     Remove {
         /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
         id: String,
     },
 
     /// Bring a stored connection up
     Connect {
         /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
         id: String,
 
         /// Enable gotatun debug logging for this connect
@@ -203,6 +209,9 @@ pub enum ConnectionCommand {
     /// Tear a stored connection down
     Disconnect {
         /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         id: Option<String>,
 
@@ -221,6 +230,9 @@ pub enum ConnectionCommand {
     #[command(verbatim_doc_comment)]
     Mode {
         /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
         id: String,
 
         /// New start mode
@@ -231,6 +243,9 @@ pub enum ConnectionCommand {
     /// Show full detail for one stored connection (owner or root only)
     Get {
         /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
         id: String,
     },
 }
