@@ -1,4 +1,4 @@
-//! `tunmux launchd agent ...`: installer + long-lived body for the Phase 4
+//! `wgd launchd agent ...`: installer + long-lived body for the Phase 4
 //! per-user session-reconciliation LaunchAgent. It never bakes a connect
 //! source into its plist -- on every start it just asks the privileged
 //! daemon for whatever is currently `Mine` + `Automatic` and connects it, so
@@ -29,11 +29,11 @@ use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failu
 use crate::privileged_api::{ConnectionScope, ConnectionStartMode};
 use crate::privileged_client::PrivilegedClient;
 
-pub(crate) const LABEL: &str = "me.pansen.tunmux.session-agent";
+pub(crate) const LABEL: &str = "me.pansen.wgd.session-agent";
 
-const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.tunmux.session-agent.plist");
-const BIN_PLACEHOLDER: &str = "@TUNMUX_BIN@";
-const HOME_PLACEHOLDER: &str = "@TUNMUX_HOME@";
+const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.wgd.session-agent.plist");
+const BIN_PLACEHOLDER: &str = "@WGD_BIN@";
+const HOME_PLACEHOLDER: &str = "@WGD_HOME@";
 
 pub fn dispatch(command: AgentCommand) -> anyhow::Result<()> {
     match command {
@@ -69,7 +69,7 @@ fn render_plist(template: &str, bin: &str, home: &str) -> anyhow::Result<String>
     Ok(rendered)
 }
 
-/// Re-render and re-bootstrap the agent, for `tunmux launchd reload`.
+/// Re-render and re-bootstrap the agent, for `wgd launchd reload`.
 pub(crate) fn reinstall() -> anyhow::Result<()> {
     cmd_install(true)
 }
@@ -79,11 +79,10 @@ fn cmd_install(force: bool) -> anyhow::Result<()> {
 
     let home = std::env::var("HOME").context("could not determine $HOME")?;
     let uid = getuid().as_raw();
-    let bin =
-        std::env::current_exe().context("failed to determine the running tunmux binary path")?;
-    let bin_str = bin.to_str().ok_or_else(|| {
-        anyhow::anyhow!("tunmux binary path is not valid UTF-8: {}", bin.display())
-    })?;
+    let bin = std::env::current_exe().context("failed to determine the running wgd binary path")?;
+    let bin_str = bin
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("wgd binary path is not valid UTF-8: {}", bin.display()))?;
 
     let plist_path = launch_agents_dir(&home).join(format!("{LABEL}.plist"));
     if plist_path.exists() && !force {
@@ -123,12 +122,12 @@ fn cmd_install(force: bool) -> anyhow::Result<()> {
         &["bootstrap", &gui_domain(uid), plist_path_str],
     )?;
 
-    println!("tunmux session agent installed.");
+    println!("wgd session agent installed.");
     println!("  plist:  {}", plist_path.display());
     println!("  binary: {}", bin.display());
     println!(
         "  it will connect every `Automatic` connection owned by this user on login \
-         (`tunmux connection mode <id> automatic`) and disconnect them again on logout."
+         (`wgd connection mode <id> automatic`) and disconnect them again on logout."
     );
     Ok(())
 }
@@ -145,7 +144,7 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     run_ignore_failure("/bin/launchctl", &["bootout", &domain_target(uid)]);
     remove_file_ignore_missing(&plist_path)?;
 
-    println!("tunmux session agent uninstalled.");
+    println!("wgd session agent uninstalled.");
     println!("  plist: {}", plist_path.display());
     Ok(())
 }
@@ -300,7 +299,7 @@ fn domain_target(uid: u32) -> String {
 fn refuse_if_root() -> anyhow::Result<()> {
     if geteuid().is_root() {
         anyhow::bail!(
-            "run `tunmux launchd agent install` as your normal user, not with sudo \
+            "run `wgd launchd agent install` as your normal user, not with sudo \
              (the session agent is per-user)"
         );
     }
@@ -313,10 +312,10 @@ mod tests {
 
     #[test]
     fn render_plist_substitutes_all() {
-        let rendered = render_plist(PLIST_TEMPLATE, "/opt/homebrew/bin/tunmux", "/Users/andi")
+        let rendered = render_plist(PLIST_TEMPLATE, "/opt/homebrew/bin/wgd", "/Users/andi")
             .expect("render succeeds");
 
-        assert!(rendered.contains("/opt/homebrew/bin/tunmux"));
+        assert!(rendered.contains("/opt/homebrew/bin/wgd"));
         assert!(rendered.contains("/Users/andi"));
         assert!(!rendered.contains(BIN_PLACEHOLDER));
         assert!(!rendered.contains(HOME_PLACEHOLDER));
@@ -325,15 +324,15 @@ mod tests {
 
     #[test]
     fn render_errors_when_placeholder_missing() {
-        let template = PLIST_TEMPLATE.replace(BIN_PLACEHOLDER, "/usr/local/bin/tunmux");
-        let err = render_plist(&template, "/opt/homebrew/bin/tunmux", "/Users/andi")
+        let template = PLIST_TEMPLATE.replace(BIN_PLACEHOLDER, "/usr/local/bin/wgd");
+        let err = render_plist(&template, "/opt/homebrew/bin/wgd", "/Users/andi")
             .expect_err("missing bin placeholder should error");
         assert!(err.to_string().contains(BIN_PLACEHOLDER));
     }
 
     #[test]
     fn render_escapes_special_chars() {
-        let rendered = render_plist(PLIST_TEMPLATE, "/opt/homebrew/bin/tunmux", "/Users/a&b")
+        let rendered = render_plist(PLIST_TEMPLATE, "/opt/homebrew/bin/wgd", "/Users/a&b")
             .expect("render succeeds");
         assert!(rendered.contains("/Users/a&amp;b"));
         assert!(!rendered.contains("/Users/a&b\""));

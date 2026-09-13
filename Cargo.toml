@@ -3,17 +3,17 @@ members = ["."]
 resolver = "2"
 
 [package]
-name = "tunmux"
+name = "wgd"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [lib]
-name = "tunmux"
+name = "wgd"
 path = "src/lib.rs"
 
 [[bin]]
-name = "tunmux"
+name = "wgd"
 path = "src/main.rs"
 
 [dependencies]

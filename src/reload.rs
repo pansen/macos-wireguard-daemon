@@ -1,7 +1,7 @@
-//! `tunmux launchd reload`: put both launchd services back into a known-good state
+//! `wgd launchd reload`: put both launchd services back into a known-good state
 //! and bring stored connections back up. This is the recovery path after a
 //! macOS update (which can leave the system daemon booted out or disabled)
-//! or after anything else that left tunmux behaving oddly.
+//! or after anything else that left wgd behaving oddly.
 //!
 //! The privileged daemon is re-registered by re-invoking this same binary
 //! under `sudo`, because the system domain needs root while the session
@@ -22,8 +22,7 @@ use crate::privileged_client::PrivilegedClient;
 pub async fn run(_args: ReloadArgs, _config: &AppConfig) -> anyhow::Result<()> {
     refuse_if_root()?;
 
-    let exe =
-        std::env::current_exe().context("failed to determine the running tunmux binary path")?;
+    let exe = std::env::current_exe().context("failed to determine the running wgd binary path")?;
 
     step("re-registering the privileged daemon (sudo)");
     install_privileged_daemon(&exe)?;
@@ -37,7 +36,7 @@ pub async fn run(_args: ReloadArgs, _config: &AppConfig) -> anyhow::Result<()> {
     crate::session_agent::reinstall()?;
 
     println!();
-    println!("tunmux launchd reload complete. Check with: tunmux status");
+    println!("wgd launchd reload complete. Check with: wgd status");
     Ok(())
 }
 
@@ -105,7 +104,7 @@ fn step(what: &str) {
 fn refuse_if_root() -> anyhow::Result<()> {
     if geteuid().is_root() {
         anyhow::bail!(
-            "run `tunmux launchd reload` as your normal user, not with sudo; it escalates the \
+            "run `wgd launchd reload` as your normal user, not with sudo; it escalates the \
              privileged daemon step on its own"
         );
     }

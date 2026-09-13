@@ -1,6 +1,6 @@
-// tunmux library crate
+// wgd library crate
 //
-// Exports the modules shared between the `tunmux` binary and any library
+// Exports the modules shared between the `wgd` binary and any library
 // consumers. This build targets macOS only.
 
 // Provider-agnostic infrastructure

@@ -1,14 +1,14 @@
 # Architecture: how the pieces fit together
 
-**Scope:** the whole `tunmux` binary, all three roles it runs in.
+**Scope:** the whole `wgd` binary, all three roles it runs in.
 
 One binary, three roles. `main()` checks for the helper role first, before
 parsing any arguments; everything else, including the privileged service, is
 decided by parsing the CLI:
 
-- **helper** if `TUNMUX_GOTATUN_HELPER` is set in the environment
+- **helper** if `WGD_GOTATUN_HELPER` is set in the environment
   (`userspace_helper::maybe_run_from_env`, checked before `Cli::parse()`),
-- **privileged service** for the `tunmux privileged --serve` subcommand (an
+- **privileged service** for the `wgd privileged --serve` subcommand (an
   ordinary, hidden clap subcommand, matched after parsing),
 - **user CLI** for everything else.
 
@@ -23,21 +23,21 @@ its lifetime.
 ```mermaid
 flowchart TB
     subgraph user["User session (your uid)"]
-        CLI["tunmux CLI<br/>main.rs · cli.rs · connection_cli.rs"]
-        AGENT["Session LaunchAgent<br/>me.pansen.tunmux.session-agent<br/>RunAtLoad + KeepAlive"]
+        CLI["wgd CLI<br/>main.rs · cli.rs · connection_cli.rs"]
+        AGENT["Session LaunchAgent<br/>me.pansen.wgd.session-agent<br/>RunAtLoad + KeepAlive"]
     end
 
     subgraph root["Root (system domain)"]
-        DAEMON["privileged service<br/>tunmux privileged --serve<br/>privileged::serve"]
-        HELPER["gotatun helper (one per connected connection)<br/>TUNMUX_GOTATUN_HELPER=1<br/>userspace_helper"]
-        STORE[("/Library/Application Support/tunmux/<br/>connections/&lt;id&gt;.json · active/&lt;id&gt;.json<br/>locks/&lt;id&gt;.lock · connections-index.lock")]
-        RUN[("/var/run/wireguard/<br/>&lt;iface&gt;.sock · .tunmux.pid · .tunmux.query.sock")]
+        DAEMON["privileged service<br/>wgd privileged --serve<br/>privileged::serve"]
+        HELPER["gotatun helper (one per connected connection)<br/>WGD_GOTATUN_HELPER=1<br/>userspace_helper"]
+        STORE[("/Library/Application Support/wgd/<br/>connections/&lt;id&gt;.json · active/&lt;id&gt;.json<br/>locks/&lt;id&gt;.lock · connections-index.lock")]
+        RUN[("/var/run/wireguard/<br/>&lt;iface&gt;.sock · .wgd.pid · .wgd.query.sock")]
     end
 
-    LD["launchd<br/>me.pansen.tunmux.privileged<br/>socket-activated"]
+    LD["launchd<br/>me.pansen.wgd.privileged<br/>socket-activated"]
 
     AGENT -->|"ListConnections{Mine},<br/>Connect/Disconnect on login/logout"| DAEMON
-    CLI -->|"JSON over<br/>ctl.sock (0660 root:tunmux)"| DAEMON
+    CLI -->|"JSON over<br/>ctl.sock (0660 root:wgd)"| DAEMON
     LD -.->|"passes listening fd"| DAEMON
     DAEMON -->|"spawn, daemonize"| HELPER
     DAEMON --> STORE
@@ -52,7 +52,7 @@ replaceable; everything below it runs as root and is deliberately small.
 each tool name (`ifconfig`, `route`, `networksetup`, `scutil`, `sh` for
 hooks) is mapped to a hardcoded absolute system path rather than searched
 for on `PATH`. Root-owned-and-not-a-symlink validation is applied
-separately, to the tunmux binary's own install location and to the
+separately, to the wgd binary's own install location and to the
 root-owned state directories the daemon reads from.
 
 The user CLI holds no state of its own; everything about a connection,
@@ -150,7 +150,7 @@ owner_uid)`, not the id.
 
 ## One connect, end to end
 
-This is `tunmux connection connect home`, assuming `home` was already added
+This is `wgd connection connect home`, assuming `home` was already added
 as a per-user connection.
 
 ```mermaid
@@ -166,7 +166,7 @@ sequenceDiagram
     participant HP as gotatun helper (root)
     participant OS as macOS
 
-    U->>CLI: tunmux connection connect home
+    U->>CLI: wgd connection connect home
     CLI->>PC: list_connections(Mine), then Global
     PC->>SOCK: {"kind":"list_connections",...}
     SOCK-->>PC: matching ConnectionSummary
@@ -185,8 +185,8 @@ sequenceDiagram
     OPS->>OPS: re-parse raw_conf, verify fingerprint unchanged
     OPS->>OPS: run PreUp hooks (%i -> real interface name)
     OPS->>OPS: lock_system_network_mutation(), 30s
-    OPS->>HP: run_gotatun_up: spawn self with<br/>TUNMUX_GOTATUN_HELPER=1, config via env (base64)
-    HP->>HP: daemonize, log to /var/log/tunmux/&lt;iface&gt;.log
+    OPS->>HP: run_gotatun_up: spawn self with<br/>WGD_GOTATUN_HELPER=1, config via env (base64)
+    HP->>HP: daemonize, log to /var/log/wgd/&lt;iface&gt;.log
     HP->>OS: TunDevice + UapiServer + apply_wireguard_config
     HP->>OS: configure_network_macos: addresses, routes, DNS
     HP-->>OPS: parent exits after child signals READY_OK
@@ -225,7 +225,7 @@ DNS.
 
 ```mermaid
 flowchart LR
-    MAIN["main()"] --> HELPERCHK{"TUNMUX_GOTATUN_HELPER<br/>set?"}
+    MAIN["main()"] --> HELPERCHK{"WGD_GOTATUN_HELPER<br/>set?"}
     HELPERCHK -->|yes| UH["userspace_helper::maybe_run_from_env"]
     HELPERCHK -->|no| PARSE["Cli::parse"]
 
@@ -259,7 +259,7 @@ if nothing owned matches, and errors on zero or on more than one match.
 
 ```mermaid
 flowchart TB
-    subgraph store["/Library/Application Support/tunmux/"]
+    subgraph store["/Library/Application Support/wgd/"]
         IDX["connections-index.lock"]
         CONND["connections/&lt;id&gt;.json<br/>0600, root-owned"]
         ACTD["active/&lt;id&gt;.json<br/>exists only while connected"]
@@ -300,7 +300,7 @@ otherwise has its own lock.
 ## Admin authentication
 
 Adding, removing, or elevating a global connection from manual to automatic
-each require real macOS admin authentication, not just `tunmux`-group
+each require real macOS admin authentication, not just `wgd`-group
 membership, since those are the only operations that let new
 root-executed config content (including `PreUp`/`PostUp`/`PreDown`/
 `PostDown` hooks) into the store or make it run unattended at boot.
@@ -328,9 +328,9 @@ connection back to manual) proceed on ownership alone, the same way the
 macOS Network pane asks for admin credentials to add a VPN profile but not
 to connect one that's already configured.
 
-The custom right, `me.pansen.tunmux.modify-connection`, requires an admin
+The custom right, `me.pansen.wgd.modify-connection`, requires an admin
 credential with a 60-second, non-shared lifetime and is registered in the
-system authorization database by `src/launchd.rs` at `tunmux launchd install`
+system authorization database by `src/launchd.rs` at `wgd launchd install`
 time and at every privileged daemon startup, before either the socket or stdio
 transport handles requests. This upgrades the rule when a replaced binary next
 starts, without requiring a separate install or reload command. Registration
@@ -344,7 +344,7 @@ still use fresh sessions and require their own authentication. The built-in
 `authenticate-admin` rule has a zero timeout, which caused a second prompt
 when the daemon previously allowed interaction during verification.
 
-Replacing the binary does not change an already-running daemon; `tunmux launchd reload`
+Replacing the binary does not change an already-running daemon; `wgd launchd reload`
 updates both the registered rule and the daemon immediately, while the next
 normal daemon startup updates the rule automatically. A non-interactive
 verification failure (`-60007`) reports that the credential may have expired or
@@ -376,7 +376,7 @@ matching the two connection kinds:
   retried on the daemon's next wake instead of being stuck down for the rest
   of the boot.
 - Per-user connections reconcile for the session's lifetime. The session
-  agent (`tunmux launchd agent run`, installed as a long-lived, per-user
+  agent (`wgd launchd agent run`, installed as a long-lived, per-user
   LaunchAgent with `RunAtLoad`+`KeepAlive`) blocks `SIGTERM` (`pthread_sigmask`
   via `SigSet::thread_block`) as the very first statement it runs, before
   doing anything else, then calls `ListConnections{Mine}` and connects every
@@ -401,7 +401,7 @@ over the socket like any other client, since it runs as your user, not root.
 flowchart TB
     subgraph serve["privileged::serve"]
         ACT{"launchd socket<br/>activation?"}
-        ACT -->|yes| FD["adopt inherited fd,<br/>chmod 0660, chown :tunmux"]
+        ACT -->|yes| FD["adopt inherited fd,<br/>chmod 0660, chown :wgd"]
         ACT -->|no| BIND["bind ctl.sock itself"]
         FD --> SPAWN
         BIND --> SPAWN
@@ -432,7 +432,7 @@ caller be its owner or root. The same rule also gates
 `WgShow`/`NetworkOverview`/`InterfaceActive` (kept from before the connection
 store, for `status`'s interface-detail lookups) whenever the interface name
 they were given happens to belong to a stored connection, closing a gap
-where any `tunmux`-group member could act on a connection's interface once
+where any `wgd`-group member could act on a connection's interface once
 its name leaked via `ListConnections{Global}`.
 
 `background_work` is an atomic counter, incremented while boot reconciliation
@@ -459,7 +459,7 @@ then owns that tunnel until its UAPI socket is removed or it is signalled.
 flowchart TB
     START["maybe_run_from_env<br/>interface from argv, config from env (base64)"]
     START --> DAEMONIZE["daemonize; child signals READY_OK/ERR<br/>over a UnixDatagram pair"]
-    DAEMONIZE --> LOGF["logging::init_file_sync<br/>/var/log/tunmux/&lt;iface&gt;.log"]
+    DAEMONIZE --> LOGF["logging::init_file_sync<br/>/var/log/wgd/&lt;iface&gt;.log"]
     LOGF --> SD["start_device"]
 
     SD --> TUN["TunDevice::from_name -> utunN"]
@@ -474,12 +474,12 @@ flowchart TB
     NET --> DNS["configure_macos_dns"]
 
     SD --> RD["RunningDevice { device, cleanup: CleanupState::Macos(Arc) }"]
-    RD --> QS["spawn_overview_query_server<br/>&lt;iface&gt;.tunmux.query.sock"]
+    RD --> QS["spawn_overview_query_server<br/>&lt;iface&gt;.wgd.query.sock"]
     RD --> WAIT["wait_for_shutdown: 1s tick"]
 
     WAIT -->|"control socket gone,<br/>SIGINT or SIGTERM"| TEAR["cleanup_network_macos:<br/>delete routes, restore DNS"]
     TEAR --> STOP["device.stop() (5s timeout)"]
-    STOP --> STATUS["write &lt;iface&gt;.tunmux.cleanup, remove pid/name/socket"]
+    STOP --> STATUS["write &lt;iface&gt;.wgd.cleanup, remove pid/name/socket"]
 ```
 
 Teardown is a handshake, not a kill. `run_gotatun_down` removes the UAPI
@@ -579,7 +579,7 @@ ownership still has to move.
 
 ## Status
 
-`tunmux status` (`cmd_status` in `src/main.rs`) is read-only and pulls from
+`wgd status` (`cmd_status` in `src/main.rs`) is read-only and pulls from
 two RPC calls plus, best-effort, per-connection detail.
 
 ```mermaid
@@ -599,7 +599,7 @@ sequenceDiagram
             D-->>S: text
             S->>PC: network_overview(iface)
             PC->>D: NetworkOverview
-            D->>HP: connect &lt;iface&gt;.tunmux.query.sock
+            D->>HP: connect &lt;iface&gt;.wgd.query.sock
             HP-->>D: freshly rendered route/DNS table
             D-->>S: text
         end
@@ -617,20 +617,20 @@ never makes `status` fail.
 
 ```mermaid
 flowchart TB
-    MAKE["make install"] --> BUILD["cargo build --release<br/>-> /usr/local/bin/tunmux"]
-    BUILD --> RELOAD["tunmux launchd reload"]
-    RELOAD --> LI["sudo tunmux launchd install"]
+    MAKE["make install"] --> BUILD["cargo build --release<br/>-> /usr/local/bin/wgd"]
+    BUILD --> RELOAD["wgd launchd reload"]
+    RELOAD --> LI["sudo wgd launchd install"]
     RELOAD --> DISC["connection disconnect --all (mine)"]
     RELOAD --> AI["launchd agent install -f"]
     BUILD --> ADD["connection add --file --name --force --start-mode automatic"]
     ADD --> CONNECT["connection connect &lt;name&gt;"]
 
-    LI --> GRP["ensure_group_with_member: create 'tunmux', add you"]
-    LI --> RIGHT["register me.pansen.tunmux.modify-connection<br/>(admin, non-shared, 60s) in the authorization database"]
-    LI --> PL["render plist from etc/…privileged.plist<br/>@TUNMUX_BIN@, @SOCK_PATH_GROUP@"]
+    LI --> GRP["ensure_group_with_member: create 'wgd', add you"]
+    LI --> RIGHT["register me.pansen.wgd.modify-connection<br/>(admin, non-shared, 60s) in the authorization database"]
+    LI --> PL["render plist from etc/…privileged.plist<br/>@WGD_BIN@, @SOCK_PATH_GROUP@"]
     PL --> BOOT["launchctl bootout, enable, bootstrap system/"]
 
-    AI --> APL["render etc/me.pansen.tunmux.session-agent.plist<br/>@TUNMUX_BIN@, @TUNMUX_HOME@"]
+    AI --> APL["render etc/me.pansen.wgd.session-agent.plist<br/>@WGD_BIN@, @WGD_HOME@"]
     APL --> ABOOT["launchctl bootout then bootstrap gui/&lt;uid&gt;<br/>RunAtLoad, KeepAlive, ExitTimeOut 120s"]
 ```
 

@@ -24,7 +24,7 @@ on:
         type: string
 
 env:
-  APP_NAME: tunmux
+  APP_NAME: wgd
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -56,7 +56,7 @@ jobs:
 
       - name: Build native target
         env:
-          TUNMUX_GIT_TAG: ${{ inputs.version }}
+          WGD_GIT_TAG: ${{ inputs.version }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact

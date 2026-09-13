@@ -130,7 +130,7 @@ pub enum PrivilegedRequest {
     },
 
     /// Fetch the live route/DNS overview for a userspace tunnel by querying the
-    /// helper's `/var/run/wireguard/<interface>.tunmux.query.sock`. Proxied
+    /// helper's `/var/run/wireguard/<interface>.wgd.query.sock`. Proxied
     /// through the privileged service because that socket is root-only.
     NetworkOverview {
         interface: String,

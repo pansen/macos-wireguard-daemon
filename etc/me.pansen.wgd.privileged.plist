@@ -4,16 +4,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>me.pansen.tunmux.privileged</string>
+    <string>me.pansen.wgd.privileged</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>@TUNMUX_BIN@</string>
+        <string>@WGD_BIN@</string>
         <string>--debug</string>
         <string>privileged</string>
         <string>--serve</string>
         <string>--authorized-group</string>
-        <string>tunmux</string>
+        <string>wgd</string>
         <string>--autostarted</string>
         <string>--idle-timeout-ms</string>
         <string>60000</string>
@@ -24,8 +24,8 @@
         <key>Listeners</key>
         <dict>
             <key>SockPathName</key>
-            <string>/Library/Application Support/tunmux/run/ctl.sock</string>
-            <!-- @SOCK_PATH_GROUP@ replaced at install time with SockPathGroup = integer GID of the tunmux group; e.g. GID 20 becomes: <key>SockPathGroup</key> <integer>20</integer> -->
+            <string>/Library/Application Support/wgd/run/ctl.sock</string>
+            <!-- @SOCK_PATH_GROUP@ replaced at install time with SockPathGroup = integer GID of the wgd group; e.g. GID 20 becomes: <key>SockPathGroup</key> <integer>20</integer> -->
             <!-- 0660 octal = 432 decimal; plist <integer> is base-10 -->
             <key>SockPathMode</key>
             <integer>432</integer>
@@ -39,7 +39,7 @@
     <dict>
         <key>PATH</key>
         <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>TUNMUX_LOG_COLOR</key>
+        <key>WGD_LOG_COLOR</key>
         <string>always</string>
     </dict>
 
@@ -48,8 +48,8 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/var/log/tunmux/privileged.out.log</string>
+    <string>/var/log/wgd/privileged.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/tunmux/privileged.err.log</string>
+    <string>/var/log/wgd/privileged.err.log</string>
 </dict>
 </plist>
