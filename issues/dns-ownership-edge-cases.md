@@ -31,7 +31,7 @@ far.
 
 ### Failure mode
 
-tunmux supports multiple simultaneous connections (provider instances plus the
+wgd supports multiple simultaneous connections (provider instances plus the
 direct slot). Each userspace helper runs its own independent DNS reconciler.
 If more than one active config promotes DNS:
 
@@ -53,7 +53,7 @@ If more than one active config promotes DNS:
 ### Solution paths
 
 **A1 — single-owner guard (small, do first).** At connect, detect that another
-tunmux tunnel already promotes DNS and refuse to promote for the second one
+wgd tunnel already promotes DNS and refuse to promote for the second one
 (connect proceeds; DNS promotion is skipped with a printed warning). Detection
 needs a shared marker readable by all helpers, e.g.
 `/var/run/wireguard/dns-owner` containing the owning interface + servers,
@@ -66,7 +66,7 @@ only the first DNS-promoting tunnel steers DNS.
 **A2 — persistent DNS-custody ledger (the durable design).** Move
 original-DNS custody out of helper memory into an on-disk ledger (e.g.
 `/var/run/wireguard/dns-ledger.json`, or under
-`/Library/Application Support/tunmux/` to survive reboot-cleaned tmpfs):
+`/Library/Application Support/wgd/` to survive reboot-cleaned tmpfs):
 
 - On first promotion of a service, record the **true pre-VPN original** once.
 - Later promoters push onto a per-service stack instead of capturing the live
@@ -115,7 +115,7 @@ Two gaps:
 
 ### Solution paths
 
-**B1 — remember what we ever applied.** Persist every DNS list tunmux applies
+**B1 — remember what we ever applied.** Persist every DNS list wgd applies
 (the ledger from A2 covers this; a minimal standalone version is a small
 append-only file of applied server lists). Adoption then matches the live DNS
 against *any previously applied list*, not just the current config's, and
@@ -127,7 +127,7 @@ recorded set, not just the targeted ones.
 **B2 — sweep at privileged-service start.** The privileged daemon starts at
 boot; have it (or the first `connect`) run a one-shot reconciliation of every
 service against the ledger and heal strays before any tunnel work. Also the
-natural home for a future `tunmux doctor`-style command (none exists today).
+natural home for a future `wgd doctor`-style command (none exists today).
 
 **B3 — endgame.** Under A3 (dynamic-store resolvers) crash leakage is
 impossible by construction; B1/B2 become unnecessary.

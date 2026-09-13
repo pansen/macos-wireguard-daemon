@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "tunmux",
+    name = "wgd",
     about = "WireGuard config-file VPN CLI",
-    version = env!("TUNMUX_BUILD_VERSION")
+    version = env!("WGD_BUILD_VERSION")
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -69,13 +69,13 @@ pub enum LaunchdCommand {
     /// supply your own.
     ///
     /// Template placeholders substituted at install time:
-    ///   @TUNMUX_BIN@       absolute path of the tunmux binary launchd runs
+    ///   @WGD_BIN@       absolute path of the wgd binary launchd runs
     ///   @SOCK_PATH_GROUP@  marker comment replaced with the SockPathGroup key
-    ///                      (integer GID of the tunmux group)
+    ///                      (integer GID of the wgd group)
     #[command(verbatim_doc_comment)]
     Install {
         /// Path to a custom plist template (defaults to the template baked
-        /// into the binary at build time). Must contain the @TUNMUX_BIN@
+        /// into the binary at build time). Must contain the @WGD_BIN@
         /// and @SOCK_PATH_GROUP@ placeholders described above.
         #[arg(long, value_name = "PATH")]
         plist_template: Option<PathBuf>,
@@ -85,7 +85,7 @@ pub enum LaunchdCommand {
     /// Runs launchctl kickstart -k. Use this to restart an already-registered
     /// daemon. It does not re-register either service, restart the session
     /// agent, or explicitly reconnect stored connections.
-    /// For service recovery and reconnection, use tunmux launchd reload.
+    /// For service recovery and reconnection, use wgd launchd reload.
     Restart,
     /// Re-register the daemon and session agent, then reconnect automatic connections; use after an upgrade or when services are disabled, unregistered, or broken
     ///
@@ -94,9 +94,9 @@ pub enum LaunchdCommand {
     /// stale connections before the session agent reconnects automatic connections.
     ///
     /// Runs, in order:
-    ///   sudo tunmux launchd install         (re-registers the privileged daemon)
-    ///   tunmux connection disconnect --all  (drops this user's active connections)
-    ///   tunmux launchd agent install -f     (re-registers the session agent, reconnects)
+    ///   sudo wgd launchd install         (re-registers the privileged daemon)
+    ///   wgd connection disconnect --all  (drops this user's active connections)
+    ///   wgd launchd agent install -f     (re-registers the session agent, reconnects)
     ///
     /// Run as your normal user, without sudo; only the daemon step escalates.
     /// Logs at debug level unless -s is given.
@@ -282,12 +282,12 @@ mod tests {
 
     #[test]
     fn parse_global_debug_alias_enables_verbose_logging() {
-        let before = Cli::try_parse_from(["tunmux", "--debug", "status"])
-            .expect("parse debug before command");
+        let before =
+            Cli::try_parse_from(["wgd", "--debug", "status"]).expect("parse debug before command");
         assert!(before.verbose);
 
-        let after = Cli::try_parse_from(["tunmux", "status", "--debug"])
-            .expect("parse debug after command");
+        let after =
+            Cli::try_parse_from(["wgd", "status", "--debug"]).expect("parse debug after command");
         assert!(after.verbose);
     }
 
@@ -306,7 +306,7 @@ mod tests {
                 std::mem::discriminant(&LaunchdCommand::Uninstall),
             ),
         ] {
-            let cli = Cli::try_parse_from(["tunmux", "launchd", arg]).expect("parse launchd");
+            let cli = Cli::try_parse_from(["wgd", "launchd", arg]).expect("parse launchd");
             match cli.command {
                 TopCommand::Launchd { command } => {
                     assert_eq!(std::mem::discriminant(&command), want)
@@ -321,7 +321,7 @@ mod tests {
         use std::path::Path;
 
         let cli = Cli::try_parse_from([
-            "tunmux",
+            "wgd",
             "launchd",
             "install",
             "--plist-template",
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn parse_launchd_reload_silent_flag() {
-        let bare = Cli::try_parse_from(["tunmux", "launchd", "reload"]).expect("parse bare reload");
+        let bare = Cli::try_parse_from(["wgd", "launchd", "reload"]).expect("parse bare reload");
         match bare.command {
             TopCommand::Launchd {
                 command: LaunchdCommand::Reload(args),
@@ -353,7 +353,7 @@ mod tests {
         }
 
         for arg in ["-s", "--silent"] {
-            let cli = Cli::try_parse_from(["tunmux", "launchd", "reload", arg])
+            let cli = Cli::try_parse_from(["wgd", "launchd", "reload", arg])
                 .expect("parse reload silent");
             match cli.command {
                 TopCommand::Launchd {
@@ -363,16 +363,16 @@ mod tests {
             }
         }
 
-        assert!(Cli::try_parse_from(["tunmux", "reload"]).is_err());
+        assert!(Cli::try_parse_from(["wgd", "reload"]).is_err());
 
         // Asking for both quiet and verbose has no sensible reading.
-        assert!(Cli::try_parse_from(["tunmux", "launchd", "reload", "-s", "-v"]).is_err());
+        assert!(Cli::try_parse_from(["wgd", "launchd", "reload", "-s", "-v"]).is_err());
     }
 
     #[test]
     fn parse_connection_add() {
         let cli = Cli::try_parse_from([
-            "tunmux",
+            "wgd",
             "connection",
             "add",
             "--file",
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn parse_connection_add_start_mode_automatic() {
         let cli = Cli::try_parse_from([
-            "tunmux",
+            "wgd",
             "connection",
             "add",
             "--file",
@@ -430,14 +430,9 @@ mod tests {
 
     #[test]
     fn parse_connection_connect_and_disconnect() {
-        let cli = Cli::try_parse_from([
-            "tunmux",
-            "connection",
-            "connect",
-            "some-id",
-            "--gotatun-debug",
-        ])
-        .expect("parse connection connect");
+        let cli =
+            Cli::try_parse_from(["wgd", "connection", "connect", "some-id", "--gotatun-debug"])
+                .expect("parse connection connect");
         match cli.command {
             TopCommand::Connection {
                 command: ConnectionCommand::Connect { id, debug },
@@ -448,7 +443,7 @@ mod tests {
             _ => panic!("expected connection connect command"),
         }
 
-        let cli = Cli::try_parse_from(["tunmux", "connection", "disconnect", "some-id"])
+        let cli = Cli::try_parse_from(["wgd", "connection", "disconnect", "some-id"])
             .expect("parse connection disconnect by id");
         match cli.command {
             TopCommand::Connection {
@@ -460,7 +455,7 @@ mod tests {
             _ => panic!("expected connection disconnect command"),
         }
 
-        let cli = Cli::try_parse_from(["tunmux", "connection", "disconnect", "--all"])
+        let cli = Cli::try_parse_from(["wgd", "connection", "disconnect", "--all"])
             .expect("parse connection disconnect --all");
         match cli.command {
             TopCommand::Connection {
@@ -472,16 +467,15 @@ mod tests {
             _ => panic!("expected connection disconnect command"),
         }
 
-        assert!(Cli::try_parse_from(["tunmux", "connection", "disconnect"]).is_err());
+        assert!(Cli::try_parse_from(["wgd", "connection", "disconnect"]).is_err());
         assert!(
-            Cli::try_parse_from(["tunmux", "connection", "disconnect", "some-id", "--all"])
-                .is_err()
+            Cli::try_parse_from(["wgd", "connection", "disconnect", "some-id", "--all"]).is_err()
         );
     }
 
     #[test]
     fn parse_connection_mode_and_get() {
-        let cli = Cli::try_parse_from(["tunmux", "connection", "mode", "some-id", "automatic"])
+        let cli = Cli::try_parse_from(["wgd", "connection", "mode", "some-id", "automatic"])
             .expect("parse connection mode");
         match cli.command {
             TopCommand::Connection {
@@ -493,7 +487,7 @@ mod tests {
             _ => panic!("expected connection mode command"),
         }
 
-        let cli = Cli::try_parse_from(["tunmux", "connection", "get", "some-id"])
+        let cli = Cli::try_parse_from(["wgd", "connection", "get", "some-id"])
             .expect("parse connection get");
         match cli.command {
             TopCommand::Connection {
@@ -507,19 +501,19 @@ mod tests {
     fn parse_launchd_agent_subcommands() {
         for (args, want) in [
             (
-                vec!["tunmux", "launchd", "agent", "install"],
+                vec!["wgd", "launchd", "agent", "install"],
                 std::mem::discriminant(&AgentCommand::Install { force: false }),
             ),
             (
-                vec!["tunmux", "launchd", "agent", "status"],
+                vec!["wgd", "launchd", "agent", "status"],
                 std::mem::discriminant(&AgentCommand::Status),
             ),
             (
-                vec!["tunmux", "launchd", "agent", "uninstall"],
+                vec!["wgd", "launchd", "agent", "uninstall"],
                 std::mem::discriminant(&AgentCommand::Uninstall),
             ),
             (
-                vec!["tunmux", "launchd", "agent", "run"],
+                vec!["wgd", "launchd", "agent", "run"],
                 std::mem::discriminant(&AgentCommand::Run),
             ),
         ] {
@@ -537,7 +531,7 @@ mod tests {
     fn parse_connection_list_and_ls_alias() {
         for arg in ["list", "ls"] {
             let cli =
-                Cli::try_parse_from(["tunmux", "connection", arg]).expect("parse connection list");
+                Cli::try_parse_from(["wgd", "connection", arg]).expect("parse connection list");
             match cli.command {
                 TopCommand::Connection {
                     command: ConnectionCommand::List { all, global },
@@ -552,14 +546,14 @@ mod tests {
 
     #[test]
     fn parse_connection_list_rejects_all_with_global() {
-        let result = Cli::try_parse_from(["tunmux", "connection", "list", "--all", "--global"]);
+        let result = Cli::try_parse_from(["wgd", "connection", "list", "--all", "--global"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_connection_add_force_requires_name() {
         let missing_name = Cli::try_parse_from([
-            "tunmux",
+            "wgd",
             "connection",
             "add",
             "--file",
@@ -569,7 +563,7 @@ mod tests {
         assert!(missing_name.is_err());
 
         let with_name = Cli::try_parse_from([
-            "tunmux",
+            "wgd",
             "connection",
             "add",
             "--file",
@@ -589,7 +583,7 @@ mod tests {
 
     #[test]
     fn parse_connection_remove() {
-        let cli = Cli::try_parse_from(["tunmux", "connection", "remove", "some-id"])
+        let cli = Cli::try_parse_from(["wgd", "connection", "remove", "some-id"])
             .expect("parse connection remove");
         match cli.command {
             TopCommand::Connection {

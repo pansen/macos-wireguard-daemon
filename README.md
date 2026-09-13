@@ -1,13 +1,13 @@
-# tunmux
+# macOS WireGuard Daemon
 
-`tunmux` is a command-line WireGuard VPN client for macOS, written in Rust,
+`wgd` is a command-line WireGuard VPN client for macOS, written in Rust,
 built around a privileged, multi-connection store.
 
 ## Why
 
 Install once, forget about it.
 
-tunmux's flagship use case is a split tunnel that permanently connects your
+Its flagship use case is a split tunnel that permanently connects your
 workstation to "home" (your LAN, your servers, your internal DNS) as a launchd
 daemon that is simply always there and never gets in the way. Add your config
 once; from then on the tunnel comes up at login, survives network roaming and
@@ -34,13 +34,13 @@ it serves here as the technical base.
 ## Install
 
 ```bash
-make install TUNMUX_PROFILE=/path/to/your.conf CONNECTION_NAME=home
+make install WGD_PROFILE=/path/to/your.conf CONNECTION_NAME=home
 ```
 
 This does, in order:
 
-- Builds the release binary and installs it to `/usr/local/bin/tunmux`.
-- Runs `tunmux launchd reload` (see below), which registers the privileged launchd
+- Builds the release binary and installs it to `/usr/local/bin/wgd`.
+- Runs `wgd launchd reload` (see below), which registers the privileged launchd
   daemon, disconnects anything already connected under your account, and
   installs the per-user session agent.
 - Adds your config as a per-user connection named `CONNECTION_NAME` with
@@ -50,16 +50,16 @@ Re-running `make install` after editing the config file is safe: an
 unmodified file is a silent no-op, and a changed one replaces the old
 `CONNECTION_NAME` record instead of piling up a duplicate.
 
-Access to the privileged daemon is limited to a dedicated `tunmux` group,
+Access to the privileged daemon is limited to a dedicated `wgd` group,
 which the install creates and adds you to (a re-login may be needed for the
 membership to take effect).
 
 `make uninstall` stops the daemon and session agent and clears any DNS
 override; it leaves stored connection records in place. `make purge` also
 removes the daemon's state directory (including the store), the binary, and
-the `tunmux` group.
+the `wgd` group.
 
-Upgrading from a pre-connection-store tunmux (the old `wgconf`/`autoconnect`
+Upgrading from a pre-connection-store install (the old `wgconf`/`autoconnect`
 design): there is no automatic migration of the old profile or state files;
 run `connection add` once per existing config after upgrading.
 
@@ -67,7 +67,7 @@ A macOS update can leave the launchd services booted out or disabled. To put
 both of them back and reconnect, run:
 
 ```bash
-tunmux launchd reload
+wgd launchd reload
 ```
 
 It re-registers the privileged daemon (escalating via `sudo` for that one
@@ -76,27 +76,27 @@ reinstalls the session agent, which then reconnects whatever automatic
 connections are stored for you. `make reload` is the same command.
 
 For a daemon-only restart using its existing launchd registration, run
-`sudo tunmux launchd restart`. This leaves service registrations and the
+`sudo wgd launchd restart`. This leaves service registrations and the
 session agent unchanged and does not explicitly reconnect stored connections.
-Use `tunmux launchd reload` for the full recovery sequence above; run it as
+Use `wgd launchd reload` for the full recovery sequence above; run it as
 your normal user, without sudo.
 
 Unlike the rest of the CLI, `launchd reload` logs its own steps at debug level by
-default; `tunmux launchd reload -s` keeps only the step headers. The daemon's own
-output goes to `/var/log/tunmux/privileged.{out,err}.log`, and each
-connection's helper logs to `/var/log/tunmux/<interface>.log` (`tunmux
+default; `wgd launchd reload -s` keeps only the step headers. The daemon's own
+output goes to `/var/log/wgd/privileged.{out,err}.log`, and each
+connection's helper logs to `/var/log/wgd/<interface>.log` (`wgd
 connection get <id>` prints the interface name).
 
 ## Connections
 
-Every WireGuard config tunmux knows about is a **connection**: parsed and
+Every WireGuard config `wgd` knows about is a **connection**: parsed and
 fingerprinted at add time, then stored by the privileged daemon under an
 opaque id (you can also refer to it by the name you gave it). Two kinds:
 
 - Global connections are system-wide and root-owned; every operation on one
   requires root. If set to automatic, a global connection comes up the next
   time anything wakes the privileged daemon after a reboot (your login
-  session agent, or a plain `tunmux status`), not immediately at boot: the
+  session agent, or a plain `wgd status`), not immediately at boot: the
   daemon itself is socket-activated on demand, not a boot-time service.
 - Per-user connections only live inside your session and don't need `sudo`
   for their owner to use. If set to automatic, the session agent brings them
@@ -104,14 +104,14 @@ opaque id (you can also refer to it by the name you gave it). Two kinds:
   different session; that case isn't handled yet).
 
 ```bash
-tunmux connection add --file <path> [--global] [--name <label>] [--mtu <n>] [--start-mode manual|automatic] [--force]
-tunmux connection list [--global | --all]   # alias: ls
-tunmux connection get <id-or-name>
-tunmux connection connect <id-or-name> [--gotatun-debug]
-tunmux connection disconnect <id-or-name> | -a/--all
-tunmux connection mode <id-or-name> <manual|automatic>
-tunmux connection remove <id-or-name>
-tunmux launchd agent {install,status,uninstall}
+wgd connection add --file <path> [--global] [--name <label>] [--mtu <n>] [--start-mode manual|automatic] [--force]
+wgd connection list [--global | --all]   # alias: ls
+wgd connection get <id-or-name>
+wgd connection connect <id-or-name> [--gotatun-debug]
+wgd connection disconnect <id-or-name> | -a/--all
+wgd connection mode <id-or-name> <manual|automatic>
+wgd connection remove <id-or-name>
+wgd launchd agent {install,status,uninstall}
 ```
 
 Adding or removing a connection, and elevating a global connection's mode
@@ -145,7 +145,7 @@ macOS has no in-kernel WireGuard. Every connection therefore runs on a
 bundled userspace WireGuard engine, [gotatun](https://github.com/mullvad/gotatun),
 through a built-in helper, so there is nothing extra to install.
 
-tunmux is split into two parts. The command you run as your normal user
+`wgd` is split into two parts. The command you run as your normal user
 handles configuration and status. The privileged daemon, running as root,
 owns the connection store and performs the operations that need elevated
 permissions: bringing tunnels up and down, and talking to the WireGuard
@@ -160,17 +160,17 @@ helper actually talk to each other, see [doc/architecture.md](doc/architecture.m
 
 ## Configuration
 
-tunmux reads optional defaults from `$XDG_CONFIG_HOME/tunmux/config.toml`
-(typically `~/.config/tunmux/config.toml`), under a `[general]` table. The
+`wgd` reads optional defaults from `$XDG_CONFIG_HOME/wgd/config.toml`
+(typically `~/.config/wgd/config.toml`), under a `[general]` table. The
 file is optional; without it, sensible defaults apply. It covers the
 privileged daemon's transport (socket or stdio), its autostart/autostop
 behavior, and the group used for socket permissions. It has nothing to do
 with connections themselves, which live entirely in the privileged store and
-are managed through `tunmux connection`.
+are managed through `wgd connection`.
 
 ## Running alongside the WireGuard app
 
-Do not run tunmux at the same time as the official WireGuard app with
+Do not run `wgd` at the same time as the official WireGuard app with
 On-Demand enabled for the same tunnel. The two will compete over the
 connection. Turn off On-Demand and deactivate matching tunnels in the app
 first.
@@ -200,4 +200,4 @@ make hooks
 
 MIT
 
-Copyright (c) 2026 Contributors to tunmux
+Copyright (c) 2026 Contributors to macOS WireGuard Daemon

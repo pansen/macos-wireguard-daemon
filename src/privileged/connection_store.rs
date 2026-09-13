@@ -371,7 +371,7 @@ pub fn load_all() -> Result<Vec<StoredConnection>> {
     load_all_in(&root_dir())
 }
 
-/// Every address tunmux has assigned to one of its own stored connections,
+/// Every address wgd has assigned to one of its own stored connections,
 /// active or not. Re-exported (see `privileged::mod`) to `userspace_helper`'s
 /// network overview, which needs to tell "one of our own connections, just
 /// not the active one" apart from an actually-foreign VPN sharing the same
@@ -757,7 +757,7 @@ pub fn is_active(id: ConnectionId) -> Result<bool> {
 /// (socket-activated, idle-exits) rather than a long-lived boot service, so
 /// that can happen many times within one machine boot, not just once. Gated
 /// by [`boot_id`] to actually run at most once per real boot: without this,
-/// an unprivileged `tunmux`-group member merely running e.g. `tunmux status`
+/// an unprivileged `wgd`-group member merely running e.g. `wgd status`
 /// after the daemon has idled out would re-trigger a root-only
 /// `ConnectConnection` on every global `Automatic` record, silently undoing
 /// an admin's explicit `disconnect` within the idle timeout. If the boot
@@ -886,7 +886,7 @@ mod tests {
 
     fn temp_root(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "tunmux-connstore-{label}-{}-{:016x}",
+            "wgd-connstore-{label}-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         ));

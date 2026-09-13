@@ -101,7 +101,7 @@ fn defaults_to_debug(command: &TopCommand) -> bool {
     matches!(command, TopCommand::Launchd { command: LaunchdCommand::Reload(args) } if !args.silent)
 }
 
-/// `tunmux status`: built entirely from the privileged connection store --
+/// `wgd status`: built entirely from the privileged connection store --
 /// this user's own connections plus every global one (global connections
 /// have no owner to match `Mine`, so it's fetched as a second, disjoint
 /// scope and appended).
@@ -111,7 +111,7 @@ fn cmd_status() -> anyhow::Result<()> {
     connections.extend(client.list_connections(ConnectionScope::Global)?);
 
     if connections.is_empty() {
-        println!("No stored connections. Add one with: tunmux connection add --file <path>");
+        println!("No stored connections. Add one with: wgd connection add --file <path>");
         return Ok(());
     }
 
@@ -171,7 +171,7 @@ fn cmd_status() -> anyhow::Result<()> {
     // own `legacy_interface_access_denied` (global detail is root-only,
     // matching every other global mutation/read), so skip them here rather
     // than printing an `Auth` error to stderr for every global connection on
-    // every plain `tunmux status` a non-admin user runs.
+    // every plain `wgd status` a non-admin user runs.
     let is_root = nix::unistd::geteuid().is_root();
     for conn in connections
         .iter()
@@ -218,11 +218,11 @@ mod tests {
 
     #[test]
     fn parsed_reload_command_asks_for_debug_logging() {
-        let cli = Cli::try_parse_from(["tunmux", "launchd", "reload"]).expect("parse reload");
+        let cli = Cli::try_parse_from(["wgd", "launchd", "reload"]).expect("parse reload");
         assert!(defaults_to_debug(&cli.command));
 
-        let quiet = Cli::try_parse_from(["tunmux", "launchd", "reload", "-s"])
-            .expect("parse silent reload");
+        let quiet =
+            Cli::try_parse_from(["wgd", "launchd", "reload", "-s"]).expect("parse silent reload");
         assert!(!defaults_to_debug(&quiet.command));
     }
 }

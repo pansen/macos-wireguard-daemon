@@ -604,7 +604,7 @@ fn authorize_access(record: &StoredConnection, origin: PeerOrigin) -> Option<Pri
 /// ownership rule the new ops use; a name that matches no stored connection
 /// (e.g. `wgconf0`, or a bare `utunN`) is not gated at all, preserving
 /// pre-existing behavior for genuinely unmanaged
-/// interfaces. Without this, any reachable `tunmux`-group member could learn
+/// interfaces. Without this, any reachable `wgd`-group member could learn
 /// a global connection's interface name from `ListConnections` and then use
 /// these ungated legacy ops to read its peer/handshake data or tear it down.
 fn legacy_interface_access_denied(
@@ -802,7 +802,7 @@ mod tests {
     /// each other and from the real (root-owned) system path.
     fn with_test_store<R>(label: &str, body: impl FnOnce() -> R) -> R {
         let dir = std::env::temp_dir().join(format!(
-            "tunmux-dispatch-test-{label}-{}-{:016x}",
+            "wgd-dispatch-test-{label}-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         ));

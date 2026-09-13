@@ -19,6 +19,6 @@
     <key>timeout</key>
     <integer>60</integer>
     <key>comment</key>
-    <string>Authenticate as an administrator to modify tunmux connections.</string>
+    <string>Authenticate as an administrator to modify wgd connections.</string>
 </dict>
 </plist>

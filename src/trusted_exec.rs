@@ -11,11 +11,11 @@ pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const LOCAL_BIN: &str = "/usr/local/bin";
 
 /// What is being checked, so a rejection can name the right thing to fix.
-/// `validate_root_owned_path` guards the tunmux binary that root re-executes
+/// `validate_root_owned_path` guards the wgd binary that root re-executes
 /// and root-only state directories; the remedy differs.
 #[derive(Clone, Copy)]
 pub enum TrustedPath {
-    /// The tunmux binary itself, wherever it happens to be installed.
+    /// The wgd binary itself, wherever it happens to be installed.
     Executable,
     /// A directory holding root-only state.
     Directory,
@@ -31,7 +31,7 @@ impl TrustedPath {
 
     fn remedy(self) -> String {
         match self {
-            TrustedPath::Executable => "install tunmux where it and every parent directory are \
+            TrustedPath::Executable => "install wgd where it and every parent directory are \
                  root-owned, are not symlinks, and have no group/other write access"
                 .into(),
             TrustedPath::Directory => "chown it to root and remove group/other write access, \
@@ -43,7 +43,7 @@ impl TrustedPath {
 
 fn trusted_local_bin() -> Option<&'static str> {
     // Finding 3 — Executable substitution through PATH: /usr/local/bin is
-    // also tunmux's installation directory. Allow it after system tools only
+    // also wgd's installation directory. Allow it after system tools only
     // when it and its ancestors are root-controlled; do not assume every
     // machine has the same ownership.
     validate_root_owned_path(Path::new(LOCAL_BIN), TrustedPath::Directory)
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn system_command_ignores_substitute_on_path() {
-        let dir = std::env::temp_dir().join(format!("tunmux-path-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wgd-path-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("id");
         fs::write(&fake, "#!/bin/sh\necho substituted\n").unwrap();
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn symlinked_privileged_directory_is_rejected() {
-        let path = std::env::temp_dir().join(format!("tunmux-dir-link-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wgd-dir-link-{}", std::process::id()));
         symlink("/usr/bin", &path).unwrap();
         assert!(validate_root_owned_path(&path, TrustedPath::Directory).is_err());
         fs::remove_file(path).unwrap();
@@ -160,8 +160,7 @@ mod tests {
 
     #[test]
     fn writable_directory_cannot_be_a_trusted_search_path() {
-        let path =
-            std::env::temp_dir().join(format!("tunmux-writable-path-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wgd-writable-path-{}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(validate_root_owned_path(&path, TrustedPath::Directory).is_err());

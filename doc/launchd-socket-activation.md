@@ -1,7 +1,7 @@
 # launchd socket activation for the privileged service
 
 **Status:** proposed
-**Scope:** macOS privileged control service (`tunmux privileged --serve`)
+**Scope:** macOS privileged control service (`wgd privileged --serve`)
 **Author:** design note
 
 ## Problem
@@ -19,7 +19,7 @@ if let Some(gid) = group_gid { chown(&socket_path, None, Some(gid))?; }
 
 The socket is created **as root**, then the mode and group are patched afterward.
 That sequence has a window — and several failure modes — in which the socket is
-left `root:wheel`/root-only, so an unprivileged client in the `tunmux` group cannot
+left `root:wheel`/root-only, so an unprivileged client in the `wgd` group cannot
 connect after boot.
 
 macOS `launchd` supports **socket activation** (the equivalent of systemd socket
@@ -33,12 +33,12 @@ chown-after-bind window entirely and is the recommended fix.
 
 | Property | Value |
 |---|---|
-| Socket path | `/Library/Application Support/tunmux/run/ctl.sock` (`privileged_socket_path()`) |
-| Socket dir | `/Library/Application Support/tunmux/run` (`privileged_socket_dir()`), mode `0750` |
+| Socket path | `/Library/Application Support/wgd/run/ctl.sock` (`privileged_socket_path()`) |
+| Socket dir | `/Library/Application Support/wgd/run` (`privileged_socket_dir()`), mode `0750` |
 | Socket file mode | `0660` |
-| Owner / group | `root` / `tunmux` |
+| Owner / group | `root` / `wgd` |
 
-Both the dir and the file are chowned to group `tunmux` inside `serve()`.
+Both the dir and the file are chowned to group `wgd` inside `serve()`.
 
 ### Server — `src/privileged/mod.rs` `serve()`
 
@@ -83,7 +83,7 @@ let peer = {
 ```
 
 **On macOS there is no peer-credential check.** The socket's filesystem permissions
-(`0660` + group `tunmux`) are the *entire* access-control boundary. This makes getting
+(`0660` + group `wgd`) are the *entire* access-control boundary. This makes getting
 the socket mode/group right not just a usability fix but the security boundary itself.
 
 ### Client — `src/privileged_client/transport.rs` `connect_or_autostart()`
@@ -92,24 +92,24 @@ the socket mode/group right not just a usability fix but the security boundary i
 try_connect_socket()
   └─ Ok        → use it
   └─ NotFound / ConnectionRefused / PermissionDenied
-       └─ autostart: sudo -n -b tunmux privileged --serve --autostarted
-                          --authorized-group tunmux [--idle-timeout-ms N]
+       └─ autostart: sudo -n -b wgd privileged --serve --autostarted
+                          --authorized-group wgd [--idle-timeout-ms N]
 ```
 
 The client is **transport-agnostic**: it only knows the socket path. It does not care
 who created the socket.
 
-### Current plist — `etc/me.pansen.tunmux.privileged.plist`
+### Current plist — `etc/me.pansen.wgd.privileged.plist`
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-  <string>/usr/local/bin/tunmux</string>
+  <string>/usr/local/bin/wgd</string>
   <string>--debug</string>
   <string>privileged</string>
   <string>--serve</string>
   <string>--authorized-group</string>
-  <string>tunmux</string>
+  <string>wgd</string>
 </array>
 <key>RunAtLoad</key>  <true/>
 <key>KeepAlive</key>  <true/>   <!-- always-on root process -->
@@ -123,8 +123,8 @@ A persistent (`KeepAlive`) root daemon that self-binds the socket.
 
 ### Goal
 
-`launchd` creates `/Library/Application Support/tunmux/run/ctl.sock` with `SockMode=0660` and
-`SockGroup=tunmux` **atomically at creation**, and hands the listening fd to the
+`launchd` creates `/Library/Application Support/wgd/run/ctl.sock` with `SockMode=0660` and
+`SockGroup=wgd` **atomically at creation**, and hands the listening fd to the
 daemon via `launch_activate_socket("Listeners", …)`. The daemon never chmods/chowns
 the socket in the activation path. The unprivileged client is unchanged.
 
@@ -144,8 +144,8 @@ the socket in the activation path. The unprivileged client is unchanged.
 
 ### The two creation paths and how they stay compatible
 
-Both paths must converge on **one socket contract**: path `/Library/Application Support/tunmux/run/ctl.sock`,
-mode `0660`, group `tunmux`. They already share `config::privileged_socket_path()`;
+Both paths must converge on **one socket contract**: path `/Library/Application Support/wgd/run/ctl.sock`,
+mode `0660`, group `wgd`. They already share `config::privileged_socket_path()`;
 the plist's `SockPathName` / `SockMode` / `SockGroup` must match it exactly.
 
 | | **launchd (installed)** | **sudo (fallback)** |
@@ -280,12 +280,12 @@ Notes:
   ```
 
 - The dir chown earlier in `serve()` (lines ~79–85) is harmless and can remain; it is
-  redundant under activation (dir is pre-created `root:tunmux` by the installer) and
+  redundant under activation (dir is pre-created `root:wgd` by the installer) and
   still needed for the sudo self-bind path.
 - `launch_activate_socket` must be called **exactly once**; calling it again returns
   the same fd already consumed.
 
-### 2. `etc/me.pansen.tunmux.privileged.plist` — convert to socket activation
+### 2. `etc/me.pansen.wgd.privileged.plist` — convert to socket activation
 
 ```xml
 <?xml version="1.0" encoding="UTF-8" ?>
@@ -294,16 +294,16 @@ Notes:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>me.pansen.tunmux.privileged</string>
+    <string>me.pansen.wgd.privileged</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/tunmux</string>
+        <string>/usr/local/bin/wgd</string>
         <string>--debug</string>
         <string>privileged</string>
         <string>--serve</string>
         <string>--authorized-group</string>
-        <string>tunmux</string>
+        <string>wgd</string>
         <string>--autostarted</string>
         <string>--idle-timeout-ms</string>
         <string>60000</string>
@@ -314,7 +314,7 @@ Notes:
         <key>Listeners</key>
         <dict>
             <key>SockPathName</key>
-            <string>/Library/Application Support/tunmux/run/ctl.sock</string>
+            <string>/Library/Application Support/wgd/run/ctl.sock</string>
             <key>SockType</key>
             <string>stream</string>
             <key>SockFamily</key>
@@ -323,7 +323,7 @@ Notes:
             <key>SockPathMode</key>
             <integer>432</integer>
             <key>SockPathGroup</key>
-            <string>tunmux</string>
+            <string>wgd</string>
         </dict>
     </dict>
 
@@ -332,9 +332,9 @@ Notes:
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/var/log/tunmux/privileged.out.log</string>
+    <string>/var/log/wgd/privileged.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/tunmux/privileged.err.log</string>
+    <string>/var/log/wgd/privileged.err.log</string>
 </dict>
 </plist>
 ```
@@ -351,22 +351,22 @@ Changes from current:
 > **Verify the key names and mode encoding on the target macOS version.** Apple's
 > `launchd.plist(5)` historically documents both `SockPathMode`/`SockPathGroup` and the
 > shorter `SockMode`/`SockGroup`. Confirm which the running launchd honors (see gotchas);
-> the value must end up `0660 root:tunmux` on the created socket.
+> the value must end up `0660 root:wgd` on the created socket.
 
 ### 3. `Makefile` — delegate daemon setup to the binary
 
 `install/privileged` now installs the binary and delegates all daemon setup to
-`tunmux launchd install`:
+`wgd launchd install`:
 
 ```make
-sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
-sudo /usr/local/bin/tunmux launchd install
+sudo install -m 0755 target/release/wgd /usr/local/bin/wgd
+sudo /usr/local/bin/wgd launchd install
 ```
 
-`tunmux launchd install` handles group creation, log dir setup, socket dir
+`wgd launchd install` handles group creation, log dir setup, socket dir
 pre-creation, plist copy/chown, and launchctl bootstrap. Similarly,
-`tunmux launchd restart` replaces the direct `launchctl kickstart`, and
-`tunmux launchd uninstall` handles bootout/disable and plist removal.
+`wgd launchd restart` replaces the direct `launchctl kickstart`, and
+`wgd launchd uninstall` handles bootout/disable and plist removal.
 
 This centralizes the entire daemon lifecycle in the binary, keeping the
 Makefile simple and reducing duplication between install-time and upgrade
@@ -390,14 +390,14 @@ separately.
 
 - [ ] **`SockMode` is decimal in plist XML.** `<integer>` is base-10, so `0660` octal =
       `432`. Writing `<integer>0660</integer>` is wrong. After load, confirm with
-      `stat -f '%Sp %Sg %Su' "/Library/Application Support/tunmux/run/ctl.sock"` → expect `srw-rw---- tunmux root`.
+      `stat -f '%Sp %Sg %Su' "/Library/Application Support/wgd/run/ctl.sock"` → expect `srw-rw---- wgd root`.
 - [ ] **Key names.** Confirm `SockPathMode`/`SockPathGroup` vs `SockMode`/`SockGroup`
       against `man launchd.plist` on the target OS; the effective result must be
-      `0660 root:tunmux`.
+      `0660 root:wgd`.
 - [ ] **launchd respawn throttle (~10s minimum).** Too-short `--idle-timeout-ms` makes a
       disconnect-then-reconnect within the throttle window add latency. Use ≥30–60s
       (spec uses 60000ms).
-- [ ] **`/Library/Application Support/tunmux/run` exists before first activation** (Makefile step 3).
+- [ ] **`/Library/Application Support/wgd/run` exists before first activation** (Makefile step 3).
 - [ ] **`launch_activate_socket` returns `None` cleanly** in a sudo-spawned daemon →
       self-bind fallback still works.
 - [ ] **`libc::launch_activate_socket` links** on macOS (else add the `extern "C"`).
@@ -405,16 +405,16 @@ separately.
 ## Test plan
 
 1. **Fresh install, on-demand:** `make install`. Confirm no daemon is running
-   (`launchctl print system/me.pansen.tunmux.privileged` shows loaded, not running).
+   (`launchctl print system/me.pansen.wgd.privileged` shows loaded, not running).
    Run a client op that needs privilege → daemon spawns → op succeeds with no sudo
    prompt. After `--idle-timeout-ms`, confirm the daemon exits and the socket persists.
-2. **Permissions:** `stat -f '%Sp %Sg %Su' "/Library/Application Support/tunmux/run/ctl.sock"` → `srw-rw----`,
-   group `tunmux`, owner `root`.
-3. **Group gating:** as a user **in** `tunmux`, a client connects; a user **not** in
-   `tunmux` is denied at connect (`PermissionDenied`).
-4. **sudo fallback intact:** `launchctl bootout system/me.pansen.tunmux.privileged`,
+2. **Permissions:** `stat -f '%Sp %Sg %Su' "/Library/Application Support/wgd/run/ctl.sock"` → `srw-rw----`,
+   group `wgd`, owner `root`.
+3. **Group gating:** as a user **in** `wgd`, a client connects; a user **not** in
+   `wgd` is denied at connect (`PermissionDenied`).
+4. **sudo fallback intact:** `launchctl bootout system/me.pansen.wgd.privileged`,
    remove the socket, run a client op from a TTY → sudo autostart self-binds the socket
-   `0660 root:tunmux` → op succeeds. Confirms the activation `None` path.
+   `0660 root:wgd` → op succeeds. Confirms the activation `None` path.
 5. **Reboot:** reboot, log in (autoconnect agent fires) → privileged op works with no
    manual sudo. This is the original bug; confirm it is fixed.
 6. **Linux unaffected:** build/run on Linux; `systemd_activated_listener()` /

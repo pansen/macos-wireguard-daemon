@@ -16,8 +16,8 @@ use tracing_subscriber::registry::LookupSpan;
 
 const LOG_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-const DEBUG_ENV: &str = "TUNMUX_DEBUG";
-pub(crate) const COLOR_ENV: &str = "TUNMUX_LOG_COLOR";
+const DEBUG_ENV: &str = "WGD_DEBUG";
+pub(crate) const COLOR_ENV: &str = "WGD_LOG_COLOR";
 const GOTATUN_UAPI_CONNECTION_TARGET: &str = "gotatun::device::uapi";
 const GOTATUN_UAPI_CONNECTION_MESSAGE: &str = "New UAPI connection on unix socket";
 
@@ -103,11 +103,11 @@ fn to_log_level_filter(level: LevelFilter) -> log::LevelFilter {
     }
 }
 
-struct TunmuxLogFormat {
+struct WgdLogFormat {
     timer: UtcTime<&'static [time::format_description::FormatItem<'static>]>,
 }
 
-impl TunmuxLogFormat {
+impl WgdLogFormat {
     fn new() -> Self {
         Self {
             timer: UtcTime::new(LOG_TIMESTAMP_FORMAT),
@@ -115,7 +115,7 @@ impl TunmuxLogFormat {
     }
 }
 
-impl<S, N> FormatEvent<S, N> for TunmuxLogFormat
+impl<S, N> FormatEvent<S, N> for WgdLogFormat
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
     N: for<'writer> FormatFields<'writer> + 'static,
@@ -149,7 +149,7 @@ where
     }
 }
 
-impl TunmuxLogFormat {
+impl WgdLogFormat {
     fn format_timestamp(&self, writer: &mut Writer<'_>) -> fmt::Result {
         if writer.has_ansi_escapes() {
             writer.write_str("\x1b[2m")?;
@@ -221,7 +221,7 @@ impl fmt::Display for FormattedLevel<'_> {
     }
 }
 
-/// Recover the level from a line already rendered by [`TunmuxLogFormat`].
+/// Recover the level from a line already rendered by [`WgdLogFormat`].
 ///
 /// The CLI receives the privileged daemon's log lines as finished text over
 /// the control socket, long past the point where a `tracing` subscriber could
@@ -328,7 +328,7 @@ pub fn init_terminal(verbose: bool) {
     let _ = TERMINAL_LEVEL.set(level);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(ansi_enabled(true))
-        .event_format(TunmuxLogFormat::new())
+        .event_format(WgdLogFormat::new())
         .with_max_level(level)
         .with_writer(std::io::stderr)
         .finish();
@@ -365,7 +365,7 @@ pub fn init_service(verbose: bool) {
     let level = level_from_env_or_default(default);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(ansi_enabled(false))
-        .event_format(TunmuxLogFormat::new())
+        .event_format(WgdLogFormat::new())
         .with_max_level(level)
         .with_writer(|| ServiceWriter)
         .finish();
@@ -415,7 +415,7 @@ pub fn init_file_sync(path: &str, verbose: bool) -> anyhow::Result<()> {
     let file = Arc::new(file);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(ansi_enabled(false))
-        .event_format(TunmuxLogFormat::new())
+        .event_format(WgdLogFormat::new())
         .with_max_level(level)
         .with_writer(move || SharedFileWriter(file.clone()))
         .finish();
@@ -428,11 +428,11 @@ mod tests {
     use super::{parse_line_level, strip_ansi, FormattedLevel};
     use tracing::Level;
 
-    /// A line in the shape `TunmuxLogFormat` writes, using the real level
+    /// A line in the shape `WgdLogFormat` writes, using the real level
     /// renderer so the padding and color codes match what the daemon emits.
     fn formatted_line(level: Level, ansi: bool) -> String {
         format!(
-            "2026-06-14T08:18:02Z {} some_event field=1 tunmux::privileged: ",
+            "2026-06-14T08:18:02Z {} some_event field=1 wgd::privileged: ",
             FormattedLevel::new(&level, ansi)
         )
     }

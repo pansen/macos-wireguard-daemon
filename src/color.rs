@@ -1,8 +1,8 @@
-//! ANSI coloring for `tunmux status` output.
+//! ANSI coloring for `wgd status` output.
 //!
 //! Two renderers live here. [`wg_show`] reproduces the palette `wg show` uses
 //! when it writes to a terminal (green interface, yellow peer, bold field
-//! labels, cyan units) so a tunmux tunnel looks the same as one inspected with
+//! labels, cyan units) so a wgd tunnel looks the same as one inspected with
 //! `wg` directly. [`tables`] greys out the column headers and rules of the
 //! summary table and of the network overview, keeping the frame quieter than
 //! the data inside it.
@@ -28,12 +28,12 @@ const UNITS: &[&str] = &[
 ];
 
 /// Whether stdout should carry ANSI escapes. A terminal gets color by default;
-/// `TUNMUX_LOG_COLOR` overrides in either direction, matching the logger.
+/// `WGD_LOG_COLOR` overrides in either direction, matching the logger.
 pub fn enabled() -> bool {
     crate::logging::ansi_enabled(std::io::stdout().is_terminal())
 }
 
-/// Grey, for the column headers and rules of tables tunmux prints itself.
+/// Grey, for the column headers and rules of tables wgd prints itself.
 pub fn table_frame(text: &str) -> String {
     paint_table_frame(text, enabled())
 }

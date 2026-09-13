@@ -16,8 +16,8 @@ use super::daemon::self_executable_for_spawn;
 pub(super) fn run_network_overview(interface: &str) -> Result<Option<String>> {
     use std::io::Read;
 
-    let socket_path = std::path::PathBuf::from("/var/run/wireguard")
-        .join(format!("{interface}.tunmux.query.sock"));
+    let socket_path =
+        std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.wgd.query.sock"));
     if !socket_path.exists() {
         return Ok(None);
     }
@@ -287,20 +287,20 @@ pub(super) fn run_gotatun_up(
     }
 
     debug!(
-        cmd = format!("{} {} [TUNMUX_GOTATUN_HELPER=1]", exe.display(), interface),
+        cmd = format!("{} {} [WGD_GOTATUN_HELPER=1]", exe.display(), interface),
         "exec"
     );
     let mut command = Command::new(exe);
     crate::trusted_exec::sanitize(&mut command);
     command
-        .env("TUNMUX_GOTATUN_HELPER", "1")
-        .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
+        .env("WGD_GOTATUN_HELPER", "1")
+        .env("WGD_GOTATUN_CONFIG_B64", config_b64)
         .arg(interface);
     if let Some(mtu) = mtu_override {
-        command.env("TUNMUX_GOTATUN_MTU_OVERRIDE", mtu.to_string());
+        command.env("WGD_GOTATUN_MTU_OVERRIDE", mtu.to_string());
     }
     if debug_enabled {
-        command.env("TUNMUX_DEBUG", "1");
+        command.env("WGD_DEBUG", "1");
     }
     if let Some(color) = std::env::var_os(crate::logging::COLOR_ENV) {
         command.env(crate::logging::COLOR_ENV, color);
@@ -560,14 +560,14 @@ fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
 /// helper's setup/teardown output back to the calling CLI. Shares the single
 /// source of truth in `config` with `userspace_helper` so the paths always match.
 ///
-/// `/var/log/tunmux/<interface>.log` on all platforms (see
+/// `/var/log/wgd/<interface>.log` on all platforms (see
 /// `config::gotatun_helper_log_path`).
 pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
     crate::config::gotatun_helper_log_path(interface)
 }
 
 fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.tunmux.{suffix}"))
+    std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.wgd.{suffix}"))
 }
 
 #[cfg(test)]
@@ -583,7 +583,7 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "tunmux-gotatun-{label}-{}-{nonce}",
+            "wgd-gotatun-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -592,7 +592,7 @@ mod tests {
     fn gotatun_runtime_paths_are_scoped_to_interface() {
         assert_eq!(
             gotatun_runtime_path("wgconf0", "cleanup"),
-            std::path::PathBuf::from("/var/run/wireguard/wgconf0.tunmux.cleanup")
+            std::path::PathBuf::from("/var/run/wireguard/wgconf0.wgd.cleanup")
         );
     }
 

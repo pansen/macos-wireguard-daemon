@@ -342,7 +342,7 @@ impl PrivilegedClient {
                     cause = %cause,
                     "admin_authentication_requested"
                 );
-                eprintln!("tunmux: admin authentication required for this change.");
+                eprintln!("wgd: admin authentication required for this change.");
                 // The `ClientAuthorization` guard must outlive the retried
                 // `send` call: freeing it (which happens automatically at
                 // end of scope here) destroys the securityd session the
