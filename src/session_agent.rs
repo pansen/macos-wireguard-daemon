@@ -164,14 +164,14 @@ fn cmd_status() -> anyhow::Result<()> {
 /// the others), then blocks until `SIGTERM` and reconciles the opposite
 /// direction (disconnect) before returning.
 ///
-/// `SIGTERM` is blocked *before* the initial reconcile runs, not after: this
-/// agent's own installer (`cmd_install`) bootstraps it (which starts it
-/// immediately via `RunAtLoad`) and then kickstarts it, which sends exactly
-/// this signal almost immediately -- if it arrived during
-/// `reconcile_connect_mine()` while still on the default disposition, the
-/// process would simply die with no teardown at all. Blocking first means a
-/// signal that arrives during startup just stays pending until `sigwait`
-/// picks it up afterward, instead of being lost.
+/// `SIGTERM` is blocked *before* the initial reconcile runs, not after: a
+/// re-install (`cmd_install`) sends this same signal via `bootout` to tear
+/// down any already-running instance just before `bootstrap` starts the new
+/// one -- if that signal arrived during `reconcile_connect_mine()` while
+/// still on the default disposition, the process would simply die with no
+/// teardown at all. Blocking first means a signal that arrives during
+/// startup just stays pending until `sigwait` picks it up afterward, instead
+/// of being lost.
 pub fn run() -> anyhow::Result<()> {
     block_sigterm().context("failed to block SIGTERM")?;
     reconcile_connect_mine();

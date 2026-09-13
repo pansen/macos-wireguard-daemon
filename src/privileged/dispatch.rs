@@ -228,7 +228,16 @@ fn handle_add_connection(
     };
 
     match connection_store::find_by_identity(&index_lock, &fingerprint, global, owner_uid) {
-        Ok(Some(existing)) => return PrivilegedResponse::ConnectionId(existing.id),
+        Ok(Some(existing)) => {
+            return reconcile_existing_add(
+                &index_lock,
+                existing,
+                name,
+                start_mode,
+                force,
+                auth_external_form.as_deref(),
+            );
+        }
         Ok(None) => {}
         Err(error) => return error_response(error),
     }
@@ -283,6 +292,88 @@ fn handle_add_connection(
         updated_at: now,
     };
     match connection_store::create(&index_lock, &stored) {
+        Ok(()) => PrivilegedResponse::ConnectionId(id),
+        Err(error) => error_response(error),
+    }
+}
+
+/// `AddConnection`'s exact-match dedup path (see §2 of the design plan):
+/// byte-for-byte-identical parsed content is a no-op for the config itself,
+/// but the caller may still be asking to change this record's mutable
+/// metadata (`name`, `start_mode`) -- e.g. `make install`'s `connection add
+/// --force --start-mode automatic` re-running against a connection a user
+/// has since set back to `manual`. Without this, an identical resubmission
+/// would silently ignore a genuinely requested `name`/`start_mode` change.
+/// The caller already holds [`connection_store::IndexLock`]; `owner_uid` in
+/// the identity lookup that produced `existing` was either the caller's own
+/// attributed uid (per-user) or required root (global, checked before this
+/// is ever reached), so `existing` is already known to be this caller's own
+/// record -- no separate ownership check needed here.
+fn reconcile_existing_add(
+    index_lock: &connection_store::IndexLock,
+    mut existing: StoredConnection,
+    name: Option<String>,
+    start_mode: ConnectionStartMode,
+    force: bool,
+    auth_external_form: Option<&[u8]>,
+) -> PrivilegedResponse {
+    let id = existing.id;
+    let name_changed = name.is_some() && name != existing.name;
+    let mode_changed = start_mode != existing.start_mode;
+    if !name_changed && !mode_changed {
+        return PrivilegedResponse::ConnectionId(id);
+    }
+
+    if name_changed {
+        if let Some(new_name) = &name {
+            if !force {
+                match connection_store::find_by_name(
+                    index_lock,
+                    new_name,
+                    existing.global,
+                    existing.owner_uid,
+                ) {
+                    Ok(Some(other)) if other.id != id => {
+                        return PrivilegedResponse::Error {
+                            code: "NameInUse".into(),
+                            message: format!(
+                                "a connection named {new_name:?} already exists ({}); remove it first, or resubmit allowing the name to be replaced",
+                                other.id
+                            ),
+                        };
+                    }
+                    Ok(_) => {}
+                    Err(error) => return error_response(error),
+                }
+            }
+        }
+    }
+
+    // Same rule as `SetConnectionMode`: only the transition that makes a
+    // global connection auto-run as root at every future boot with no
+    // further human involvement requires proof of admin authentication.
+    let elevating = mode_changed
+        && existing.global
+        && existing.start_mode == ConnectionStartMode::Manual
+        && start_mode == ConnectionStartMode::Automatic;
+    if elevating {
+        if let Err(response) = require_admin_auth(auth_external_form) {
+            return response;
+        }
+    }
+
+    let conn_lock = match connection_store::lock_connection(id) {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    if name_changed {
+        existing.name = name;
+    }
+    if mode_changed {
+        existing.start_mode = start_mode;
+    }
+    existing.updated_at = connection_store::now_unix();
+    match connection_store::update(&conn_lock, &existing) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
         Err(error) => error_response(error),
     }
@@ -349,7 +440,7 @@ fn handle_connect_connection(origin: PeerOrigin, id: ConnectionId, debug: bool) 
         if let Some(root) = test_root {
             connection_store::set_test_root(root);
         }
-        let response = match connection_store::lock_connection(id) {
+        let response = match connection_store::lock_connection_patient(id) {
             Ok(conn_lock) => match super::connection_ops::connect(&conn_lock, id, debug) {
                 Ok(()) => PrivilegedResponse::Unit,
                 Err(error) => error_response(error),
@@ -378,7 +469,7 @@ fn handle_disconnect_connection(origin: PeerOrigin, id: ConnectionId) -> Dispatc
         if let Some(root) = test_root {
             connection_store::set_test_root(root);
         }
-        let response = match connection_store::lock_connection(id) {
+        let response = match connection_store::lock_connection_patient(id) {
             Ok(conn_lock) => match super::connection_ops::disconnect(&conn_lock, id) {
                 Ok(()) => PrivilegedResponse::Unit,
                 Err(error) => error_response(error),
@@ -785,6 +876,184 @@ mod tests {
     }
 
     #[test]
+    fn add_connection_resubmission_with_new_name_updates_it_without_auth() {
+        with_test_store("dedup-rename", || {
+            let first = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Manual,
+                Some("old-name".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            let id = connection_id(&first);
+
+            // No auth token: a plain rename on an identical resubmission must
+            // not engage the admin-auth flow.
+            let renamed = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Manual,
+                Some("new-name".to_string()),
+                None,
+                false,
+                None,
+            );
+            assert_eq!(connection_id(&renamed), id);
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.name.as_deref(), Some("new-name"));
+        });
+    }
+
+    #[test]
+    fn add_connection_resubmission_rejects_colliding_name_unless_forced() {
+        with_test_store("dedup-name-collision", || {
+            let other_conf = SAMPLE_CONF.replace("10.0.0.2/32", "10.0.0.3/32");
+            let first = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Manual,
+                Some("a".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            let first_id = connection_id(&first);
+            let second = handle_add_connection(
+                PeerOrigin::Socket(501),
+                other_conf.clone(),
+                false,
+                ConnectionStartMode::Manual,
+                Some("b".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            let second_id = connection_id(&second);
+            assert_ne!(first_id, second_id);
+
+            // Resubmitting the second connection's exact content but asking
+            // for the first connection's name must be rejected without
+            // `force`...
+            let collision = handle_add_connection(
+                PeerOrigin::Socket(501),
+                other_conf.clone(),
+                false,
+                ConnectionStartMode::Manual,
+                Some("a".to_string()),
+                None,
+                false,
+                None,
+            );
+            assert_eq!(error_code(&collision), "NameInUse");
+
+            // ...and succeed, replacing the name, with it.
+            let forced = handle_add_connection(
+                PeerOrigin::Socket(501),
+                other_conf,
+                false,
+                ConnectionStartMode::Manual,
+                Some("a".to_string()),
+                None,
+                true,
+                None,
+            );
+            assert_eq!(connection_id(&forced), second_id);
+            let stored = connection_store::load(second_id).unwrap().unwrap();
+            assert_eq!(stored.name.as_deref(), Some("a"));
+        });
+    }
+
+    #[test]
+    fn add_connection_resubmission_elevating_global_start_mode_requires_auth() {
+        with_test_store("dedup-elevate", || {
+            let first = add_connection(PeerOrigin::Socket(0), SAMPLE_CONF, true, valid_auth());
+            let id = connection_id(&first);
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().start_mode,
+                ConnectionStartMode::Manual
+            );
+
+            // Same content, but now asking to elevate the global connection
+            // to auto-run as root at every future boot: must require auth,
+            // exactly like `SetConnectionMode`'s own Manual -> Automatic gate
+            // on a global connection.
+            let without_token = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF.to_string(),
+                true,
+                ConnectionStartMode::Automatic,
+                None,
+                None,
+                false,
+                None,
+            );
+            assert_eq!(error_code(&without_token), "AuthRequired");
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().start_mode,
+                ConnectionStartMode::Manual,
+                "must not elevate before a valid token is presented"
+            );
+
+            let with_token = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF.to_string(),
+                true,
+                ConnectionStartMode::Automatic,
+                None,
+                None,
+                false,
+                valid_auth(),
+            );
+            assert_eq!(connection_id(&with_token), id);
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().start_mode,
+                ConnectionStartMode::Automatic
+            );
+        });
+    }
+
+    #[test]
+    fn add_connection_resubmission_non_elevating_start_mode_change_needs_no_auth() {
+        with_test_store("dedup-non-elevate", || {
+            // Per-user connections never require admin auth for `start_mode`
+            // (only a *global* Manual -> Automatic transition does), so this
+            // must succeed with no token at all.
+            let first = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Manual,
+                None,
+                None,
+                false,
+                valid_auth(),
+            );
+            let id = connection_id(&first);
+
+            let updated = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Automatic,
+                None,
+                None,
+                false,
+                None,
+            );
+            assert_eq!(connection_id(&updated), id);
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().start_mode,
+                ConnectionStartMode::Automatic
+            );
+        });
+    }
+
+    #[test]
     fn add_connection_same_text_different_global_scope_is_a_distinct_connection() {
         with_test_store("scope-distinct", || {
             let global = connection_id(&add_connection(
@@ -809,6 +1078,50 @@ mod tests {
             let response =
                 handle_remove_connection(PeerOrigin::Socket(0), ConnectionId::new(), None);
             assert_eq!(error_code(&response), "NotFound");
+        });
+    }
+
+    #[test]
+    fn remove_connection_refuses_while_active_without_engaging_auth() {
+        with_test_store("remove-active", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            // `is_active` treats the marker as stale unless the recorded
+            // socket path actually exists on disk, so the fixture needs a
+            // real (if empty) file there.
+            let socket = std::env::temp_dir().join(format!(
+                "{}-{:016x}.sock",
+                id.interface_name(),
+                rand::random::<u64>()
+            ));
+            std::fs::write(&socket, b"").unwrap();
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            connection_store::save_active(
+                &conn_lock,
+                id,
+                &connection_store::ActiveConnectionState {
+                    fingerprint: "sha256:whatever".to_string(),
+                    interface: id.interface_name(),
+                    socket: socket.clone(),
+                    device: 0,
+                    inode: 0,
+                    changed_sec: 0,
+                    changed_nsec: 0,
+                    connected_at: connection_store::now_unix(),
+                },
+            )
+            .unwrap();
+            drop(conn_lock);
+
+            // No auth token: a `Busy` refusal must not even reach the
+            // admin-auth check.
+            let response = handle_remove_connection(PeerOrigin::Socket(501), id, None);
+            assert_eq!(error_code(&response), "Busy");
+            let _ = std::fs::remove_file(&socket);
         });
     }
 
