@@ -382,26 +382,50 @@ fn ensure_directories(gid: u32) -> anyhow::Result<()> {
 
 /// Register the custom authorization right the privileged daemon gates
 /// configuration-changing connection operations behind (see
-/// `privileged::authz`), with the built-in `authenticate-admin` rule: any
-/// admin account may satisfy it (password or Touch ID), and macOS caches the
-/// resulting authorization briefly rather than re-prompting on every call.
-/// Idempotent -- re-running install simply rewrites the same rule.
-fn register_authorization_right() -> anyhow::Result<()> {
-    run_checked(
-        "/usr/bin/security",
-        &[
+/// `privileged::authz`). A non-shared admin credential remains valid for
+/// 60 seconds so the daemon can verify the client's authorization without
+/// prompting again. The built-in `authenticate-admin` rule has timeout=0,
+/// which forces authentication again during the daemon's verification.
+/// Idempotent -- install and every privileged daemon startup write the same
+/// bundled policy. Startup registration also upgrades existing installations
+/// where the binary was replaced without re-running `launchd install`.
+pub(crate) fn register_authorization_right() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    anyhow::ensure!(
+        nix::unistd::geteuid().is_root(),
+        "registering the tunmux authorization rule requires root; start the privileged service via launchd or sudo"
+    );
+    let mut child = Command::new("/usr/bin/security")
+        .args([
             "authorizationdb",
             "write",
             crate::privileged::authz::RIGHT_NAME,
-            "authenticate-admin",
-        ],
-    )
-    .with_context(|| {
-        format!(
-            "failed to register the {} authorization right",
-            crate::privileged::authz::RIGHT_NAME
-        )
-    })
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run security authorizationdb write")?;
+    let write_result = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(include_bytes!(
+            "../etc/me.pansen.tunmux.modify-connection.plist"
+        ));
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for security authorizationdb write")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to register the {} authorization right ({}): {}",
+        crate::privileged::authz::RIGHT_NAME,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    write_result.context("failed to write the tunmux authorization rule")
 }
 
 /// Write the rendered plist to `PLIST_PATH` atomically (temp file + rename)

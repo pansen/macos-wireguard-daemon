@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
-use tracing::{debug, Level};
+use tracing::{debug, warn, Level};
 
 use crate::config::PrivilegedTransport;
 use crate::error::{AppError, Result};
@@ -238,6 +238,13 @@ impl PrivilegedClient {
         }
 
         eprintln!("sudo authentication required for tunmux privileged autostart.");
+        warn!(
+            action = "start_privileged_daemon",
+            method = "sudo",
+            cause = "privileged daemon autostart requires a sudo password after non-interactive launch failed",
+            timeout_secs = SUDO_PROMPT_TIMEOUT.as_secs(),
+            "admin_authentication_requested"
+        );
         debug!(
             "privileged daemon start: running sudo -v with timeout={}s",
             SUDO_PROMPT_TIMEOUT.as_secs()
@@ -363,6 +370,13 @@ impl PrivilegedClient {
             }
 
             eprintln!("sudo authentication required for tunmux privileged stdio mode.");
+            warn!(
+                action = "start_privileged_stdio_helper",
+                method = "sudo",
+                cause = "starting the privileged stdio helper requires a sudo password after non-interactive validation failed",
+                timeout_secs = SUDO_PROMPT_TIMEOUT.as_secs(),
+                "admin_authentication_requested"
+            );
             let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
                 .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
             if !validate {

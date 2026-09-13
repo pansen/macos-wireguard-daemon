@@ -328,12 +328,33 @@ connection back to manual) proceed on ownership alone, the same way the
 macOS Network pane asks for admin credentials to add a VPN profile but not
 to connect one that's already configured.
 
-The custom right, `me.pansen.tunmux.modify-connection` with rule
-`authenticate-admin`, is registered in the system authorization database by
-`src/launchd.rs` at `tunmux launchd install` time; without that step the
-prompt has nothing to authenticate against. The runtime two-phase check
+The custom right, `me.pansen.tunmux.modify-connection`, requires an admin
+credential with a 60-second, non-shared lifetime and is registered in the
+system authorization database by `src/launchd.rs` at `tunmux launchd install`
+time and at every privileged daemon startup, before either the socket or stdio
+transport handles requests. This upgrades the rule when a replaced binary next
+starts, without requiring a separate install or reload command. Registration
+requires root; if it fails, startup fails with repair guidance instead of
+serving mutations against an incompatible rule. The runtime two-phase check
 itself lives in `src/privileged/authz.rs`: `client_authorize()` runs in the
-CLI process, `verify_external_form()` runs in the daemon.
+CLI process, `verify_external_form()` runs in the daemon without allowing UI
+and destroys the credentials after successful verification. The short lifetime
+allows the same authorization session to survive the handoff; separate changes
+still use fresh sessions and require their own authentication. The built-in
+`authenticate-admin` rule has a zero timeout, which caused a second prompt
+when the daemon previously allowed interaction during verification.
+
+Replacing the binary does not change an already-running daemon; `tunmux reload`
+updates both the registered rule and the daemon immediately, while the next
+normal daemon startup updates the rule automatically. A non-interactive
+verification failure (`-60007`) reports that the credential may have expired or
+the rule may be outdated, with retry and reload guidance.
+The interactive regression check is
+`cargo test --lib authenticated_external_form_verifies_once_without_reprompting -- --ignored`:
+it should open one client prompt, verify the external form without another
+prompt, and reject reuse of the consumed credentials. A forced replacement
+that adds a changed configuration and removes a stale one should prompt once
+for each change (two prompts total).
 
 ## Boot and session reconciliation
 
@@ -605,7 +626,7 @@ flowchart TB
     ADD --> CONNECT["connection connect &lt;name&gt;"]
 
     LI --> GRP["ensure_group_with_member: create 'tunmux', add you"]
-    LI --> RIGHT["register me.pansen.tunmux.modify-connection<br/>(authenticate-admin) in the authorization database"]
+    LI --> RIGHT["register me.pansen.tunmux.modify-connection<br/>(admin, non-shared, 60s) in the authorization database"]
     LI --> PL["render plist from etc/…privileged.plist<br/>@TUNMUX_BIN@, @SOCK_PATH_GROUP@"]
     PL --> BOOT["launchctl bootout, enable, bootstrap system/"]
 
