@@ -4,10 +4,17 @@
 pub(crate) mod authz;
 mod commands;
 mod connection_ops;
-// `pub(crate)` so `userspace_helper`'s network overview can cross-reference a
-// foreign-looking tunnel's address against every stored connection (not just
-// the active one) before guessing it's an unrelated VPN like Tailscale.
-pub(crate) mod connection_store;
+mod connection_store;
+// Narrow, deliberate crack in `connection_store`'s privacy: `userspace_helper`
+// needs to know which addresses tunmux itself has assigned (to tell a stale
+// one of our own interfaces apart from a real foreign VPN in its "other
+// tunnels" overview), but must not gain a path to `StoredConnection` itself
+// (raw config text, private keys) the way re-exporting `load_all` would.
+// `allow(unused_imports)`: only `userspace_helper` (bin-only, not part of
+// `lib.rs`'s module tree) calls this, so the `lib` build of this same source
+// sees it as unused.
+#[allow(unused_imports)]
+pub(crate) use connection_store::known_addresses;
 mod daemon;
 mod dispatch;
 mod managed_pids;

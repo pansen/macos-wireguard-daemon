@@ -204,6 +204,7 @@ impl PrivilegedClient {
         start_mode: ConnectionStartMode,
         name: Option<String>,
         mtu_override: Option<u16>,
+        force: bool,
     ) -> Result<ConnectionId> {
         match self.send_with_admin_auth_retry(|auth_external_form| {
             PrivilegedRequest::AddConnection {
@@ -212,6 +213,7 @@ impl PrivilegedClient {
                 start_mode,
                 name: name.clone(),
                 mtu_override,
+                force,
                 auth_external_form,
             }
         })? {

@@ -371,6 +371,32 @@ pub fn load_all() -> Result<Vec<StoredConnection>> {
     load_all_in(&root_dir())
 }
 
+/// Every address tunmux has assigned to one of its own stored connections,
+/// active or not. Re-exported (see `privileged::mod`) to `userspace_helper`'s
+/// network overview, which needs to tell "one of our own connections, just
+/// not the active one" apart from an actually-foreign VPN sharing the same
+/// CGNAT space -- deliberately narrower than handing that caller `load_all`
+/// itself, which would also expose every connection's raw config and keys.
+/// Best-effort like `load_all`: an unreadable record is skipped rather than
+/// failing the whole overview.
+///
+/// `allow(dead_code)`: only the bin's `userspace_helper` (outside `lib.rs`'s
+/// module tree) calls this, so the `lib` build of this same source sees it
+/// as unused.
+#[allow(dead_code)]
+pub(crate) fn known_addresses() -> std::collections::HashSet<IpAddr> {
+    match load_all() {
+        Ok(conns) => conns
+            .iter()
+            .flat_map(|conn| conn.config.addresses.iter().map(|net| net.addr()))
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%error, "connection_store_known_addresses_failed");
+            Default::default()
+        }
+    }
+}
+
 /// Look up the stored connection (if any) whose derived interface name is
 /// `interface`. Used to gate the legacy `WgShow`/`NetworkOverview`/
 /// `InterfaceActive` ops by the same ownership rule as the connection-store
@@ -568,6 +594,39 @@ fn find_by_identity_in(
 ) -> Result<Option<StoredConnection>> {
     for conn in load_all_strict_in(root)? {
         if conn.fingerprint == fingerprint && conn.global == global && conn.owner_uid == owner_uid {
+            return Ok(Some(conn));
+        }
+    }
+    Ok(None)
+}
+
+/// Look up an existing record with the given `name` in the same `(global,
+/// owner_uid)` namespace, for `AddConnection`'s name-uniqueness check: a
+/// name must resolve to at most one connection within a namespace, or
+/// looking a connection up by name (e.g. `ConnectConnection`) becomes
+/// ambiguous. Scoped the same way [`find_by_identity`] is, since that's the
+/// same "what could collide" boundary: a global name and a given user's own
+/// name don't share a namespace, so they may coincide.
+pub fn find_by_name(
+    _index: &IndexLock,
+    name: &str,
+    global: bool,
+    owner_uid: Option<u32>,
+) -> Result<Option<StoredConnection>> {
+    find_by_name_in(&root_dir(), name, global, owner_uid)
+}
+
+fn find_by_name_in(
+    root: &Path,
+    name: &str,
+    global: bool,
+    owner_uid: Option<u32>,
+) -> Result<Option<StoredConnection>> {
+    for conn in load_all_strict_in(root)? {
+        if conn.name.as_deref() == Some(name)
+            && conn.global == global
+            && conn.owner_uid == owner_uid
+        {
             return Ok(Some(conn));
         }
     }
@@ -942,6 +1001,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_by_name_matches_on_name_global_and_owner() {
+        let root = temp_root("by-name");
+        let mut conn = sample(ConnectionId::new(), false, Some(501));
+        conn.name = Some("direct".to_string());
+        save_in(&root, &conn).unwrap();
+
+        assert!(find_by_name_in(&root, "direct", false, Some(501))
+            .unwrap()
+            .is_some());
+        // A same-named connection in a different (global, owner_uid)
+        // namespace doesn't collide -- each namespace has its own names.
+        assert!(find_by_name_in(&root, "direct", true, Some(501))
+            .unwrap()
+            .is_none());
+        assert!(find_by_name_in(&root, "direct", false, Some(502))
+            .unwrap()
+            .is_none());
+        assert!(find_by_name_in(&root, "not-direct", false, Some(501))
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 

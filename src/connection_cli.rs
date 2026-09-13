@@ -9,7 +9,9 @@
 use anyhow::Context;
 
 use crate::cli::{ConnectionCommand, StartModeArg};
-use crate::privileged_api::{ConnectionId, ConnectionScope, ConnectionStartMode};
+use crate::privileged_api::{
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+};
 use crate::privileged_client::PrivilegedClient;
 
 impl From<StartModeArg> for ConnectionStartMode {
@@ -41,9 +43,45 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
     }
 }
 
-fn parse_id(id: &str) -> anyhow::Result<ConnectionId> {
-    id.parse()
-        .map_err(|_| anyhow::anyhow!("invalid connection id {id:?}"))
+/// Resolve `id_or_name` to a [`ConnectionId`], accepting either a literal id
+/// or a connection's `--name`. Tried as an id first (so a name that happens
+/// to look like a UUID is a validation error at `add` time, not a silent
+/// shadowing here -- see `validate_name_charset`'s id-shaped-name check).
+///
+/// A name is looked up among the caller's own connections first and only
+/// among `Global` ones if that comes up empty, rather than across both at
+/// once: otherwise an unrelated global connection sharing a name with one of
+/// the caller's own would turn an everyday, unambiguous name into a
+/// false-positive "ambiguous" error. `AddConnection` rejects a name
+/// collision within a given scope outside of `--force`, so a lookup that
+/// does search a scope normally resolves to exactly one connection; a
+/// leftover ambiguity (e.g. a `--force` cleanup that didn't finish) is
+/// reported rather than silently picking one.
+fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<ConnectionId> {
+    if let Ok(id) = id_or_name.parse() {
+        return Ok(id);
+    }
+    let by_name = |scope: ConnectionScope| -> anyhow::Result<Vec<ConnectionSummary>> {
+        Ok(client
+            .list_connections(scope)?
+            .into_iter()
+            .filter(|conn| conn.name.as_deref() == Some(id_or_name))
+            .collect())
+    };
+    let mut matches = by_name(ConnectionScope::Mine)?;
+    if matches.is_empty() {
+        matches = by_name(ConnectionScope::Global)?;
+    }
+    match matches.len() {
+        0 => anyhow::bail!(
+            "no connection named {id_or_name:?} (and it is not a valid connection id)"
+        ),
+        1 => Ok(matches.remove(0).id),
+        _ => anyhow::bail!(
+            "connection name {id_or_name:?} is ambiguous ({} matches); use the connection id instead",
+            matches.len()
+        ),
+    }
 }
 
 fn cmd_add(
@@ -57,7 +95,7 @@ fn cmd_add(
     let conf_text =
         std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
     let client = PrivilegedClient::new();
-    let id = client.add_connection(&conf_text, global, start_mode, name.clone(), mtu)?;
+    let id = client.add_connection(&conf_text, global, start_mode, name.clone(), mtu, force)?;
     println!("Connection id: {id}");
     println!(
         "  (byte-for-byte-identical resubmissions of this file will return the same id \
@@ -135,16 +173,16 @@ fn print_connections(scope: ConnectionScope) -> anyhow::Result<()> {
 }
 
 fn cmd_remove(id: &str) -> anyhow::Result<()> {
-    let id = parse_id(id)?;
     let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
     client.remove_connection(id)?;
     println!("Removed connection {id}");
     Ok(())
 }
 
 fn cmd_connect(id: &str, debug: bool) -> anyhow::Result<()> {
-    let id = parse_id(id)?;
     let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
     client.connect_connection(id, debug)?;
     println!("Connected {id}");
     Ok(())
@@ -180,23 +218,23 @@ fn cmd_disconnect(id: Option<&str>, all: bool) -> anyhow::Result<()> {
     }
 
     // clap enforces exactly one of `id`/`--all` at parse time.
-    let id = parse_id(id.expect("clap enforces id is set without --all"))?;
+    let id = resolve_id(&client, id.expect("clap enforces id is set without --all"))?;
     client.disconnect_connection(id)?;
     println!("Disconnected {id}");
     Ok(())
 }
 
 fn cmd_mode(id: &str, start_mode: ConnectionStartMode) -> anyhow::Result<()> {
-    let id = parse_id(id)?;
     let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
     client.set_connection_mode(id, start_mode)?;
     println!("Set {id} start mode to {start_mode:?}");
     Ok(())
 }
 
 fn cmd_get(id: &str) -> anyhow::Result<()> {
-    let id = parse_id(id)?;
     let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
     let conn = client.get_connection(id)?;
     println!("id:          {}", conn.id);
     println!("name:        {}", conn.name.as_deref().unwrap_or("-"));

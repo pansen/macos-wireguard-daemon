@@ -145,6 +145,7 @@ pub(super) fn dispatch(
             start_mode,
             name,
             mtu_override,
+            force,
             auth_external_form,
         } => DispatchOutcome::Immediate(handle_add_connection(
             origin,
@@ -153,6 +154,7 @@ pub(super) fn dispatch(
             start_mode,
             name,
             mtu_override,
+            force,
             auth_external_form,
         )),
 
@@ -190,6 +192,7 @@ pub(super) fn dispatch(
 
 // ---- connection-store request handlers -------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_add_connection(
     origin: PeerOrigin,
     conf_text: String,
@@ -197,6 +200,7 @@ fn handle_add_connection(
     start_mode: ConnectionStartMode,
     name: Option<String>,
     mtu_override: Option<u16>,
+    force: bool,
     auth_external_form: Option<Vec<u8>>,
 ) -> PrivilegedResponse {
     if global && !origin.is_root() {
@@ -227,6 +231,30 @@ fn handle_add_connection(
         Ok(Some(existing)) => return PrivilegedResponse::ConnectionId(existing.id),
         Ok(None) => {}
         Err(error) => return error_response(error),
+    }
+
+    // Not the exact-match case above, so this is either a genuinely new name
+    // or a changed config superseding an old record under the same name.
+    // Reject the latter unless the caller passed `force`, so a `name` a
+    // `ConnectConnection`-by-name lookup could resolve stays unique; `force`
+    // callers are expected to remove the superseded record right after this
+    // call returns its (different) id.
+    if !force {
+        if let Some(name) = &name {
+            match connection_store::find_by_name(&index_lock, name, global, owner_uid) {
+                Ok(Some(existing)) => {
+                    return PrivilegedResponse::Error {
+                        code: "NameInUse".into(),
+                        message: format!(
+                            "a connection named {name:?} already exists ({}); remove it first, or resubmit allowing the name to be replaced",
+                            existing.id
+                        ),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return error_response(error),
+            }
+        }
     }
 
     // A genuinely new/changed configuration: requires admin authentication
@@ -692,6 +720,7 @@ mod tests {
             ConnectionStartMode::Manual,
             None,
             None,
+            false,
             auth,
         )
     }
@@ -1147,6 +1176,7 @@ mod tests {
                 ConnectionStartMode::Manual,
                 None,
                 Some(1280),
+                false,
                 valid_auth(),
             );
             let id = connection_id(&response);
@@ -1159,6 +1189,75 @@ mod tests {
                 connection_config::fingerprint(&reparsed),
                 stored.fingerprint
             );
+        });
+    }
+
+    // A different `Endpoint` port gives this a different fingerprint from
+    // `SAMPLE_CONF` while still parsing, standing in for "the profile file
+    // changed" between two `AddConnection` calls that reuse the same name.
+    const SAMPLE_CONF_EDITED: &str = "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.1:51821\n";
+
+    #[test]
+    fn add_connection_rejects_a_name_already_used_by_a_different_connection() {
+        with_test_store("add-name-collision", || {
+            let first = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF.to_string(),
+                true,
+                ConnectionStartMode::Manual,
+                Some("direct".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            let first_id = connection_id(&first);
+
+            let second = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF_EDITED.to_string(),
+                true,
+                ConnectionStartMode::Manual,
+                Some("direct".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            assert_eq!(error_code(&second), "NameInUse");
+            // The rejected call must not have replaced the original record.
+            assert!(connection_store::load(first_id).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn add_connection_with_force_allows_replacing_a_same_named_connection() {
+        with_test_store("add-name-force", || {
+            let first = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF.to_string(),
+                true,
+                ConnectionStartMode::Manual,
+                Some("direct".to_string()),
+                None,
+                false,
+                valid_auth(),
+            );
+            let first_id = connection_id(&first);
+
+            let second = handle_add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF_EDITED.to_string(),
+                true,
+                ConnectionStartMode::Manual,
+                Some("direct".to_string()),
+                None,
+                true,
+                valid_auth(),
+            );
+            let second_id = connection_id(&second);
+            assert_ne!(first_id, second_id);
+            // `force` only waives the uniqueness check; it's still on the
+            // caller (see `cmd_add`) to remove `first_id` afterwards.
+            assert!(connection_store::load(first_id).unwrap().is_some());
         });
     }
 
