@@ -308,8 +308,7 @@ mod tests {
 
     #[test]
     fn idle_wait_blocks_until_the_timeout_and_wakes_on_connect() {
-        let path =
-            std::env::temp_dir().join(format!("tunmux-idlewait-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wgd-idlewait-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -348,8 +347,7 @@ mod tests {
 
     #[test]
     fn listener_services_request_behind_idle_connection() {
-        let path =
-            std::env::temp_dir().join(format!("tunmux-listener-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wgd-listener-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&path).unwrap();
         let idle = UnixStream::connect(&path).unwrap();
         let mut active = UnixStream::connect(&path).unwrap();
@@ -509,7 +507,7 @@ mod tests {
     #[test]
     fn wait_for_io_polls_frequently_while_any_client_is_pending() {
         let path =
-            std::env::temp_dir().join(format!("tunmux-pending-wait-{}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("wgd-pending-wait-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -533,10 +531,8 @@ mod tests {
 
     #[test]
     fn wait_for_io_polls_frequently_while_background_work_is_in_flight() {
-        let path = std::env::temp_dir().join(format!(
-            "tunmux-background-wait-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("wgd-background-wait-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();

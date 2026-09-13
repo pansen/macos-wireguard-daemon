@@ -1,11 +1,11 @@
-//! `tunmux connection ...`: the CLI surface over the privileged
+//! `wgd connection ...`: the CLI surface over the privileged
 //! connection-store RPCs (`AddConnection`/`ListConnections`/
 //! `RemoveConnection`/`ConnectConnection`/`DisconnectConnection`/
 //! `SetConnectionMode`/`GetConnection`). This is the Phase 5 CLI: the legacy
 //! `wgconf`/`connect`/`disconnect`/`autoconnect` surface has been retired in
 //! favor of it (see `doc/connection-store-plan.md`'s Phase 5 addendum for the
 //! mapping). The per-user session-reconciliation LaunchAgent lives under
-//! `tunmux launchd agent ...` instead (see `session_agent.rs`).
+//! `wgd launchd agent ...` instead (see `session_agent.rs`).
 use std::time::Duration;
 
 use anyhow::Context;
@@ -107,7 +107,7 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_millis(750);
 /// It does *not* promise to leave the daemon alone. Completion never
 /// escalates (see the autostart and transport guards below), but the control
 /// socket is held by launchd with `RunAtLoad` false, so merely connecting to
-/// it can start the daemon on demand, exactly as any other `tunmux` command
+/// it can start the daemon on demand, exactly as any other `wgd` command
 /// does. That daemon exits on the idle timeout its plist sets.
 pub fn complete_connection_id(
     current: &std::ffi::OsStr,
@@ -116,7 +116,7 @@ pub fn complete_connection_id(
         return Vec::new();
     };
     // The stdio transport reaches the daemon by running
-    // `sudo tunmux privileged --serve --stdio` for *every* request, which
+    // `sudo wgd privileged --serve --stdio` for *every* request, which
     // would put a password prompt behind every <TAB>. `without_autostart`
     // below does not cover it: it only gates the socket transport's own
     // spawn-a-daemon fallback. So don't complete at all under stdio.
@@ -226,7 +226,7 @@ fn cmd_add(
 /// whole disconnect-then-remove sequence while the daemon reports `Busy`.
 ///
 /// The race this guards against is wider than a single check-then-act gap:
-/// `tunmux launchd reload` reinstalls the per-user session agent with `RunAtLoad`,
+/// `wgd launchd reload` reinstalls the per-user session agent with `RunAtLoad`,
 /// and the agent's one-shot startup reconcile (`session_agent::run` ->
 /// `reconcile_connect_mine`) can reconnect this exact `Automatic` record via
 /// a full `ConnectConnection` round trip (WireGuard handshake, routes, DNS)

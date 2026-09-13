@@ -43,11 +43,11 @@ const READY_ERR: &[u8] = &[0];
 #[cfg(unix)]
 const SOCK_DIR: &str = "/var/run/wireguard";
 #[cfg(unix)]
-const HELPER_ENV: &str = "TUNMUX_GOTATUN_HELPER";
+const HELPER_ENV: &str = "WGD_GOTATUN_HELPER";
 #[cfg(unix)]
-const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
+const CONFIG_B64_ENV: &str = "WGD_GOTATUN_CONFIG_B64";
 #[cfg(unix)]
-const MTU_OVERRIDE_ENV: &str = "TUNMUX_GOTATUN_MTU_OVERRIDE";
+const MTU_OVERRIDE_ENV: &str = "WGD_GOTATUN_MTU_OVERRIDE";
 
 /// How often the macOS shutdown loop reconciles routes against the current LAN.
 /// Reconciling re-snapshots the network fingerprint (running `ifconfig`), which is
@@ -57,33 +57,33 @@ const MACOS_RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
 fn gotatun_pid_path(interface: &str) -> PathBuf {
-    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.pid"))
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.wgd.pid"))
 }
 
 #[cfg(unix)]
 fn gotatun_name_path(interface: &str) -> PathBuf {
-    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.name"))
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.wgd.name"))
 }
 
 #[cfg(unix)]
 fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
-    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.cleanup"))
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.wgd.cleanup"))
 }
 
 /// Unix socket the helper listens on to serve the live network overview. The
-/// privileged service (also root) connects here on behalf of `tunmux status`;
+/// privileged service (also root) connects here on behalf of `wgd status`;
 /// the state it renders lives only in this process's memory, so a query channel
 /// is the only way to expose it. Lives under the same `0750 root:daemon`
 /// runtime dir as the UAPI socket, so unprivileged callers can't reach it.
 #[cfg(target_os = "macos")]
 fn gotatun_query_socket_path(interface: &str) -> PathBuf {
-    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.query.sock"))
+    PathBuf::from(SOCK_DIR).join(format!("{interface}.wgd.query.sock"))
 }
 
 #[cfg(unix)]
 fn gotatun_log_path(interface: &str) -> PathBuf {
     // Shared with the privileged service (which clears and tails this file), so
-    // both derive it from the same place: /var/log/tunmux/<iface>.log on all
+    // both derive it from the same place: /var/log/wgd/<iface>.log on all
     // platforms (see config::gotatun_helper_log_path).
     crate::config::gotatun_helper_log_path(interface)
 }
@@ -245,17 +245,17 @@ pub fn maybe_run_from_env() -> bool {
     let interface = match args.next() {
         Some(value) => value,
         None => {
-            eprintln!("tunmux gotatun helper: missing interface argument");
+            eprintln!("wgd gotatun helper: missing interface argument");
             std::process::exit(2);
         }
     };
     if args.next().is_some() {
-        eprintln!("tunmux gotatun helper: unexpected extra arguments");
+        eprintln!("wgd gotatun helper: unexpected extra arguments");
         std::process::exit(2);
     }
 
     if let Err(e) = daemonize_and_run(&interface) {
-        eprintln!("tunmux gotatun helper failed: {e}");
+        eprintln!("wgd gotatun helper failed: {e}");
         std::process::exit(1);
     }
     true
@@ -354,7 +354,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 "userspace_helper_ready"
             );
 
-            // Expose the live network overview for `tunmux status`. Best-effort:
+            // Expose the live network overview for `wgd status`. Best-effort:
             // a bind failure only costs the status view, not the tunnel.
             #[cfg(target_os = "macos")]
             if let CleanupState::Macos(state) = &running.cleanup {
@@ -2396,7 +2396,7 @@ fn spawn_overview_query_server(interface: &str, state: std::sync::Arc<MacosClean
     let interface = interface.to_string();
     let thread_interface = interface.clone();
     let spawned = std::thread::Builder::new()
-        .name(format!("tunmux-overview-{interface}"))
+        .name(format!("wgd-overview-{interface}"))
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -2427,7 +2427,7 @@ fn format_macos_network_overview_table(
     foreign: &MacosForeignSnapshot,
 ) -> String {
     let mut lines = vec![
-        "tunmux network overview".to_string(),
+        "wgd network overview".to_string(),
         format!(
             "interface={} endpoint={} endpoint_pin={} gateway={} local_subnets={}",
             inputs.interface,
@@ -2523,7 +2523,7 @@ fn format_system_resolver_line(global_resolvers: &[String], tunnel_dns: &[String
     format!("System resolver={} ({note})", format_list(global_resolvers))
 }
 
-/// Snapshot of the host environment *outside* tunmux's own routes/DNS — the
+/// Snapshot of the host environment *outside* wgd's own routes/DNS — the
 /// other VPNs and the effective resolver — bundled so the overview formatter
 /// stays a single, testable call.
 #[cfg(target_os = "macos")]
@@ -2537,7 +2537,7 @@ struct MacosForeignSnapshot {
 /// reporting on. Surfaced so an interfering peer (kernel-mode Tailscale,
 /// another WireGuard, IPSec, …) is visible instead of needing manual
 /// `ifconfig`/`netstat` -- though (see `own` below) it may turn out to be
-/// tunmux's own after all, just not this overview's active connection.
+/// wgd's own after all, just not this overview's active connection.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq)]
 struct ForeignTunnel {
@@ -2547,7 +2547,7 @@ struct ForeignTunnel {
     addresses: Vec<String>,
     /// Carries a 100.64.0.0/10 (CGNAT) address — the Tailscale tailnet signature.
     cgnat: bool,
-    /// Carries an address that matches one of tunmux's own stored connections
+    /// Carries an address that matches one of wgd's own stored connections
     /// (see `crate::privileged::known_addresses`) -- ours, just not the
     /// interface this overview is currently reporting on.
     own: bool,
@@ -2562,7 +2562,7 @@ fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
-    // `crate::privileged::known_addresses()` is every address tunmux has
+    // `crate::privileged::known_addresses()` is every address wgd has
     // assigned to one of its own stored connections, active or not. A
     // leftover interface from a connection that isn't the one currently
     // driving this overview (e.g. an orphaned utun from a previous connect
@@ -2679,7 +2679,7 @@ fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
                     t.addresses.join(", ")
                 },
                 if t.own {
-                    "tunmux (own address; another/stale connection)".to_string()
+                    "wgd (own address; another/stale connection)".to_string()
                 } else if t.cgnat {
                     "CGNAT 100.64/10 (Tailscale?)".to_string()
                 } else {
@@ -3547,7 +3547,7 @@ utun7: flags=0<> mtu 1500
     #[test]
     fn parse_foreign_tunnels_recognizes_own_other_connection_by_address() {
         // utun6 carries a CGNAT address that happens to belong to one of
-        // tunmux's own stored connections (e.g. an orphaned interface from a
+        // wgd's own stored connections (e.g. an orphaned interface from a
         // previous connect cycle) — it should be identified as ours, not
         // flagged as a possible Tailscale tailnet.
         let ifconfig = "\
@@ -3597,7 +3597,7 @@ utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1384
             cgnat: true,
             own: true,
         }]);
-        assert_eq!(rows[0][3], "tunmux (own address; another/stale connection)");
+        assert_eq!(rows[0][3], "wgd (own address; another/stale connection)");
     }
 
     #[test]

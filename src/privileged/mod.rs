@@ -6,7 +6,7 @@ mod commands;
 mod connection_ops;
 mod connection_store;
 // Narrow, deliberate crack in `connection_store`'s privacy: `userspace_helper`
-// needs to know which addresses tunmux itself has assigned (to tell a stale
+// needs to know which addresses wgd itself has assigned (to tell a stale
 // one of our own interfaces apart from a real foreign VPN in its "other
 // tunnels" overview), but must not gain a path to `StoredConnection` itself
 // (raw config text, private keys) the way re-exporting `load_all` would.
@@ -36,7 +36,7 @@ use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
 
 use dispatch::dispatch;
 
-const AUTH_GROUP_NAME: &str = "tunmux";
+const AUTH_GROUP_NAME: &str = "wgd";
 
 struct ControlState {
     leases: HashSet<String>,
@@ -80,7 +80,7 @@ pub fn serve(
     // Upgrade authorizationdb before any client can authenticate against the
     // old zero-timeout rule. Do not serve mutations with an incompatible rule.
     crate::launchd::register_authorization_right()
-        .context("failed to initialize the privileged service authorization rule; run `tunmux launchd reload` to repair the installation")?;
+        .context("failed to initialize the privileged service authorization rule; run `wgd launchd reload` to repair the installation")?;
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
@@ -169,7 +169,7 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     // Stdio helpers can start without ever going through launchd install.
     crate::launchd::register_authorization_right()
-        .context("failed to initialize the privileged stdio authorization rule; run `tunmux launchd reload` to repair the installation")?;
+        .context("failed to initialize the privileged stdio authorization rule; run `wgd launchd reload` to repair the installation")?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
     connection_store::ensure_store_dirs()?;
@@ -380,7 +380,7 @@ fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
         }
     }
 
-    if let Ok(group) = std::env::var("TUNMUX_PRIVILEGED_GROUP") {
+    if let Ok(group) = std::env::var("WGD_PRIVILEGED_GROUP") {
         let trimmed = group.trim().to_string();
         if !trimmed.is_empty() {
             return Some(trimmed);

@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::error::AppError;
 use crate::privileged_api::PrivilegedRequest;
 
-pub(crate) const FALLBACK_AUTH_GROUP: &str = "tunmux";
+pub(crate) const FALLBACK_AUTH_GROUP: &str = "wgd";
 
 pub(crate) fn shell_quote(value: &str) -> String {
     if !value.contains([' ', '\t', '\'', '"', '\\']) {
@@ -63,10 +63,10 @@ pub(crate) fn current_user_primary_group_name() -> Option<String> {
 
 pub(crate) fn startup_lock_dir() -> PathBuf {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("tunmux");
+        return PathBuf::from(runtime_dir).join("wgd");
     }
     let uid = Uid::current().as_raw();
-    PathBuf::from(format!("/tmp/tunmux-{}", uid))
+    PathBuf::from(format!("/tmp/wgd-{}", uid))
 }
 
 pub(crate) fn build_lease_token() -> String {
@@ -77,7 +77,7 @@ pub(crate) fn build_lease_token() -> String {
 }
 
 pub(crate) fn configured_privileged_stdio_log_path() -> Option<PathBuf> {
-    let value = std::env::var_os("TUNMUX_PRIVILEGED_STDIO_LOG")?;
+    let value = std::env::var_os("WGD_PRIVILEGED_STDIO_LOG")?;
     let path = PathBuf::from(value);
     if path.as_os_str().is_empty() {
         return None;

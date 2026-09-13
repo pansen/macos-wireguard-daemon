@@ -1,7 +1,7 @@
 //! macOS Authorization Services gate for configuration-changing connection
 //! operations (`AddConnection`/`RemoveConnection`/an elevating
 //! `SetConnectionMode`). See the design plan's authorization section for the
-//! full rationale: mere `tunmux`-group membership must not be enough to
+//! full rationale: mere `wgd`-group membership must not be enough to
 //! introduce a config whose `PreUp`/`PostUp`/etc. hooks the daemon will later
 //! execute as root, so those operations additionally require proof of real
 //! admin authentication (password or Touch ID), not just peer-uid ownership.
@@ -18,8 +18,8 @@
 //!      prompt) before committing the mutation.
 //!
 //! The custom right this module authorizes against
-//! (`me.pansen.tunmux.modify-connection`) is registered in the system
-//! authorization database at `tunmux launchd install` time and before either
+//! (`me.pansen.wgd.modify-connection`) is registered in the system
+//! authorization database at `wgd launchd install` time and before either
 //! privileged transport serves requests (see `launchd.rs`), requiring an
 //! admin credential with a 60-second, non-shared
 //! lifetime for the client-to-daemon handoff. Verification never opens UI.
@@ -33,7 +33,7 @@ use std::ptr;
 use crate::error::{AppError, Result};
 
 /// Must match the right registered by `launchd::register_authorization_right`.
-pub const RIGHT_NAME: &str = "me.pansen.tunmux.modify-connection";
+pub const RIGHT_NAME: &str = "me.pansen.wgd.modify-connection";
 
 // ---- raw Authorization Services FFI ---------------------------------------
 //
@@ -126,7 +126,7 @@ fn verification_error(status: OSStatus) -> AppError {
             "admin authorization could not be verified without another prompt \
              (AuthorizationCopyRights OSStatus {status}); the credential may have expired \
              or the installed authorization rule may be outdated. Retry the command; \
-             if this persists after an upgrade, run `tunmux launchd reload` to update the rule \
+             if this persists after an upgrade, run `wgd launchd reload` to update the rule \
              and restart the privileged daemon"
         ));
     }
@@ -348,14 +348,14 @@ mod tests {
         assert!(message.contains("OSStatus -60007"));
         assert!(message.contains("expired"));
         assert!(message.contains("Retry the command"));
-        assert!(message.contains("tunmux launchd reload"));
+        assert!(message.contains("wgd launchd reload"));
     }
 
     #[test]
     fn other_verification_failures_keep_their_status_without_upgrade_advice() {
         let message = verification_error(-60005).to_string();
         assert!(message.contains("OSStatus -60005"));
-        assert!(!message.contains("tunmux launchd reload"));
+        assert!(!message.contains("wgd launchd reload"));
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
     ///
     /// `security authorizationdb read` exits 0 for a defined right and
     /// nonzero (-60005, errAuthorizationDenied) for an undefined one.
-    fn tunmux_right_is_registered() -> bool {
+    fn wgd_right_is_registered() -> bool {
         std::process::Command::new("/usr/bin/security")
             .args(["authorizationdb", "read", RIGHT_NAME])
             .stdout(std::process::Stdio::null())
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn live_but_unauthenticated_external_form_is_rejected() {
-        // This asserts a property of *tunmux's own* rule: `authenticate-user`
+        // This asserts a property of *wgd's own* rule: `authenticate-user`
         // with `shared` false, so holding an authorization session grants
         // nothing on its own. Where the rule isn't installed (a CI runner,
         // a checkout that never ran `launchd install`), the undefined right
@@ -402,10 +402,10 @@ mod tests {
         // nothing about the code under test, so skip rather than assert
         // against whatever the machine's ambient credential state happens to
         // be.
-        if !tunmux_right_is_registered() {
+        if !wgd_right_is_registered() {
             eprintln!(
                 "skipping {RIGHT_NAME} rejection check: the right is not \
-                 registered on this machine (run `sudo tunmux launchd install`)"
+                 registered on this machine (run `sudo wgd launchd install`)"
             );
             return;
         }

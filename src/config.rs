@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::error::Result;
 
-const APP_DIR: &str = "tunmux";
+const APP_DIR: &str = "wgd";
 
 // ── TOML config ────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ pub fn load_config() -> AppConfig {
 
 // ── Path helpers ───────────────────────────────────────────────
 
-/// Root config directory: ~/.config/tunmux/
+/// Root config directory: ~/.config/wgd/
 #[must_use]
 pub fn app_config_dir() -> PathBuf {
     xdg_config_home().join(APP_DIR)
@@ -114,7 +114,7 @@ pub fn privileged_socket_path() -> PathBuf {
 
 #[must_use]
 pub fn privileged_socket_dir() -> PathBuf {
-    PathBuf::from("/Library/Application Support/tunmux/run")
+    PathBuf::from("/Library/Application Support/wgd/run")
 }
 
 pub fn ensure_privileged_socket_dir() -> Result<()> {
@@ -128,13 +128,13 @@ pub fn ensure_privileged_socket_dir() -> Result<()> {
 
 #[must_use]
 pub fn privileged_runtime_dir() -> PathBuf {
-    PathBuf::from("/Library/Application Support/tunmux")
+    PathBuf::from("/Library/Application Support/wgd")
 }
 
-/// Root-owned log directory for the privileged gotatun helper: `/var/log/tunmux`.
+/// Root-owned log directory for the privileged gotatun helper: `/var/log/wgd`.
 #[must_use]
 pub fn root_log_dir() -> PathBuf {
-    PathBuf::from("/var/log/tunmux")
+    PathBuf::from("/var/log/wgd")
 }
 
 pub fn ensure_root_log_dir() -> Result<()> {
@@ -155,7 +155,7 @@ pub fn ensure_root_log_dir() -> Result<()> {
 /// (clear-at-connect + tail), which must agree on the path.
 ///
 /// The helper runs as root (the privileged daemon spawns it), so its log lives
-/// under `/var/log/tunmux/<interface>.log`.
+/// under `/var/log/wgd/<interface>.log`.
 #[must_use]
 pub fn gotatun_helper_log_path(interface: &str) -> PathBuf {
     root_log_dir().join(format!("{interface}.log"))

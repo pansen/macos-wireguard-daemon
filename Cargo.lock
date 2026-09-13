@@ -1520,35 +1520,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tunmux"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "clap_complete",
- "daemonize",
- "gotatun",
- "ipnet",
- "log",
- "nix 0.29.0",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "toml",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "uuid",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "typed-builder"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1684,6 +1655,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wgd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "clap_complete",
+ "daemonize",
+ "gotatun",
+ "ipnet",
+ "log",
+ "nix 0.29.0",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

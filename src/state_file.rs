@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn bounded_acquisition_reports_would_block_instead_of_waiting() {
-        let dir = std::env::temp_dir().join(format!("tunmux-lock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wgd-lock-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("busy.lock");
         let held = acquire(&path, None).unwrap();
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn concurrent_readers_never_observe_partial_state() {
-        let dir = std::env::temp_dir().join(format!("tunmux-atomic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wgd-atomic-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         let old = vec![b'a'; 64 * 1024];
