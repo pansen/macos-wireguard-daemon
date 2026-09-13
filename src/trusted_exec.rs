@@ -66,6 +66,13 @@ pub fn command(name: &str) -> io::Result<Command> {
         "ifconfig" | "route" => PathBuf::from("/sbin").join(name),
         "networksetup" | "scutil" => PathBuf::from("/usr/sbin").join(name),
         "id" => PathBuf::from("/usr/bin/id"),
+        // Interpreter for a connection's PreUp/PostUp/PreDown/PostDown hook
+        // lines (see `privileged::connection_ops::run_hook`). The hook
+        // *content* is arbitrary and root-executed by design, but it can
+        // only enter the store via `AddConnection`'s admin-authentication
+        // gate -- this only approves the shell binary itself against
+        // PATH substitution, the same guarantee every other entry here gives.
+        "sh" => PathBuf::from("/bin/sh"),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

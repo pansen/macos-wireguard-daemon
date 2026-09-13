@@ -11,6 +11,13 @@ pub enum AppError {
     #[error("Authentication failed: {0}")]
     Auth(String),
 
+    /// A configuration-changing connection operation needs macOS admin
+    /// authentication before it can proceed (see `privileged::authz`).
+    /// Distinct from `Auth`: this is not a denial, it's a prompt-and-retry
+    /// signal the client is expected to act on.
+    #[error("Admin authentication required: {0}")]
+    AuthRequired(String),
+
     #[error("WireGuard error: {0}")]
     WireGuard(String),
 

@@ -11,18 +11,13 @@ use tracing::debug;
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
-use crate::privileged_api::{GotaTunAction, PrivilegedRequest, PrivilegedResponse};
+use crate::privileged_api::{
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, PrivilegedRequest,
+    PrivilegedResponse,
+};
 
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
-
-/// Whether an error from a `PrivilegedClient` call is a transient
-/// transport/cold-start error worth retrying, as opposed to an authoritative
-/// failure. Exposed for callers outside this module (e.g.
-/// `wireguard::userspace`) that implement their own retry/settle loops.
-pub(crate) fn is_retryable_transport_error(err: &AppError) -> bool {
-    is_transport_error(err)
-}
 
 pub struct PrivilegedClient {
     socket_path: PathBuf,
@@ -150,22 +145,6 @@ impl PrivilegedClient {
         }
     }
 
-    pub fn gotatun_run(
-        &self,
-        action: GotaTunAction,
-        interface: &str,
-        config_content: &str,
-        mtu_override: Option<u16>,
-    ) -> Result<()> {
-        self.send_unit(PrivilegedRequest::GotaTunRun {
-            action,
-            interface: interface.to_string(),
-            config_content: config_content.to_string(),
-            mtu_override,
-            debug: crate::logging::debug_enabled(),
-        })
-    }
-
     /// Run `wg show <interface>` as root and return the output.
     /// Works for both kernel and userspace (gotatun) backends.
     #[allow(dead_code)]
@@ -199,6 +178,7 @@ impl PrivilegedClient {
     /// `interface` exists. Used for liveness checks that would otherwise be
     /// permission-blind from an unprivileged caller (the socket dir is
     /// `0750 root:daemon`).
+    #[allow(dead_code)]
     pub fn interface_active(&self, interface: &str) -> Result<bool> {
         match self.send(PrivilegedRequest::InterfaceActive {
             interface: interface.to_string(),
@@ -207,6 +187,121 @@ impl PrivilegedClient {
             _ => Err(AppError::Other(
                 "invalid privileged response for InterfaceActive".into(),
             )),
+        }
+    }
+
+    /// Parse and store a WireGuard `.conf`, returning its (fresh or
+    /// already-existing, on an exact-match resubmission) `ConnectionId`.
+    /// Transparently drives the macOS admin-authentication two-phase
+    /// protocol (see `privileged::authz`) when the daemon reports the
+    /// change is real: the first attempt carries no token, and on
+    /// `AuthRequired` this triggers the standard OS prompt and retries once
+    /// with the resulting token attached.
+    pub fn add_connection(
+        &self,
+        conf_text: &str,
+        global: bool,
+        start_mode: ConnectionStartMode,
+        name: Option<String>,
+        mtu_override: Option<u16>,
+        force: bool,
+    ) -> Result<ConnectionId> {
+        match self.send_with_admin_auth_retry(|auth_external_form| {
+            PrivilegedRequest::AddConnection {
+                conf_text: conf_text.to_string(),
+                global,
+                start_mode,
+                name: name.clone(),
+                mtu_override,
+                force,
+                auth_external_form,
+            }
+        })? {
+            PrivilegedResponse::ConnectionId(id) => Ok(id),
+            _ => Err(AppError::Other(
+                "invalid privileged response for AddConnection".into(),
+            )),
+        }
+    }
+
+    /// Remove a stored connection. Same admin-authentication protocol as
+    /// [`Self::add_connection`].
+    pub fn remove_connection(&self, id: ConnectionId) -> Result<()> {
+        self.send_with_admin_auth_retry(|auth_external_form| PrivilegedRequest::RemoveConnection {
+            id,
+            auth_external_form,
+        })
+        .map(|_| ())
+    }
+
+    /// Bring up a stored connection. Ownership-gated only (see the design
+    /// plan's authorization section) -- no admin-auth prompt for connecting
+    /// an already-vetted connection.
+    pub fn connect_connection(&self, id: ConnectionId, debug: bool) -> Result<()> {
+        self.send_unit(PrivilegedRequest::ConnectConnection { id, debug })
+    }
+
+    pub fn disconnect_connection(&self, id: ConnectionId) -> Result<()> {
+        self.send_unit(PrivilegedRequest::DisconnectConnection { id })
+    }
+
+    /// Change a stored connection's start mode. Only transitions a global
+    /// connection from `Manual` to `Automatic` require admin authentication
+    /// (see the design plan); every other transition is ownership-gated.
+    pub fn set_connection_mode(
+        &self,
+        id: ConnectionId,
+        start_mode: ConnectionStartMode,
+    ) -> Result<()> {
+        self.send_with_admin_auth_retry(|auth_external_form| PrivilegedRequest::SetConnectionMode {
+            id,
+            start_mode,
+            auth_external_form,
+        })
+        .map(|_| ())
+    }
+
+    pub fn list_connections(&self, scope: ConnectionScope) -> Result<Vec<ConnectionSummary>> {
+        match self.send(PrivilegedRequest::ListConnections { scope })? {
+            PrivilegedResponse::ConnectionList(list) => Ok(list),
+            _ => Err(AppError::Other(
+                "invalid privileged response for ListConnections".into(),
+            )),
+        }
+    }
+
+    pub fn get_connection(&self, id: ConnectionId) -> Result<ConnectionSummary> {
+        match self.send(PrivilegedRequest::GetConnection { id })? {
+            PrivilegedResponse::Connection(summary) => Ok(summary),
+            _ => Err(AppError::Other(
+                "invalid privileged response for GetConnection".into(),
+            )),
+        }
+    }
+
+    /// Send a request built by `build_request(None)`; if the daemon reports
+    /// `AuthRequired` (a genuine configuration change needing admin
+    /// authentication -- see `privileged::authz`), trigger the OS prompt via
+    /// `authz::client_authorize` and retry once with the resulting token.
+    /// `build_request` is a closure rather than a plain request because the
+    /// external form has to be threaded into the *same* request shape on retry.
+    fn send_with_admin_auth_retry(
+        &self,
+        mut build_request: impl FnMut(Option<Vec<u8>>) -> PrivilegedRequest,
+    ) -> Result<PrivilegedResponse> {
+        match self.send(build_request(None)) {
+            Err(AppError::AuthRequired(_)) => {
+                eprintln!("tunmux: admin authentication required for this change.");
+                // The `ClientAuthorization` guard must outlive the retried
+                // `send` call: freeing it (which happens automatically at
+                // end of scope here) destroys the securityd session the
+                // external form's rights live in, so the daemon's own
+                // `AuthorizationCreateFromExternalForm` needs it to still be
+                // alive when that call runs, not just the bytes to be well-formed.
+                let authorization = crate::privileged::authz::client_authorize()?;
+                self.send(build_request(Some(authorization.external_form().to_vec())))
+            }
+            other => other,
         }
     }
 
@@ -388,6 +483,8 @@ fn map_privileged_error(response: PrivilegedResponse) -> Result<PrivilegedRespon
         PrivilegedResponse::Error { code, message } => Err(match code.as_str() {
             "WireGuard" => AppError::WireGuard(message),
             "Auth" => AppError::Auth(message),
+            "AuthRequired" => AppError::AuthRequired(message),
+            "NotFound" => AppError::Other(format!("not found: {message}")),
             _ => AppError::Other(message),
         }),
         other => Ok(other),
