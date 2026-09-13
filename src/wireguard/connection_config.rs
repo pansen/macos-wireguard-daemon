@@ -474,7 +474,7 @@ fn decode_key32(field: &str, value: &str) -> Result<[u8; 32]> {
 /// Upper bound on how long endpoint hostname resolution may block. `AddConnection`
 /// runs on the privileged daemon's single dispatch thread (see
 /// `src/privileged/socket.rs`), so an unbounded `getaddrinfo()` on a
-/// caller-chosen hostname would let any `tunmux`-group member freeze every
+/// caller-chosen hostname would let any `wgd`-group member freeze every
 /// other client's requests, and would have the root daemon itself make
 /// blocking DNS queries for an attacker-chosen name with no time limit. The OS
 /// resolver call itself cannot be cancelled once started, so this bounds how
@@ -510,7 +510,7 @@ fn resolve_host_with_timeout(host: &str, port: u16, timeout: Duration) -> Result
     // outlives the timeout is abandoned (its result is dropped when the send
     // fails), trading a leaked thread for a bounded wait on the caller side.
     let _ = std::thread::Builder::new()
-        .name("tunmux-endpoint-resolve".into())
+        .name("wgd-endpoint-resolve".into())
         .spawn(move || {
             let result = target
                 .to_socket_addrs()
@@ -545,7 +545,7 @@ fn resolve_host_with_timeout(host: &str, port: u16, timeout: Duration) -> Result
 /// sequences can encode to the same bytes. The intermediate buffer is
 /// zeroized on drop, since it contains the private key and any preshared
 /// keys in plain bytes for the duration of the hash computation.
-const FINGERPRINT_TAG: &[u8] = b"tunmux-connfp-v1";
+const FINGERPRINT_TAG: &[u8] = b"wgd-connfp-v1";
 
 #[must_use]
 pub fn fingerprint(config: &ConnectionConfig) -> String {
@@ -873,7 +873,7 @@ Endpoint = 198.51.100.1:51820\n";
         // a unit test, so this just pins the "fails, doesn't hang" contract.
         let started = std::time::Instant::now();
         let result = resolve_host_with_timeout(
-            "tunmux-test-nonexistent.invalid",
+            "wgd-test-nonexistent.invalid",
             51820,
             Duration::from_secs(5),
         );

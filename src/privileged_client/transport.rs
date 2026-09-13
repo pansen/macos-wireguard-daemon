@@ -237,7 +237,7 @@ impl PrivilegedClient {
             )));
         }
 
-        eprintln!("sudo authentication required for tunmux privileged autostart.");
+        eprintln!("sudo authentication required for wgd privileged autostart.");
         warn!(
             action = "start_privileged_daemon",
             method = "sudo",
@@ -333,7 +333,7 @@ impl PrivilegedClient {
             command.stdout(Stdio::null());
             command.stderr(Stdio::null());
         }
-        debug!(cmd = "sudo -n -b tunmux privileged --serve", "exec");
+        debug!(cmd = "sudo -n -b wgd privileged --serve", "exec");
         let status = command
             .status()
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
@@ -369,7 +369,7 @@ impl PrivilegedClient {
                 )));
             }
 
-            eprintln!("sudo authentication required for tunmux privileged stdio mode.");
+            eprintln!("sudo authentication required for wgd privileged stdio mode.");
             warn!(
                 action = "start_privileged_stdio_helper",
                 method = "sudo",
@@ -525,7 +525,7 @@ impl PrivilegedClient {
     }
 
     pub(crate) fn manual_start_command(&self) -> String {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tunmux"));
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wgd"));
         let stdio = if matches!(self.transport, PrivilegedTransport::Stdio) {
             " --stdio"
         } else {
@@ -729,7 +729,7 @@ mod tests {
     }
 
     fn line(level: &str, message: &str) -> String {
-        format!("2026-06-14T08:18:02Z {level} {message} tunmux::privileged: ")
+        format!("2026-06-14T08:18:02Z {level} {message} wgd::privileged: ")
     }
 
     #[test]

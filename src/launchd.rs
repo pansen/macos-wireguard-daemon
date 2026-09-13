@@ -1,9 +1,9 @@
-//! Pure core for the `tunmux launchd` subcommand: an installer for the
+//! Pure core for the `wgd launchd` subcommand: an installer for the
 //! privileged launchd daemon plist. This module provides both the
 //! plist-rendering / binary-location-validation logic and the
-//! `tunmux launchd install|restart|uninstall` command handlers, which own
-//! every system-domain launchd operation (the Makefile and `tunmux launchd reload`
-//! both go through them). `tunmux launchd agent ...` is dispatched from here
+//! `wgd launchd install|restart|uninstall` command handlers, which own
+//! every system-domain launchd operation (the Makefile and `wgd launchd reload`
+//! both go through them). `wgd launchd agent ...` is dispatched from here
 //! too, but its own installer/body live in `session_agent.rs` since it's a
 //! per-user (GUI domain) LaunchAgent, not this module's system daemon.
 
@@ -19,16 +19,16 @@ use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failu
 use crate::privileged_api::ConnectionScope;
 use crate::privileged_client::PrivilegedClient;
 
-pub(crate) const LABEL: &str = "me.pansen.tunmux.privileged";
-pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist";
+pub(crate) const LABEL: &str = "me.pansen.wgd.privileged";
+pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.wgd.privileged.plist";
 
 /// Group whose members may talk to the privileged daemon's control socket.
 /// Must match `AUTH_GROUP_NAME` in `src/privileged/mod.rs`, which is private
 /// to that module and therefore unavailable from here.
-const GROUP_NAME: &str = "tunmux";
+const GROUP_NAME: &str = "wgd";
 
-const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.tunmux.privileged.plist");
-const BIN_PLACEHOLDER: &str = "@TUNMUX_BIN@";
+const PLIST_TEMPLATE: &str = include_str!("../etc/me.pansen.wgd.privileged.plist");
+const BIN_PLACEHOLDER: &str = "@WGD_BIN@";
 const SOCK_GROUP_MARKER: &str = "@SOCK_PATH_GROUP@";
 
 /// Render the privileged daemon's launchd plist, substituting the daemon
@@ -121,7 +121,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
         if path_str.starts_with(prefix) {
             anyhow::bail!(
                 "refusing to install a launchd daemon that runs a binary from a user-writable \
-                 location ({}); place the tunmux binary in a system location such as \
+                 location ({}); place the wgd binary in a system location such as \
                  /usr/local/bin with root-owned parent directories",
                 path.display()
             );
@@ -132,7 +132,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
         if path.starts_with(home) {
             anyhow::bail!(
                 "refusing to install a launchd daemon that runs a binary from the invoking \
-                 user's home directory ({}); place the tunmux binary in a system location \
+                 user's home directory ({}); place the wgd binary in a system location \
                  such as /usr/local/bin with root-owned parent directories",
                 path.display()
             );
@@ -166,9 +166,9 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     // system state (group creation, membership, directories, plist).
     let user = invoking_user()?;
     let bin = daemon_binary_path()?;
-    let bin_str = bin.to_str().ok_or_else(|| {
-        anyhow::anyhow!("tunmux binary path is not valid UTF-8: {}", bin.display())
-    })?;
+    let bin_str = bin
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("wgd binary path is not valid UTF-8: {}", bin.display()))?;
     let template = match plist_template.as_deref() {
         Some(path) => fs::read_to_string(path)
             .with_context(|| format!("failed to read plist template {}", path.display()))?,
@@ -193,7 +193,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     write_plist(&plist)?;
     bootstrap()?;
 
-    println!("tunmux privileged daemon installed.");
+    println!("wgd privileged daemon installed.");
     println!("  binary: {}", bin.display());
     println!("  plist:  {PLIST_PATH}");
     if let Some(path) = &plist_template {
@@ -201,7 +201,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     }
     if member_added {
         println!(
-            "Added {user} to the tunmux group. If tunmux reports permission denied when \
+            "Added {user} to the wgd group. If wgd reports permission denied when \
              connecting to the daemon, log out and back in for group membership to take effect."
         );
     }
@@ -211,7 +211,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
 fn cmd_restart() -> anyhow::Result<()> {
     require_root("restart")?;
     // Re-run the same location validation as install, guarding against e.g.
-    // `sudo ./target/debug/tunmux launchd restart` restarting a daemon that
+    // `sudo ./target/debug/wgd launchd restart` restarting a daemon that
     // was installed from a different (system) location.
     let _ = daemon_binary_path()?;
 
@@ -219,9 +219,9 @@ fn cmd_restart() -> anyhow::Result<()> {
         "/bin/launchctl",
         &["kickstart", "-k", &format!("system/{LABEL}")],
     )
-    .with_context(|| "daemon not installed? run: sudo tunmux launchd install")?;
+    .with_context(|| "daemon not installed? run: sudo wgd launchd install")?;
 
-    println!("tunmux privileged daemon restarted.");
+    println!("wgd privileged daemon restarted.");
     Ok(())
 }
 
@@ -245,10 +245,10 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     remove_file_ignore_missing(Path::new(PLIST_PATH))?;
     remove_file_ignore_missing(&config::privileged_socket_path())?;
 
-    println!("tunmux privileged daemon uninstalled.");
+    println!("wgd privileged daemon uninstalled.");
     println!("Intentionally kept (remove with `make purge/privileged` for a full removal):");
-    println!("  the tunmux binary");
-    println!("  the tunmux group");
+    println!("  the wgd binary");
+    println!("  the wgd group");
     println!("  {}", config::root_log_dir().display());
     println!(
         "  the runtime directory ({})",
@@ -303,7 +303,7 @@ fn disconnect_all_connections_once() {
 /// Bail unless running as root, with a hint on how to re-invoke this command.
 fn require_root(cmd_hint: &str) -> anyhow::Result<()> {
     if !geteuid().is_root() {
-        anyhow::bail!("this command must run as root; try: sudo tunmux launchd {cmd_hint}");
+        anyhow::bail!("this command must run as root; try: sudo wgd launchd {cmd_hint}");
     }
     Ok(())
 }
@@ -317,14 +317,14 @@ fn invoking_user_home() -> Option<PathBuf> {
     User::from_name(&user).ok().flatten().map(|u| u.dir)
 }
 
-/// The user who ran `sudo`, i.e. who should be added to the `tunmux` group.
+/// The user who ran `sudo`, i.e. who should be added to the `wgd` group.
 fn invoking_user() -> anyhow::Result<String> {
     match std::env::var("SUDO_USER") {
         Ok(user) if !user.is_empty() => Ok(user),
         _ => anyhow::bail!(
             "could not determine the invoking user (SUDO_USER is unset); run this via \
-             `sudo tunmux launchd install` from your normal account, or add yourself to the \
-             tunmux group manually with: sudo dseditgroup -o edit -a <user> -t user tunmux"
+             `sudo wgd launchd install` from your normal account, or add yourself to the \
+             wgd group manually with: sudo dseditgroup -o edit -a <user> -t user wgd"
         ),
     }
 }
@@ -333,7 +333,7 @@ fn invoking_user() -> anyhow::Result<String> {
 /// root launchd job. The executable must be a regular file, not a Homebrew link.
 fn daemon_binary_path() -> anyhow::Result<PathBuf> {
     let invoked =
-        std::env::current_exe().context("failed to determine the running tunmux binary path")?;
+        std::env::current_exe().context("failed to determine the running wgd binary path")?;
     let resolved = fs::canonicalize(&invoked)
         .with_context(|| format!("failed to resolve {}", invoked.display()))?;
     validate_binary_location(&invoked, &resolved, invoking_user_home().as_deref())?;
@@ -344,7 +344,7 @@ fn daemon_binary_path() -> anyhow::Result<PathBuf> {
     Ok(invoked)
 }
 
-/// Ensure the `tunmux` group exists and that `user` is a member, returning
+/// Ensure the `wgd` group exists and that `user` is a member, returning
 /// its GID and whether membership was added during this install.
 fn ensure_group_with_member(user: &str) -> anyhow::Result<(u32, bool)> {
     let read_ok = std::process::Command::new("/usr/sbin/dseditgroup")
@@ -363,7 +363,7 @@ fn ensure_group_with_member(user: &str) -> anyhow::Result<(u32, bool)> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .with_context(|| "failed to check tunmux group membership")?
+        .with_context(|| "failed to check wgd group membership")?
         .success();
     if !already_member {
         run_checked(
@@ -416,7 +416,7 @@ pub(crate) fn register_authorization_right() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         nix::unistd::geteuid().is_root(),
-        "registering the tunmux authorization rule requires root; start the privileged service via launchd or sudo"
+        "registering the wgd authorization rule requires root; start the privileged service via launchd or sudo"
     );
     let mut child = Command::new("/usr/bin/security")
         .args([
@@ -434,7 +434,7 @@ pub(crate) fn register_authorization_right() -> anyhow::Result<()> {
         .take()
         .expect("piped stdin")
         .write_all(include_bytes!(
-            "../etc/me.pansen.tunmux.modify-connection.plist"
+            "../etc/me.pansen.wgd.modify-connection.plist"
         ));
     let output = child
         .wait_with_output()
@@ -446,7 +446,7 @@ pub(crate) fn register_authorization_right() -> anyhow::Result<()> {
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    write_result.context("failed to write the tunmux authorization rule")
+    write_result.context("failed to write the wgd authorization rule")
 }
 
 /// Write the rendered plist to `PLIST_PATH` atomically (temp file + rename)
@@ -501,27 +501,27 @@ mod tests {
             return;
         }
         let err = require_root("install").expect_err("must not be root");
-        assert!(err.to_string().contains("sudo tunmux launchd install"));
+        assert!(err.to_string().contains("sudo wgd launchd install"));
     }
 
     #[test]
     fn render_plist_substitutes_binary_and_gid() {
-        let rendered = render_plist_from(PLIST_TEMPLATE, "/opt/homebrew/bin/tunmux", 499)
+        let rendered = render_plist_from(PLIST_TEMPLATE, "/opt/homebrew/bin/wgd", 499)
             .expect("render succeeds");
 
         assert!(rendered.contains("<key>SockPathGroup</key>"));
         assert!(rendered.contains("<integer>499</integer>"));
-        assert!(rendered.contains("/opt/homebrew/bin/tunmux"));
+        assert!(rendered.contains("/opt/homebrew/bin/wgd"));
         assert!(!rendered.contains(BIN_PLACEHOLDER));
         assert!(!rendered.contains("@SOCK_PATH_GROUP@"));
-        assert!(rendered.contains("me.pansen.tunmux.privileged"));
+        assert!(rendered.contains("me.pansen.wgd.privileged"));
         assert!(rendered.contains("SockPathMode"));
     }
 
     #[test]
     fn render_plist_errors_when_bin_placeholder_missing() {
-        let template = PLIST_TEMPLATE.replace(BIN_PLACEHOLDER, "/usr/local/bin/tunmux");
-        let err = render_plist_from(&template, "/opt/homebrew/bin/tunmux", 499)
+        let template = PLIST_TEMPLATE.replace(BIN_PLACEHOLDER, "/usr/local/bin/wgd");
+        let err = render_plist_from(&template, "/opt/homebrew/bin/wgd", 499)
             .expect_err("missing bin placeholder should error");
         assert!(err.to_string().contains(BIN_PLACEHOLDER));
     }
@@ -529,15 +529,15 @@ mod tests {
     #[test]
     fn render_plist_errors_when_sock_group_marker_missing() {
         let template = PLIST_TEMPLATE.replace(SOCK_GROUP_MARKER, "");
-        let err = render_plist_from(&template, "/opt/homebrew/bin/tunmux", 499)
+        let err = render_plist_from(&template, "/opt/homebrew/bin/wgd", 499)
             .expect_err("missing marker should error");
         assert!(err.to_string().contains(SOCK_GROUP_MARKER));
     }
 
     #[test]
     fn render_rejects_template_without_label() {
-        let modified = PLIST_TEMPLATE.replace(LABEL, "me.pansen.tunmux.evil");
-        let err = render_plist_from(&modified, "/usr/local/bin/tunmux", 20)
+        let modified = PLIST_TEMPLATE.replace(LABEL, "me.pansen.wgd.evil");
+        let err = render_plist_from(&modified, "/usr/local/bin/wgd", 20)
             .expect_err("missing expected Label should error");
         assert!(err.to_string().contains("Label"));
     }
@@ -545,16 +545,16 @@ mod tests {
     #[test]
     fn render_escapes_binary_path() {
         let rendered =
-            render_plist_from(PLIST_TEMPLATE, "/opt/t&t/bin/tunmux", 20).expect("render succeeds");
-        assert!(rendered.contains("/opt/t&amp;t/bin/tunmux"));
+            render_plist_from(PLIST_TEMPLATE, "/opt/t&t/bin/wgd", 20).expect("render succeeds");
+        assert!(rendered.contains("/opt/t&amp;t/bin/wgd"));
         assert!(!rendered.contains("t&t/bin"));
     }
 
     #[test]
     fn rejects_user_home_directory() {
         assert!(validate_binary_location(
-            Path::new("/Users/andi/p/tunmux/target/release/tunmux"),
-            Path::new("/Users/andi/p/tunmux/target/release/tunmux"),
+            Path::new("/Users/andi/p/wgd/target/release/wgd"),
+            Path::new("/Users/andi/p/wgd/target/release/wgd"),
             None,
         )
         .is_err());
@@ -563,16 +563,15 @@ mod tests {
     #[test]
     fn rejects_tmp() {
         assert!(
-            validate_binary_location(Path::new("/tmp/tunmux"), Path::new("/tmp/tunmux"), None)
-                .is_err()
+            validate_binary_location(Path::new("/tmp/wgd"), Path::new("/tmp/wgd"), None).is_err()
         );
     }
 
     #[test]
     fn rejects_var_folders() {
         assert!(validate_binary_location(
-            Path::new("/private/var/folders/xx/tunmux"),
-            Path::new("/private/var/folders/xx/tunmux"),
+            Path::new("/private/var/folders/xx/wgd"),
+            Path::new("/private/var/folders/xx/wgd"),
             None,
         )
         .is_err());
@@ -581,8 +580,8 @@ mod tests {
     #[test]
     fn rejects_var_tmp() {
         assert!(validate_binary_location(
-            Path::new("/var/tmp/tunmux"),
-            Path::new("/private/var/tmp/tunmux"),
+            Path::new("/var/tmp/wgd"),
+            Path::new("/private/var/tmp/wgd"),
             None,
         )
         .is_err());
@@ -590,7 +589,7 @@ mod tests {
 
     #[test]
     fn rejects_relative_path() {
-        assert!(validate_binary_location(Path::new("tunmux"), Path::new("tunmux"), None).is_err());
+        assert!(validate_binary_location(Path::new("wgd"), Path::new("wgd"), None).is_err());
     }
 
     #[test]
@@ -598,8 +597,8 @@ mod tests {
         // Invoked path looks fine (/usr/local/bin), but the symlink target
         // resolves into a home directory build — must still be rejected.
         assert!(validate_binary_location(
-            Path::new("/usr/local/bin/tunmux"),
-            Path::new("/Users/andi/target/release/tunmux"),
+            Path::new("/usr/local/bin/wgd"),
+            Path::new("/Users/andi/target/release/wgd"),
             None,
         )
         .is_err());
@@ -608,8 +607,8 @@ mod tests {
     #[test]
     fn rejects_non_standard_home_via_invoking_user_home() {
         assert!(validate_binary_location(
-            Path::new("/opt/home/andi/tunmux"),
-            Path::new("/opt/home/andi/tunmux"),
+            Path::new("/opt/home/andi/wgd"),
+            Path::new("/opt/home/andi/wgd"),
             Some(Path::new("/opt/home/andi")),
         )
         .is_err());
@@ -618,8 +617,8 @@ mod tests {
     #[test]
     fn accepts_usr_local_bin() {
         assert!(validate_binary_location(
-            Path::new("/usr/local/bin/tunmux"),
-            Path::new("/usr/local/bin/tunmux"),
+            Path::new("/usr/local/bin/wgd"),
+            Path::new("/usr/local/bin/wgd"),
             None,
         )
         .is_ok());
@@ -628,8 +627,8 @@ mod tests {
     #[test]
     fn rejects_homebrew_cellar_symlink_target() {
         assert!(validate_binary_location(
-            Path::new("/opt/homebrew/bin/tunmux"),
-            Path::new("/opt/homebrew/Cellar/tunmux/0.9.0/bin/tunmux"),
+            Path::new("/opt/homebrew/bin/wgd"),
+            Path::new("/opt/homebrew/Cellar/wgd/0.9.0/bin/wgd"),
             None,
         )
         .is_err());
