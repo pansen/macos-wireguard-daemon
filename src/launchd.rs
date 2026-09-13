@@ -175,6 +175,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     // --- system mutation begins here ---
     let gid = ensure_group_with_member(&user)?;
     ensure_directories(gid)?;
+    register_authorization_right()?;
     let plist = render_plist_from(&template, bin_str, gid)?;
     write_plist(&plist)?;
     bootstrap()?;
@@ -324,6 +325,30 @@ fn ensure_directories(gid: u32) -> anyhow::Result<()> {
         .with_context(|| format!("failed to chmod {}", sock_dir.display()))?;
 
     Ok(())
+}
+
+/// Register the custom authorization right the privileged daemon gates
+/// configuration-changing connection operations behind (see
+/// `privileged::authz`), with the built-in `authenticate-admin` rule: any
+/// admin account may satisfy it (password or Touch ID), and macOS caches the
+/// resulting authorization briefly rather than re-prompting on every call.
+/// Idempotent -- re-running install simply rewrites the same rule.
+fn register_authorization_right() -> anyhow::Result<()> {
+    run_checked(
+        "/usr/bin/security",
+        &[
+            "authorizationdb",
+            "write",
+            crate::privileged::authz::RIGHT_NAME,
+            "authenticate-admin",
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "failed to register the {} authorization right",
+            crate::privileged::authz::RIGHT_NAME
+        )
+    })
 }
 
 /// Write the rendered plist to `PLIST_PATH` atomically (temp file + rename)

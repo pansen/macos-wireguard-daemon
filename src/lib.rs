@@ -1,11 +1,9 @@
 // tunmux library crate
 //
 // Exports the modules shared between the `tunmux` binary and any library
-// consumers. This build targets macOS only and serves the WireGuard
-// config-file (`wgconf`) path.
+// consumers. This build targets macOS only.
 
 // Provider-agnostic infrastructure
-pub mod autoconnect;
 pub mod cli;
 pub mod color;
 pub mod config;
@@ -14,14 +12,11 @@ pub mod launchctl;
 pub mod launchd;
 pub mod logging;
 pub mod reload;
-pub mod shared;
+pub mod session_agent;
 pub mod state_file;
 pub mod trusted_exec;
 
-// WireGuard config-file provider (the sole provider in this build)
-pub mod wgconf;
-
-// WireGuard config and connection state, plus the userspace/kernel backends.
+// WireGuard config parsing shared by the CLI and the privileged daemon.
 pub mod wireguard;
 
 // Privileged API types (portable serde types only, no unix deps)

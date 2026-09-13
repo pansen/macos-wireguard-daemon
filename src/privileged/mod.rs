@@ -1,9 +1,24 @@
+// `pub(crate)` rather than private: `client_authorize` runs client-side (in
+// the unprivileged CLI process, not the daemon) and is called directly from
+// `privileged_client`, which needs to reach past this module's usual privacy.
+pub(crate) mod authz;
 mod commands;
+mod connection_ops;
+mod connection_store;
+// Narrow, deliberate crack in `connection_store`'s privacy: `userspace_helper`
+// needs to know which addresses tunmux itself has assigned (to tell a stale
+// one of our own interfaces apart from a real foreign VPN in its "other
+// tunnels" overview), but must not gain a path to `StoredConnection` itself
+// (raw config text, private keys) the way re-exporting `load_all` would.
+// `allow(unused_imports)`: only `userspace_helper` (bin-only, not part of
+// `lib.rs`'s module tree) calls this, so the `lib` build of this same source
+// sees it as unused.
+#[allow(unused_imports)]
+pub(crate) use connection_store::known_addresses;
 mod daemon;
 mod dispatch;
 mod managed_pids;
 mod socket;
-mod tunnel_state;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -21,10 +36,6 @@ use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
 use dispatch::dispatch;
 
 const AUTH_GROUP_NAME: &str = "tunmux";
-
-/// Cap on bytes read from the helper log tail when finishing a capture, so a
-/// runaway/verbose helper log can't be slurped wholesale into the daemon's memory.
-const MAX_HELPER_TAIL_BYTES: usize = 256 * 1024;
 
 struct ControlState {
     leases: HashSet<String>,
@@ -68,6 +79,7 @@ pub fn serve(
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
+    connection_store::ensure_store_dirs()?;
 
     // Resolve group GID for chown of socket dir and file.
     let group_gid = authorized_group
@@ -126,7 +138,24 @@ pub fn serve(
     };
 
     let mut control_state = ControlState::new(cli_autostarted);
-    socket::serve(listener, &mut control_state, idle_timeout)
+    // Phase 3: bring up global `Automatic` connections in the background,
+    // only once the listener above is already bound and accepting -- doing
+    // this serially beforehand would delay every client behind N
+    // helper-startup handshakes (see `connection_store::reconcile_boot`'s
+    // doc comment). `background_work` tells the idle-exit check in
+    // `socket::serve` not to shut the daemon down while this thread is still
+    // running, even with no clients connected -- otherwise the idle timer
+    // could fire mid-reconcile and kill the daemon right after it started a
+    // gotatun helper, before `active/<id>.json` is ever written for it.
+    let background_work = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    {
+        let background_work = background_work.clone();
+        std::thread::spawn(move || {
+            connection_store::reconcile_boot();
+            background_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    socket::serve(listener, &mut control_state, idle_timeout, &background_work)
 }
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
@@ -135,6 +164,7 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
         idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     config::ensure_privileged_runtime_dir()?;
     config::ensure_root_log_dir()?;
+    connection_store::ensure_store_dirs()?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -154,7 +184,19 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
             return Ok(());
         }
 
-        let (logs, response) = process_request_payload(&payload, &mut control_state, None);
+        // stdio is one request at a time: a `Pending` (Connect/Disconnect)
+        // outcome is simply awaited here rather than interleaved with other
+        // clients the way the socket transport (`socket.rs`) has to.
+        let (logs, response) = match process_request_payload(&payload, &mut control_state, None) {
+            RequestOutcome::Immediate(logs, response) => (logs, response),
+            RequestOutcome::Pending(rx) => (
+                Vec::new(),
+                rx.recv().unwrap_or_else(|_| PrivilegedResponse::Error {
+                    code: "Other".into(),
+                    message: "worker thread ended without a response".into(),
+                }),
+            ),
+        };
         let buffer = encode_response_frames(&logs, &response)?;
         writer.write_all(&buffer)?;
         writer.flush()?;
@@ -226,13 +268,23 @@ fn encode_response_frames(
     Ok(buffer)
 }
 
+/// Outcome of one dispatch call, as seen by the transport layer. `Pending` is
+/// produced only for `ConnectConnection`/`DisconnectConnection` (see
+/// `dispatch::DispatchOutcome`); the stdio transport just blocks on it
+/// (stdio is inherently one-request-at-a-time), while the socket transport
+/// (`socket.rs`) keeps polling other clients while it waits.
+pub(super) enum RequestOutcome {
+    Immediate(Vec<String>, PrivilegedResponse),
+    Pending(std::sync::mpsc::Receiver<PrivilegedResponse>),
+}
+
 fn process_request_payload(
     payload: &str,
     control_state: &mut ControlState,
     peer: Option<(u32, u32)>,
-) -> (Vec<String>, PrivilegedResponse) {
+) -> RequestOutcome {
     if payload.trim().is_empty() {
-        return (
+        return RequestOutcome::Immediate(
             Vec::new(),
             PrivilegedResponse::Error {
                 code: "Protocol".into(),
@@ -244,7 +296,7 @@ fn process_request_payload(
     let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(payload) {
         Ok(req) => req,
         Err(e) => {
-            return (
+            return RequestOutcome::Immediate(
                 Vec::new(),
                 PrivilegedResponse::Error {
                     code: "Protocol".into(),
@@ -255,9 +307,9 @@ fn process_request_payload(
     };
 
     // Finding 2 — Protected log disclosure: reject untrusted names before any
-    // capture constructs a path or opens a file, including on the error path.
+    // handler constructs a path from them, including on the error path.
     if let Err(e) = request.validate() {
-        return (
+        return RequestOutcome::Immediate(
             Vec::new(),
             PrivilegedResponse::Error {
                 code: "Validation".into(),
@@ -266,179 +318,49 @@ fn process_request_payload(
         );
     }
 
-    // For gotatun up/down, capture this request's log output (the service's own lines via the
-    // thread-local capture, plus the helper's log file) so it can be streamed to the caller.
-    // Begin before the `privileged_request_received` line so it is included.
-    let gotatun_capture = gotatun_capture_for(&request);
-
     let request_kind = describe_request(&request);
-    if let Some((uid, gid)) = peer {
-        info!(
-            transport = ?"socket",
-            uid = ?uid,
-            gid = ?gid,
-            request = ?request_kind, "privileged_request_received");
-    } else {
-        info!(
-            transport = ?"stdio",
-            request = ?request_kind, "privileged_request_received");
-    }
-
-    let response = dispatch(request, control_state);
-    let logs = finish_gotatun_capture(gotatun_capture);
-    (logs, response)
-}
-
-struct HelperLogCapture {
-    path: std::path::PathBuf,
-    offset: u64,
-    inode: Option<u64>,
-}
-
-/// Capture new output only. A fresh helper replaces its log, while a verified
-/// idempotent connect must not replay the previous session's entire log.
-fn gotatun_capture_for(request: &PrivilegedRequest) -> Option<HelperLogCapture> {
-    use std::os::unix::fs::MetadataExt;
-    let PrivilegedRequest::GotaTunRun { interface, .. } = request else {
-        return None;
-    };
-    crate::logging::begin_log_capture();
-    let path = commands::gotatun_log_path(interface);
-    let metadata = std::fs::symlink_metadata(&path).ok();
-    Some(HelperLogCapture {
-        path,
-        offset: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-        inode: metadata.map(|m| m.ino()),
-    })
-}
-
-/// Finish a capture started by `gotatun_capture_for`: merge the service's captured lines with the
-/// helper's log tail, ordered by timestamp. Returns empty if no capture was active.
-fn finish_gotatun_capture(capture: Option<HelperLogCapture>) -> Vec<String> {
-    use std::os::unix::fs::MetadataExt;
-    let service_lines = crate::logging::take_log_capture();
-    let Some(HelperLogCapture {
-        path,
-        offset,
-        inode,
-    }) = capture
-    else {
-        return Vec::new();
-    };
-    let current_inode = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
-    let offset = if inode == current_inode { offset } else { 0 };
-    let helper_lines = read_log_tail(&path, offset);
-    merge_log_lines(service_lines, helper_lines)
-}
-
-/// Read a log file from `offset` to its end, returned as lines. The offset may land mid-line or
-/// even mid-UTF-8-codepoint (it can be derived from a raw `metadata.len()`), so the bytes are
-/// split on `\n` and decoded lossily -- a single bad byte can't discard the whole tail. A leading
-/// partial line is dropped only when `offset` is verified to fall inside a line. The read is capped
-/// at [`MAX_HELPER_TAIL_BYTES`]; past the cap a `(truncated)` marker is appended.
-fn read_log_tail(path: &std::path::Path, offset: u64) -> Vec<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt;
-    // Finding 2 — Protected log disclosure: a log must be a regular file,
-    // never a symlink to another root-readable file or a blocking FIFO.
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)
-    else {
-        return Vec::new();
-    };
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return Vec::new();
-    }
-
-    // Peek at the byte just before `offset`: if it isn't a newline, `offset` sits inside a line and
-    // the first chunk we read is a partial line to be discarded. If it is a newline (or offset==0)
-    // the first chunk is a whole line and must be kept.
-    let starts_mid_line = match offset.checked_sub(1) {
-        Some(prev_offset) => {
-            if file.seek(SeekFrom::Start(prev_offset)).is_err() {
-                return Vec::new();
-            }
-            let mut prev = [0u8; 1];
-            file.read_exact(&mut prev).is_ok() && prev[0] != b'\n'
+    // `None` (stdio) means the caller has already proven root by reaching
+    // this process at all -- see `dispatch::PeerOrigin`'s doc comment.
+    let origin = match peer {
+        Some((uid, gid)) => {
+            info!(
+                transport = ?"socket",
+                uid = ?uid,
+                gid = ?gid,
+                request = ?request_kind, "privileged_request_received");
+            dispatch::PeerOrigin::Socket(uid)
         }
-        None => false,
+        None => {
+            info!(
+                transport = ?"stdio",
+                request = ?request_kind, "privileged_request_received");
+            dispatch::PeerOrigin::Stdio
+        }
     };
 
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return Vec::new();
-    }
-
-    // Read at most the cap (+1 byte to detect overflow) so the whole file can't be pulled in.
-    let mut buffer = Vec::new();
-    if Read::by_ref(&mut file)
-        .take(MAX_HELPER_TAIL_BYTES as u64 + 1)
-        .read_to_end(&mut buffer)
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let truncated = buffer.len() > MAX_HELPER_TAIL_BYTES;
-    if truncated {
-        buffer.truncate(MAX_HELPER_TAIL_BYTES);
-    }
-
-    let mut lines: Vec<String> = buffer
-        .split(|&byte| byte == b'\n')
-        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-        .collect();
-    // `split` yields a trailing empty element after the file's final newline.
-    if lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    if starts_mid_line && !lines.is_empty() {
-        lines.remove(0);
-    }
-    if truncated {
-        lines.push("(helper log tail truncated)".to_string());
-    }
-    lines
-}
-
-/// Merge service and helper log lines, ordered by their leading timestamp. The timestamp is a
-/// fixed-width prefix so lexicographic order is chronological; a stable sort keeps same-second
-/// lines in insertion order (service lines first).
-fn merge_log_lines(service: Vec<String>, helper: Vec<String>) -> Vec<String> {
-    let mut all = service;
-    all.extend(helper);
-    // Only reorder lines whose leading token actually looks like our timestamp.
-    // When either side has no parseable timestamp we treat the pair as equal so
-    // the stable sort leaves them in insertion order (service lines first) rather
-    // than trusting a brittle fixed-width slice of whatever the line happens to be.
-    all.sort_by(|a, b| match (leading_timestamp(a), leading_timestamp(b)) {
-        (Some(ta), Some(tb)) => ta.cmp(tb),
-        _ => std::cmp::Ordering::Equal,
-    });
-    all
-}
-
-/// Extract the leading RFC3339 timestamp token (e.g. `2026-06-14T08:18:02Z`) from a
-/// log line, or `None` if the first whitespace-delimited token isn't shaped like one.
-fn leading_timestamp(line: &str) -> Option<&str> {
-    const TIMESTAMP_LEN: usize = "2026-06-14T08:18:02Z".len();
-    let token = line.split_whitespace().next()?;
-    if token.len() == TIMESTAMP_LEN && token.ends_with('Z') {
-        Some(token)
-    } else {
-        None
+    match dispatch(request, control_state, origin) {
+        dispatch::DispatchOutcome::Immediate(response) => {
+            RequestOutcome::Immediate(Vec::new(), response)
+        }
+        dispatch::DispatchOutcome::Pending(rx) => RequestOutcome::Pending(rx),
     }
 }
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
     match request {
-        PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
         PrivilegedRequest::InterfaceActive { .. } => "InterfaceActive",
         PrivilegedRequest::WgShow { .. } => "WgShow",
         PrivilegedRequest::NetworkOverview { .. } => "NetworkOverview",
+        PrivilegedRequest::AddConnection { .. } => "AddConnection",
+        PrivilegedRequest::RemoveConnection { .. } => "RemoveConnection",
+        PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
+        PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",
+        PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
+        PrivilegedRequest::ListConnections { .. } => "ListConnections",
+        PrivilegedRequest::GetConnection { .. } => "GetConnection",
     }
 }
 
@@ -470,72 +392,6 @@ fn read_group_gid(group_name: &str) -> Option<u32> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
-
-    #[test]
-    fn invalid_interface_cannot_disclose_a_log() {
-        let path = std::env::temp_dir().join(format!("tunmux-private-{}.log", std::process::id()));
-        std::fs::write(&path, "PRIVATE_SENTINEL\n").unwrap();
-        let absolute = path.to_str().unwrap().strip_suffix(".log").unwrap();
-        for interface in [absolute.to_owned(), format!("../../../{absolute}")] {
-            let payload = serde_json::json!({
-                "kind": "gota_tun_run", "action": "Up", "interface": interface,
-                "config_content": "unused"
-            })
-            .to_string();
-            let (logs, response) =
-                process_request_payload(&payload, &mut ControlState::new(false), None);
-            assert!(logs.is_empty());
-            assert!(
-                matches!(response, PrivilegedResponse::Error { code, .. } if code == "Validation")
-            );
-        }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "PRIVATE_SENTINEL\n"
-        );
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn log_reader_rejects_symlinks_and_fifos() {
-        use std::os::unix::fs::symlink;
-        let dir = std::env::temp_dir().join(format!("tunmux-log-types-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let private = dir.join("private.log");
-        std::fs::write(&private, "PRIVATE_SENTINEL\n").unwrap();
-        let link = dir.join("helper.log");
-        symlink(&private, &link).unwrap();
-        assert!(read_log_tail(&link, 0).is_empty());
-        let fifo = dir.join("fifo.log");
-        nix::unistd::mkfifo(
-            &fifo,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .unwrap();
-        assert!(read_log_tail(&fifo, 0).is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn idempotent_capture_skips_old_log_but_new_helper_starts_at_zero() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = std::env::temp_dir().join(format!("tunmux-capture-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("helper.log");
-        std::fs::write(&path, "old session\n").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let capture = || HelperLogCapture {
-            path: path.clone(),
-            offset: metadata.len(),
-            inode: Some(metadata.ino()),
-        };
-        assert!(finish_gotatun_capture(Some(capture())).is_empty());
-        let replacement = dir.join("new.log");
-        std::fs::write(&replacement, "new session\n").unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-        assert_eq!(finish_gotatun_capture(Some(capture())), ["new session"]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 
     /// Split the framed bytes into one JSON value per newline-delimited line.
     fn parse_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
@@ -591,101 +447,5 @@ mod protocol_tests {
         for (frame, expected) in frames.iter().zip(&logs) {
             assert_eq!(frame["log"], serde_json::json!(expected));
         }
-    }
-
-    #[test]
-    fn merge_orders_by_timestamp_and_keeps_service_first_on_ties() {
-        let service = vec![
-            "2026-06-14T08:18:02Z service-a".to_string(),
-            "2026-06-14T08:18:04Z service-b".to_string(),
-        ];
-        let helper = vec![
-            "2026-06-14T08:18:01Z helper-a".to_string(),
-            "2026-06-14T08:18:02Z helper-b".to_string(),
-        ];
-        let merged = merge_log_lines(service, helper);
-        assert_eq!(
-            merged,
-            vec![
-                "2026-06-14T08:18:01Z helper-a".to_string(),
-                // Same second as helper-b: stable sort keeps the service line first.
-                "2026-06-14T08:18:02Z service-a".to_string(),
-                "2026-06-14T08:18:02Z helper-b".to_string(),
-                "2026-06-14T08:18:04Z service-b".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_falls_back_to_insertion_order_for_untimestamped_lines() {
-        // Lines without a parseable timestamp must not be reordered against each
-        // other (no fixed-width slice of arbitrary text decides their order).
-        let service = vec![
-            "no timestamp here".to_string(),
-            "another bare line".to_string(),
-        ];
-        let helper = vec!["also untimestamped".to_string()];
-        let merged = merge_log_lines(service.clone(), helper.clone());
-        assert_eq!(merged, [service, helper].concat());
-    }
-
-    #[test]
-    fn leading_timestamp_only_matches_well_formed_prefix() {
-        assert_eq!(
-            leading_timestamp("2026-06-14T08:18:02Z hello"),
-            Some("2026-06-14T08:18:02Z")
-        );
-        assert_eq!(leading_timestamp("hello world"), None);
-        assert_eq!(leading_timestamp(""), None);
-        // Right length but not a timestamp (no trailing Z).
-        assert_eq!(leading_timestamp("abcdefghijklmnopqrst rest"), None);
-    }
-
-    fn temp_log_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("tunmux-tail-{}-{}.log", tag, std::process::id()))
-    }
-
-    #[test]
-    fn read_log_tail_keeps_whole_lines_from_boundary_offset() {
-        let path = temp_log_path("boundary");
-        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
-        assert_eq!(
-            read_log_tail(&path, 0),
-            vec!["line one", "line two", "line three"]
-        );
-        // Offset 9 is the boundary right after "line one\n"; whole lines are kept.
-        assert_eq!(read_log_tail(&path, 9), vec!["line two", "line three"]);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn read_log_tail_drops_leading_partial_line() {
-        let path = temp_log_path("partial");
-        std::fs::write(&path, "line one\nline two\n").unwrap();
-        // Offset 3 lands inside "line one"; the partial prefix is discarded.
-        assert_eq!(read_log_tail(&path, 3), vec!["line two"]);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn read_log_tail_decodes_invalid_utf8_lossily() {
-        let path = temp_log_path("utf8");
-        // A lone 0xFF byte is invalid UTF-8; the surrounding lines must still survive.
-        std::fs::write(&path, b"good\n\xFFbad\n").unwrap();
-        let lines = read_log_tail(&path, 0);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "good");
-        assert!(lines[1].contains("bad"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn read_log_tail_caps_oversize_input_with_marker() {
-        let path = temp_log_path("truncate");
-        let big = "x".repeat(MAX_HELPER_TAIL_BYTES + 1024);
-        std::fs::write(&path, format!("{big}\n")).unwrap();
-        let lines = read_log_tail(&path, 0);
-        assert_eq!(lines.last().unwrap(), "(helper log tail truncated)");
-        let _ = std::fs::remove_file(&path);
     }
 }

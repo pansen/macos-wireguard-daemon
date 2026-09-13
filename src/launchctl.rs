@@ -1,6 +1,6 @@
 //! Shared `launchctl`/plist-rendering helpers used by both the privileged
 //! (system-domain) launchd daemon installer (`src/launchd.rs`) and the
-//! per-user (GUI-domain) autoconnect agent installer (`src/autoconnect.rs`).
+//! per-user (GUI-domain) session agent installer (`src/session_agent.rs`).
 //! Generic — no privileged/GUI-domain assumptions.
 
 use std::fs;
@@ -61,16 +61,6 @@ pub(crate) fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Inverse of [`xml_escape`], for reading a value back out of a rendered
-/// plist. `&amp;` is decoded last so an escaped `&amp;lt;` round-trips.
-pub(crate) fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,11 +68,5 @@ mod tests {
     #[test]
     fn xml_escape_escapes_specials() {
         assert_eq!(xml_escape("/a&b/<c>"), "/a&amp;b/&lt;c&gt;");
-    }
-
-    #[test]
-    fn xml_unescape_reverses_escape() {
-        let raw = "/a&b/<c>\"d'e";
-        assert_eq!(xml_unescape(&xml_escape(raw)), raw);
     }
 }

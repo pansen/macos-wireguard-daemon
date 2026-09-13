@@ -19,7 +19,6 @@ pub struct AppConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
-    pub backend: String,
     pub credential_store: CredentialStore,
     pub privileged_transport: PrivilegedTransport,
     pub privileged_autostart: bool,
@@ -32,7 +31,6 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            backend: default_backend().to_string(),
             credential_store: default_credential_store(),
             privileged_transport: PrivilegedTransport::Socket,
             privileged_autostart: true,
@@ -51,10 +49,6 @@ pub enum CredentialStore {
     File,
     Keyring,
     Auto,
-}
-
-fn default_backend() -> &'static str {
-    "userspace"
 }
 
 fn default_credential_store() -> CredentialStore {
@@ -101,38 +95,6 @@ pub fn load_config() -> AppConfig {
                 e
             );
             AppConfig::default()
-        }
-    }
-}
-
-// ── Provider enum ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Provider {
-    #[value(name = "wgconf")]
-    Wgconf,
-}
-
-impl Provider {
-    #[must_use]
-    pub fn dir_name(self) -> &'static str {
-        match self {
-            Provider::Wgconf => "wgconf",
-        }
-    }
-
-    /// Alias for `dir_name` – kept for call-site readability.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        self.dir_name()
-    }
-
-    /// Parse a provider directory name (e.g. `"wgconf"`) into its enum variant.
-    #[must_use]
-    pub fn from_dir_name(name: &str) -> Option<Self> {
-        match name {
-            "wgconf" => Some(Provider::Wgconf),
-            _ => None,
         }
     }
 }
@@ -211,27 +173,6 @@ pub fn ensure_privileged_runtime_dir() -> Result<()> {
         &dir,
         crate::trusted_exec::TrustedPath::Directory,
     )?;
-    Ok(())
-}
-
-/// Provider-specific config directory: ~/.config/tunmux/<provider>/
-#[must_use]
-pub fn config_dir(provider: Provider) -> PathBuf {
-    app_config_dir().join(provider.dir_name())
-}
-
-/// Connections directory: ~/.config/tunmux/connections/
-#[must_use]
-pub fn connections_dir() -> PathBuf {
-    app_config_dir().join("connections")
-}
-
-pub fn ensure_connections_dir() -> Result<()> {
-    let dir = connections_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    }
     Ok(())
 }
 

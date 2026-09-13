@@ -729,97 +729,34 @@ fn apply_mtu_override(config: &mut ParsedUserspaceConfig, value: &str) -> anyhow
     Ok(())
 }
 
+/// Delegates to the shared [`crate::wireguard::connection_config`] parser (the
+/// only WireGuard `.conf` parser in the codebase) and narrows its fully
+/// general, multi-peer result down to the single peer this helper's gotatun
+/// device can actually drive. A config with more than one `[Peer]` section is
+/// an explicit error here rather than the old silent single-peer overwrite.
 #[cfg(unix)]
 fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> {
-    enum Section {
-        None,
-        Interface,
-        Peer,
-    }
-
-    let mut section = Section::None;
-    let mut private_key = None;
-    let mut addresses: Vec<String> = Vec::new();
-    let mut dns_servers: Vec<String> = Vec::new();
-    let mut mtu = None;
-    let mut peer_public_key = None;
-    let mut peer_preshared_key = None;
-    let mut allowed_ips: Vec<String> = Vec::new();
-    let mut endpoint = None;
-
-    for raw_line in config.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = match &line[1..line.len() - 1] {
-                "Interface" => Section::Interface,
-                "Peer" => Section::Peer,
-                _ => Section::None,
-            };
-            continue;
-        }
-
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = raw_value.trim();
-        if value.is_empty() {
-            continue;
-        }
-
-        match section {
-            Section::Interface => match key {
-                "PrivateKey" => private_key = Some(decode_key32("PrivateKey", value)?),
-                "Address" => addresses = split_csv(value),
-                "DNS" => dns_servers = split_csv(value),
-                "MTU" => mtu = Some(crate::wireguard::config::parse_mtu(value)?),
-                _ => {}
-            },
-            Section::Peer => match key {
-                "PublicKey" => peer_public_key = Some(decode_key32("PublicKey", value)?),
-                "PresharedKey" => peer_preshared_key = Some(decode_key32("PresharedKey", value)?),
-                "AllowedIPs" => allowed_ips = split_csv(value),
-                "Endpoint" => endpoint = Some(parse_endpoint(value)?),
-                _ => {}
-            },
-            Section::None => {}
-        }
-    }
-
-    let private_key = private_key.ok_or_else(|| anyhow::anyhow!("missing Interface.PrivateKey"))?;
-    if addresses.is_empty() {
-        anyhow::bail!("missing Interface.Address");
-    }
-    let peer_public_key =
-        peer_public_key.ok_or_else(|| anyhow::anyhow!("missing Peer.PublicKey"))?;
-    if allowed_ips.is_empty() {
-        anyhow::bail!("missing Peer.AllowedIPs");
-    }
-    let endpoint = endpoint.ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
+    let parsed = crate::wireguard::connection_config::parse_connection_config(config)?;
+    anyhow::ensure!(
+        parsed.peers.len() == 1,
+        "gotatun userspace backend supports exactly one [Peer] section, found {}",
+        parsed.peers.len()
+    );
+    let peer = &parsed.peers[0];
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
 
     Ok(ParsedUserspaceConfig {
-        private_key,
-        addresses,
-        dns_servers,
-        mtu,
-        peer_public_key,
-        peer_preshared_key,
-        allowed_ips,
+        private_key: parsed.private_key.to_bytes(),
+        addresses: parsed.addresses.iter().map(ToString::to_string).collect(),
+        dns_servers: parsed.dns_servers.iter().map(ToString::to_string).collect(),
+        mtu: parsed.mtu,
+        peer_public_key: peer.public_key.to_bytes(),
+        peer_preshared_key: peer.preshared_key.as_ref().map(|psk| *psk.as_bytes()),
+        allowed_ips: peer.allowed_ips.iter().map(ToString::to_string).collect(),
         endpoint,
     })
-}
-
-#[cfg(unix)]
-fn split_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToString::to_string)
-        .collect()
 }
 
 #[cfg(all(test, unix))]
@@ -846,37 +783,6 @@ mod userspace_config_tests {
         apply_mtu_override(&mut parsed, "1420").expect("apply override");
         assert_eq!(parsed.mtu, Some(1420));
     }
-}
-
-#[cfg(unix)]
-fn decode_key32(field: &str, value: &str) -> anyhow::Result<[u8; 32]> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .with_context(|| format!("failed to decode {}", field))?;
-    if decoded.len() != 32 {
-        anyhow::bail!("{} must decode to 32 bytes", field);
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
-}
-
-#[cfg(unix)]
-fn parse_endpoint(value: &str) -> anyhow::Result<SocketAddr> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    let (host, port) = value
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid endpoint {}", value))?;
-    let ip: IpAddr = host
-        .trim_matches(['[', ']'])
-        .parse()
-        .with_context(|| format!("invalid endpoint IP {}", host))?;
-    let port: u16 = port
-        .parse()
-        .with_context(|| format!("invalid endpoint port {}", port))?;
-    Ok(SocketAddr::new(ip, port))
 }
 
 #[cfg(unix)]
@@ -2627,9 +2533,11 @@ struct MacosForeignSnapshot {
     tailscaled_present: bool,
 }
 
-/// A non-tunmux tunnel interface sharing the host (another VPN). Surfaced in the
-/// overview so an interfering peer (kernel-mode Tailscale, another WireGuard,
-/// IPSec, …) is visible instead of needing manual `ifconfig`/`netstat`.
+/// A tunnel interface other than the one this overview is currently
+/// reporting on. Surfaced so an interfering peer (kernel-mode Tailscale,
+/// another WireGuard, IPSec, …) is visible instead of needing manual
+/// `ifconfig`/`netstat` -- though (see `own` below) it may turn out to be
+/// tunmux's own after all, just not this overview's active connection.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq)]
 struct ForeignTunnel {
@@ -2639,6 +2547,10 @@ struct ForeignTunnel {
     addresses: Vec<String>,
     /// Carries a 100.64.0.0/10 (CGNAT) address — the Tailscale tailnet signature.
     cgnat: bool,
+    /// Carries an address that matches one of tunmux's own stored connections
+    /// (see `crate::privileged::known_addresses`) -- ours, just not the
+    /// interface this overview is currently reporting on.
+    own: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -2650,7 +2562,17 @@ fn macos_foreign_tunnels(own_interface: &str) -> Vec<ForeignTunnel> {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
-    parse_foreign_tunnels(&String::from_utf8_lossy(&output.stdout), own_interface)
+    // `crate::privileged::known_addresses()` is every address tunmux has
+    // assigned to one of its own stored connections, active or not. A
+    // leftover interface from a connection that isn't the one currently
+    // driving this overview (e.g. an orphaned utun from a previous connect
+    // cycle) still carries one of these addresses, which is what tells it
+    // apart from an actually-foreign VPN sharing the same CGNAT space.
+    parse_foreign_tunnels(
+        &String::from_utf8_lossy(&output.stdout),
+        own_interface,
+        &crate::privileged::known_addresses(),
+    )
 }
 
 /// True for interface names that belong to a tunnel/VPN (vs en0, lo0, bridge…).
@@ -2670,7 +2592,11 @@ fn is_cgnat_v4(ip: Ipv4Addr) -> bool {
 /// Parse `ifconfig` into the foreign tunnel interfaces (UP, tunnel-named, not
 /// our own). Pure so it can be unit-tested against captured fixtures.
 #[cfg(target_os = "macos")]
-fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunnel> {
+fn parse_foreign_tunnels(
+    ifconfig: &str,
+    own_interface: &str,
+    own_addresses: &std::collections::HashSet<IpAddr>,
+) -> Vec<ForeignTunnel> {
     let mut tunnels: Vec<ForeignTunnel> = Vec::new();
     let mut current: Option<ForeignTunnel> = None;
 
@@ -2695,6 +2621,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                     mtu,
                     addresses: Vec::new(),
                     cgnat: false,
+                    own: false,
                 });
             }
             continue;
@@ -2708,6 +2635,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                 if let Ok(ip) = addr.parse::<Ipv4Addr>() {
                     tunnel.addresses.push(addr.to_string());
                     tunnel.cgnat |= is_cgnat_v4(ip);
+                    tunnel.own |= own_addresses.contains(&IpAddr::V4(ip));
                 }
             }
         } else if let Some(rest) = trimmed.strip_prefix("inet6 ") {
@@ -2717,6 +2645,7 @@ fn parse_foreign_tunnels(ifconfig: &str, own_interface: &str) -> Vec<ForeignTunn
                     // Skip link-local; it says nothing about what the tunnel routes.
                     if !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80 {
                         tunnel.addresses.push(bare.to_string());
+                        tunnel.own |= own_addresses.contains(&IpAddr::V6(ip));
                     }
                 }
             }
@@ -2749,7 +2678,9 @@ fn foreign_tunnel_overview_rows(tunnels: &[ForeignTunnel]) -> Vec<Vec<String>> {
                 } else {
                     t.addresses.join(", ")
                 },
-                if t.cgnat {
+                if t.own {
+                    "tunmux (own address; another/stale connection)".to_string()
+                } else if t.cgnat {
                     "CGNAT 100.64/10 (Tailscale?)".to_string()
                 } else {
                     "-".to_string()
@@ -3587,7 +3518,7 @@ utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
 utun7: flags=0<> mtu 1500
 \tinet 10.9.9.9 netmask 0xffffffff
 ";
-        let tunnels = parse_foreign_tunnels(ifconfig, "utun4");
+        let tunnels = parse_foreign_tunnels(ifconfig, "utun4", &std::collections::HashSet::new());
 
         assert_eq!(
             tunnels,
@@ -3597,18 +3528,41 @@ utun7: flags=0<> mtu 1500
                     mtu: Some(1380),
                     addresses: vec![], // link-local only
                     cgnat: false,
+                    own: false,
                 },
                 ForeignTunnel {
                     interface: "utun6".to_string(),
                     mtu: Some(1280),
                     addresses: vec!["100.96.10.5".to_string()],
                     cgnat: true,
+                    own: false,
                 },
             ]
         );
         // utun4 (self) excluded; en0/lo0 not tunnels; utun7 is DOWN (no UP flag).
         assert!(!tunnels.iter().any(|t| t.interface == "utun4"));
         assert!(!tunnels.iter().any(|t| t.interface == "utun7"));
+    }
+
+    #[test]
+    fn parse_foreign_tunnels_recognizes_own_other_connection_by_address() {
+        // utun6 carries a CGNAT address that happens to belong to one of
+        // tunmux's own stored connections (e.g. an orphaned interface from a
+        // previous connect cycle) — it should be identified as ours, not
+        // flagged as a possible Tailscale tailnet.
+        let ifconfig = "\
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1384
+\tinet 100.64.1.2 --> 100.64.1.2 netmask 0xffffffff
+";
+        let own_addresses: std::collections::HashSet<IpAddr> =
+            [IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))]
+                .into_iter()
+                .collect();
+        let tunnels = parse_foreign_tunnels(ifconfig, "utun7", &own_addresses);
+
+        assert_eq!(tunnels.len(), 1);
+        assert!(tunnels[0].cgnat);
+        assert!(tunnels[0].own);
     }
 
     #[test]
@@ -3627,10 +3581,23 @@ utun7: flags=0<> mtu 1500
             mtu: Some(1280),
             addresses: vec!["100.96.10.5".to_string()],
             cgnat: true,
+            own: false,
         }]);
         assert_eq!(rows[0][0], "utun6");
         assert_eq!(rows[0][1], "1280");
         assert_eq!(rows[0][3], "CGNAT 100.64/10 (Tailscale?)");
+    }
+
+    #[test]
+    fn foreign_tunnel_rows_render_own_address_distinctly() {
+        let rows = foreign_tunnel_overview_rows(&[ForeignTunnel {
+            interface: "utun6".to_string(),
+            mtu: Some(1384),
+            addresses: vec!["100.64.1.2".to_string()],
+            cgnat: true,
+            own: true,
+        }]);
+        assert_eq!(rows[0][3], "tunmux (own address; another/stale connection)");
     }
 
     #[test]

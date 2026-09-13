@@ -1,6 +1,10 @@
-# Path to the WireGuard profile the login autoconnect agent connects with.
+# Path to the WireGuard profile `make install` stores as this user's
+# Automatic connection; the session agent itself just reconnects whatever is
+# currently stored that way, not this variable.
 # Override on other machines/users: make install TUNMUX_PROFILE=/path/to/your.conf
 TUNMUX_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
+CONNECTION_NAME ?= andi_split
+TUNMUX_BIN ?= /usr/local/bin/tunmux
 
 .PHONY: hooks
 hooks:
@@ -10,36 +14,63 @@ hooks:
 build.release:
 	cargo build --release
 
-.PHONY: install/binary
-install/binary:
+.PHONY: install.binary
+install.binary:
 	@# Binary copy is a dev stand-in for the future Homebrew bottle.
-	sudo install -m 0755 target/release/tunmux /usr/local/bin/tunmux
+	sudo install -m 0755 target/release/tunmux $(TUNMUX_BIN)
 
-.PHONY: install/privileged
-install/privileged: install/binary
-	sudo /usr/local/bin/tunmux launchd install
+.PHONY: install.privileged
+install.privileged: install.binary
+	sudo $(TUNMUX_BIN) launchd install
 
+
+.PHONY: install.connection
+install.connection:
+	@# Exercises the privileged connection-store RPCs (AddConnection,
+	@# ConnectConnection, and RemoveConnection via --force) for real against
+	@# the daemon `reload` just re-registered, instead of only through unit
+	@# tests. Per-user (no --global), matching the session agent's own
+	@# per-user model below. --start-mode automatic means this user's session
+	@# agent reconnects it on every future login. Fingerprint identity is
+	@# separate from --name: --force removes any older "direct" record left
+	@# over from a previous, since-edited profile so repeated installs don't
+	@# accumulate stale connections. An unmodified re-run of `make install` is
+	@# a silent no-op either way. A genuinely new/changed config triggers a
+	@# macOS admin-authentication prompt (password or Touch ID) for the add
+	@# and, if there was a stale record to clean up, a second one for that
+	@# removal.
+	$(TUNMUX_BIN) connection add \
+		--file $(TUNMUX_PROFILE) \
+		--name $(CONNECTION_NAME) \
+		--force \
+		--start-mode automatic
+	$(TUNMUX_BIN) connection connect $(CONNECTION_NAME)
 
 .PHONY: install
-install: build.release install/binary
-	@# `tunmux reload` registers the privileged daemon (escalating on its own)
-	@# and the autoconnect agent; --file seeds the agent on a first install.
-	/usr/local/bin/tunmux reload --file $(TUNMUX_PROFILE)
+install: build.release install.binary
+	@# `tunmux reload` registers the privileged daemon (escalating on its own),
+	@# drops any leftover tunnels, and re-registers the session agent -- do
+	@# not re-run `connection agent install` after `install.connection`
+	@# below: that would SIGTERM the instance `reload` just started (bootout
+	@# before bootstrap), disconnecting the connection `install.connection`
+	@# only just brought up, for no benefit.
+	$(TUNMUX_BIN) reload
+	$(MAKE) install.connection
 
 
 .PHONY: reload
 reload:
-	@# Re-registers both launchd services and reconnects, keeping whatever
-	@# profile the installed autoconnect agent was set up with.
-	/usr/local/bin/tunmux reload
+	@# Re-registers both launchd services and reconnects this user's
+	@# `automatic` connections.
+	$(TUNMUX_BIN) reload
 
 
-.PHONY: uninstall/autostart
-uninstall/autostart:
-	/usr/local/bin/tunmux autoconnect uninstall
+.PHONY: uninstall.autostart
+uninstall.autostart:
+	$(TUNMUX_BIN) connection agent uninstall
 
-.PHONY: uninstall/dns
-uninstall/dns:
+.PHONY: uninstall.dns
+uninstall.dns:
 	@# Clear any tunnel DNS override back to DHCP. A graceful daemon teardown
 	@# already restores DNS; this is the fallback for a force-killed daemon
 	@# (bootout/pkill above) that skipped cleanup. tunmux only ever writes the
@@ -53,34 +84,34 @@ uninstall/dns:
 	dscacheutil -flushcache
 	sudo killall -HUP mDNSResponder
 
-.PHONY: uninstall/privileged
-uninstall/privileged: build.release
+.PHONY: uninstall.privileged
+uninstall.privileged: build.release
 	@# Unregister the daemon only (bootout + plist/socket removal). Keeps the
-	@# binary, tunmux group, and logs — see purge/privileged for full teardown.
+	@# binary, tunmux group, and logs — see purge.privileged for full teardown.
 	@# Prefer the installed binary; if it was already removed, fall back to the
 	@# freshly compiled one so `launchd uninstall` still runs.
-	bin=/usr/local/bin/tunmux; [ -x "$$bin" ] || bin=target/release/tunmux; \
+	bin=$(TUNMUX_BIN); [ -x "$$bin" ] || bin=target/release/tunmux; \
 	sudo "$$bin" launchd uninstall || true
 
-.PHONY: purge/privileged
-purge/privileged: uninstall/privileged
+.PHONY: purge.privileged
+purge.privileged: uninstall.privileged
 	@# Destructive: after unregistering the daemon, remove the binary, all data,
 	@# logs, and the tunmux group.
-	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
-	sudo rm -f /usr/local/bin/tunmux
+	sudo pkill -f '$(TUNMUX_BIN) connection agent run' 2>/dev/null || true
+	sudo rm -f $(TUNMUX_BIN)
 	sudo rm -rf "/Library/Application Support/tunmux"
 	sudo rm -rf /var/log/tunmux
 	sudo dseditgroup -o delete tunmux 2>/dev/null || true
 
 .PHONY: uninstall
-uninstall: uninstall/autostart uninstall/privileged uninstall/dns
+uninstall: uninstall.autostart uninstall.privileged uninstall.dns
 
 .PHONY: purge
-purge: uninstall purge/privileged
+purge: uninstall purge.privileged
 
 
-.PHONY: check/privileged
-check/privileged:
+.PHONY: check.privileged
+check.privileged:
 	@echo "==> daemon (expect: state = not running, sockets registered)"
 	sudo launchctl print system/me.pansen.tunmux.privileged | grep -E 'state =|Listeners'
 	@echo "==> socket (expect: srw-rw---- root:tunmux)"
@@ -95,4 +126,4 @@ check/privileged:
 	ping -c2 55.56.57.2
 
 .PHONY: check
-check: check/privileged
+check: check.privileged
