@@ -111,7 +111,13 @@ fn cmd_install(force: bool) -> anyhow::Result<()> {
     // instance immediately. No separate `kickstart -k` afterward: that would
     // just SIGTERM the instance `bootstrap` only just started, right as it's
     // in the middle of its own initial reconciliation.
+    //
+    // `enable` runs first to clear any stale "disabled" override (left by a
+    // previous uninstall, or by toggling the agent off in System Settings ->
+    // Login Items) -- bootstrapping a disabled label fails with EIO, same
+    // failure mode `launchd::bootstrap` guards against for the system daemon.
     run_ignore_failure("/bin/launchctl", &["bootout", &domain_target(uid)]);
+    run_checked("/bin/launchctl", &["enable", &domain_target(uid)])?;
     run_checked(
         "/bin/launchctl",
         &["bootstrap", &gui_domain(uid), plist_path_str],
