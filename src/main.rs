@@ -16,7 +16,7 @@ mod trusted_exec;
 mod userspace_helper;
 mod wireguard;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tracing::error;
 
 use cli::{Cli, LaunchdCommand, TopCommand};
@@ -26,6 +26,13 @@ fn main() {
     if userspace_helper::maybe_run_from_env() {
         return;
     }
+
+    // Shell completion: when the shell invokes us with COMPLETE=<shell> set,
+    // emit candidates and exit. This has to come before any dispatch so a
+    // <TAB> keystroke can never fall through into daemon-spawning or
+    // privileged code paths. The command tree is introspected fresh from
+    // `Cli` on every request, so completions track `--help` automatically.
+    clap_complete::CompleteEnv::with_factory(cli::Cli::command).complete();
 
     let cli = Cli::parse();
     if cli.verbose || defaults_to_debug(&cli.command) {

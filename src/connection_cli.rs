@@ -86,6 +86,68 @@ fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<Con
     }
 }
 
+/// Completion candidates for the `<ID>` positional of `remove`/`connect`/
+/// `disconnect`/`mode`/`get`: every connection the caller can name, offered
+/// both by id and by `--name`, since `resolve_id` accepts either.
+///
+/// This runs on every <TAB>, so it stays cheap and silent. Autostart is off:
+/// pressing tab must never spawn the privileged daemon. Any failure -- daemon
+/// not running, socket missing, timeout -- collapses to "no candidates"
+/// rather than printing an error into the shell's completion buffer.
+pub fn complete_connection_id(
+    current: &std::ffi::OsStr,
+) -> Vec<clap_complete::engine::CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    // `without_autostart` below only gates the socket transport's
+    // spawn-a-daemon fallback. The stdio transport reaches the daemon by
+    // running `sudo tunmux privileged --serve --stdio` for *every* request,
+    // which would put a password prompt behind every <TAB>, so don't complete
+    // at all under it.
+    if !matches!(
+        crate::config::load_config().general.privileged_transport,
+        crate::config::PrivilegedTransport::Socket
+    ) {
+        return Vec::new();
+    }
+    let client = PrivilegedClient::new().without_autostart();
+    // Same scopes, in the same order, as `resolve_id` searches.
+    let mut connections = client
+        .list_connections(ConnectionScope::Mine)
+        .unwrap_or_default();
+    connections.extend(
+        client
+            .list_connections(ConnectionScope::Global)
+            .unwrap_or_default(),
+    );
+
+    let mut candidates = Vec::new();
+    for conn in &connections {
+        // Shells that render candidate help (zsh, fish) show the same fields
+        // `connection list` prints, so the picker is readable on its own.
+        // bash discards it.
+        let help = format!(
+            "name={name} global={global} mode={mode:?} connected={connected} interface={interface}",
+            name = conn.name.as_deref().unwrap_or("-"),
+            global = conn.global,
+            mode = conn.start_mode,
+            connected = conn.connected,
+            interface = conn.interface,
+        );
+        let values = [Some(conn.id.to_string()), conn.name.clone()];
+        for value in values.into_iter().flatten() {
+            if value.starts_with(current) {
+                candidates.push(
+                    clap_complete::engine::CompletionCandidate::new(value)
+                        .help(Some(help.clone().into())),
+                );
+            }
+        }
+    }
+    candidates
+}
+
 fn cmd_add(
     file: &str,
     global: bool,
