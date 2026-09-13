@@ -175,7 +175,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     );
 
     // --- system mutation begins here ---
-    let gid = ensure_group_with_member(&user)?;
+    let (gid, member_added) = ensure_group_with_member(&user)?;
     ensure_directories(gid)?;
     register_authorization_right()?;
     let plist = render_plist_from(&template, bin_str, gid)?;
@@ -188,10 +188,12 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(path) = &plist_template {
         println!("  template: {}", path.display());
     }
-    println!(
-        "You may need to log out and back in (or run `newgrp tunmux`) for tunmux group \
-         membership to take effect."
-    );
+    if member_added {
+        println!(
+            "Added {user} to the tunmux group. If tunmux reports permission denied when \
+             connecting to the daemon, log out and back in for group membership to take effect."
+        );
+    }
     Ok(())
 }
 
@@ -331,9 +333,9 @@ fn daemon_binary_path() -> anyhow::Result<PathBuf> {
     Ok(invoked)
 }
 
-/// Port of Makefile:19-20: ensure the `tunmux` group exists and that `user`
-/// is a member, returning its GID.
-fn ensure_group_with_member(user: &str) -> anyhow::Result<u32> {
+/// Ensure the `tunmux` group exists and that `user` is a member, returning
+/// its GID and whether membership was added during this install.
+fn ensure_group_with_member(user: &str) -> anyhow::Result<(u32, bool)> {
     let read_ok = std::process::Command::new("/usr/sbin/dseditgroup")
         .args(["-o", "read", GROUP_NAME])
         .stdout(std::process::Stdio::null())
@@ -345,16 +347,24 @@ fn ensure_group_with_member(user: &str) -> anyhow::Result<u32> {
         run_checked("/usr/sbin/dseditgroup", &["-o", "create", GROUP_NAME])?;
     }
 
-    // Idempotent: re-adding an existing member is a no-op.
-    run_checked(
-        "/usr/sbin/dseditgroup",
-        &["-o", "edit", "-a", user, "-t", "user", GROUP_NAME],
-    )?;
+    let already_member = std::process::Command::new("/usr/sbin/dseditgroup")
+        .args(["-o", "checkmember", "-m", user, GROUP_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| "failed to check tunmux group membership")?
+        .success();
+    if !already_member {
+        run_checked(
+            "/usr/sbin/dseditgroup",
+            &["-o", "edit", "-a", user, "-t", "user", GROUP_NAME],
+        )?;
+    }
 
     Group::from_name(GROUP_NAME)
         .ok()
         .flatten()
-        .map(|g| g.gid.as_raw())
+        .map(|g| (g.gid.as_raw(), !already_member))
         .ok_or_else(|| anyhow::anyhow!("group {GROUP_NAME} not found after creation"))
 }
 
