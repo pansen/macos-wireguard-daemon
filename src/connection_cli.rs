@@ -6,9 +6,12 @@
 //! Phase 5 CLI: the legacy `wgconf`/`connect`/`disconnect`/`autoconnect`
 //! surface has been retired in favor of it (see
 //! `doc/connection-store-plan.md`'s Phase 5 addendum for the mapping).
+use std::time::Duration;
+
 use anyhow::Context;
 
 use crate::cli::{ConnectionCommand, StartModeArg};
+use crate::error::AppError;
 use crate::privileged_api::{
     ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
 };
@@ -126,10 +129,51 @@ fn cmd_add(
                 "Removing stale connection {} (same name {name:?}, superseded by {id})",
                 conn.id
             );
-            client.remove_connection(conn.id)?;
+            disconnect_and_remove_stale(&client, conn.id)?;
         }
     }
     Ok(())
+}
+
+/// Disconnect and remove a stale same-name connection record, retrying the
+/// whole disconnect-then-remove sequence while the daemon reports `Busy`.
+///
+/// The race this guards against is wider than a single check-then-act gap:
+/// `tunmux reload` reinstalls the per-user session agent with `RunAtLoad`,
+/// and the agent's one-shot startup reconcile (`session_agent::run` ->
+/// `reconcile_connect_mine`) can reconnect this exact `Automatic` record via
+/// a full `ConnectConnection` round trip (WireGuard handshake, routes, DNS)
+/// at any point while this function is running, including between our own
+/// disconnect and the daemon committing the removal. A single
+/// disconnect-then-remove pair can still lose that race; since the agent
+/// only ever attempts that one reconnect per start, retrying the pair
+/// converges as soon as it has.
+///
+/// The 12-second retry budget limits retries, not total wall-clock time:
+/// a blocking RPC can exceed it. In particular, `disconnect_connection`
+/// waits up to `PATIENT_LOCK_TIMEOUT` (30s) for an in-progress connect to
+/// release its lock, then performs teardown. `NotFound` from either call
+/// is treated as success: something else already removed the record.
+fn disconnect_and_remove_stale(client: &PrivilegedClient, id: ConnectionId) -> anyhow::Result<()> {
+    const RETRY_BUDGET: Duration = Duration::from_secs(12);
+    const RETRY_DELAY: Duration = Duration::from_millis(150);
+    let deadline = std::time::Instant::now() + RETRY_BUDGET;
+    loop {
+        let result = (|| -> crate::error::Result<()> {
+            // Setup (including PostUp hooks) holds the connection lock while
+            // `connected` is still false. Always disconnect so the daemon's
+            // patient lock waits for setup before tearing the connection down.
+            client.disconnect_connection(id)?;
+            client.remove_connection(id)
+        })();
+        match result {
+            Ok(()) | Err(AppError::NotFound(_)) => return Ok(()),
+            Err(AppError::Busy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn cmd_list(all: bool, global: bool) -> anyhow::Result<()> {
