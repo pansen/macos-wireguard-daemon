@@ -678,9 +678,55 @@ enum Frame {
 
 #[cfg(test)]
 mod tests {
-    use super::super::PrivilegedResponse;
+    use super::super::{PrivilegedClient, PrivilegedResponse};
     use super::{read_framed_response, Frame, Level, LogLineFilter};
+    use crate::privileged_api::{ConnectionScope, PrivilegedRequest};
     use std::io::Cursor;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn request_timeout_bounds_a_peer_that_accepts_but_never_answers() {
+        // The failure this guards is a daemon that is reachable but wedged:
+        // the connection succeeds, the request is written, and the response
+        // never comes. Without a deadline the read blocks forever, which for
+        // the completion path means a hung terminal on every <TAB>.
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        let (mut ours, _theirs) = UnixStream::pair().expect("socketpair");
+        // `_theirs` stays open and silent for the whole test: dropping it
+        // would deliver EOF and end the read for the wrong reason.
+
+        let client = PrivilegedClient::new().with_request_timeout(TIMEOUT);
+        client
+            .apply_request_timeout(&ours)
+            .expect("apply request timeout");
+
+        let started = Instant::now();
+        let result = client.send_on_stream(
+            &mut ours,
+            &PrivilegedRequest::ListConnections {
+                scope: ConnectionScope::Mine,
+            },
+        );
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "a silent peer must not read as success");
+        assert!(
+            waited < TIMEOUT * 10,
+            "read should give up near the timeout, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_request_timeout_the_socket_keeps_its_blocking_default() {
+        // The everyday `connection` commands must stay uncapped: a connect
+        // legitimately outlasts any deadline worth setting here.
+        let (ours, _theirs) = UnixStream::pair().expect("socketpair");
+        PrivilegedClient::new()
+            .apply_request_timeout(&ours)
+            .expect("no-op without a configured timeout");
+        assert!(ours.read_timeout().expect("read timeout").is_none());
+    }
 
     fn line(level: &str, message: &str) -> String {
         format!("2026-06-14T08:18:02Z {level} {message} tunmux::privileged: ")

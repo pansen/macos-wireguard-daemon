@@ -374,8 +374,42 @@ mod tests {
         assert!(matches!(err, AppError::Auth(_)));
     }
 
+    /// Whether [`RIGHT_NAME`] is registered in the system authorization
+    /// database (`register_authorization_right`, run by `launchd install` and
+    /// by every privileged daemon start).
+    ///
+    /// `security authorizationdb read` exits 0 for a defined right and
+    /// nonzero (-60005, errAuthorizationDenied) for an undefined one.
+    fn tunmux_right_is_registered() -> bool {
+        std::process::Command::new("/usr/bin/security")
+            .args(["authorizationdb", "read", RIGHT_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn live_but_unauthenticated_external_form_is_rejected() {
+        // This asserts a property of *tunmux's own* rule: `authenticate-user`
+        // with `shared` false, so holding an authorization session grants
+        // nothing on its own. Where the rule isn't installed (a CI runner,
+        // a checkout that never ran `launchd install`), the undefined right
+        // falls back to the system default rule instead -- which is shared
+        // and cached, so an admin credential another process minted moments
+        // earlier makes `AuthorizationCopyRights` succeed here. That says
+        // nothing about the code under test, so skip rather than assert
+        // against whatever the machine's ambient credential state happens to
+        // be.
+        if !tunmux_right_is_registered() {
+            eprintln!(
+                "skipping {RIGHT_NAME} rejection check: the right is not \
+                 registered on this machine (run `sudo tunmux launchd install`)"
+            );
+            return;
+        }
+
         let mut auth = ptr::null_mut();
         assert_eq!(
             unsafe {
