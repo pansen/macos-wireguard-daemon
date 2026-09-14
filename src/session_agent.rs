@@ -22,11 +22,13 @@ use std::process::Stdio;
 use anyhow::Context;
 use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::{geteuid, getuid};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::cli::AgentCommand;
 use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failure, xml_escape};
-use crate::privileged_api::{ConnectionScope, ConnectionStartMode};
+use crate::privileged_api::{
+    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+};
 use crate::privileged_client::PrivilegedClient;
 
 pub(crate) const LABEL: &str = "me.pansen.wgd.session-agent";
@@ -194,14 +196,39 @@ fn reconcile_connect_mine() {
             return;
         }
     };
+    for id in connect_candidates(&connections) {
+        if let Err(error) = client.connect_connection(id, false) {
+            warn!(id = %id, error = %error, "session_agent_connect_failed");
+        }
+    }
+}
+
+/// Which of `connections` (already scoped to `Mine`) this agent start should
+/// bring up: `Automatic`, not currently connected, and not explicitly
+/// disconnected by the user since (see
+/// `ConnectionSummary::user_disconnected` and
+/// `issues/session-agent-overrides-disconnect.md` -- without this last
+/// check, a `KeepAlive` relaunch of this agent mid-session would silently
+/// undo an explicit `wgd connection disconnect`). Split out from
+/// `reconcile_connect_mine` so the selection criteria can be unit tested
+/// without a real `PrivilegedClient`, mirroring
+/// `connection_store::boot_reconcile_candidates`.
+fn connect_candidates(connections: &[ConnectionSummary]) -> Vec<ConnectionId> {
+    let mut ids = Vec::new();
     for conn in connections {
         if conn.start_mode != ConnectionStartMode::Automatic || conn.connected {
             continue;
         }
-        if let Err(error) = client.connect_connection(conn.id, false) {
-            warn!(id = %conn.id, error = %error, "session_agent_connect_failed");
+        if conn.user_disconnected {
+            debug!(
+                id = %conn.id,
+                "session_agent_skipping_user_disconnected_connection"
+            );
+            continue;
         }
+        ids.push(conn.id);
     }
+    ids
 }
 
 fn reconcile_disconnect_mine() {
@@ -217,7 +244,12 @@ fn reconcile_disconnect_mine() {
         if !conn.connected {
             continue;
         }
-        if let Err(error) = client.disconnect_connection(conn.id) {
+        // Logout teardown, not the user asking this tunnel to stay down: a
+        // fresh login must still bring an `Automatic` connection back up, so
+        // this must not persist `user_disconnected` (see
+        // `PrivilegedClient::disconnect_connection_for_teardown`'s doc
+        // comment).
+        if let Err(error) = client.disconnect_connection_for_teardown(conn.id) {
             warn!(id = %conn.id, error = %error, "session_agent_disconnect_failed");
         }
     }
@@ -309,6 +341,55 @@ fn refuse_if_root() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(
+        start_mode: ConnectionStartMode,
+        connected: bool,
+        user_disconnected: bool,
+    ) -> ConnectionSummary {
+        ConnectionSummary {
+            id: ConnectionId::new(),
+            global: false,
+            owner_uid: Some(501),
+            start_mode,
+            name: None,
+            interface: "wg-aaaaaaaa".to_string(),
+            connected,
+            user_disconnected,
+            addresses: Vec::new(),
+            dns_servers: Vec::new(),
+            mtu: None,
+            peers: Vec::new(),
+            fingerprint: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn connect_candidates_selects_only_automatic_disconnected_and_not_user_disconnected() {
+        let automatic_down = sample(ConnectionStartMode::Automatic, false, false);
+        let manual_down = sample(ConnectionStartMode::Manual, false, false);
+        let automatic_up = sample(ConnectionStartMode::Automatic, true, false);
+        // The regression case this exists for: an `Automatic` connection the
+        // user explicitly disconnected must not come back just because the
+        // agent process bounced (see
+        // `issues/session-agent-overrides-disconnect.md`).
+        let automatic_user_disconnected = sample(ConnectionStartMode::Automatic, false, true);
+
+        let candidates = connect_candidates(&[
+            automatic_down.clone(),
+            manual_down,
+            automatic_up,
+            automatic_user_disconnected,
+        ]);
+        assert_eq!(candidates, vec![automatic_down.id]);
+    }
+
+    #[test]
+    fn connect_candidates_is_empty_for_no_connections() {
+        assert_eq!(connect_candidates(&[]), Vec::new());
+    }
 
     #[test]
     fn render_plist_substitutes_all() {

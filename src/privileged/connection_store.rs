@@ -36,6 +36,15 @@ pub struct StoredConnection {
     pub interface: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Set when the user explicitly disconnected this connection (`wgd
+    /// connection disconnect`, `DisconnectReason::User`); cleared by an
+    /// explicit `ConnectConnection` or a `start_mode` transition that lands
+    /// on `Automatic`. Session/boot reconciliation (`session_agent`'s
+    /// `reconcile_connect_mine`, `reconcile_boot_once`) skip a candidate
+    /// with this set, so an explicit disconnect of an `Automatic` connection
+    /// stays down across an agent restart instead of being silently undone
+    /// -- see `issues/session-agent-overrides-disconnect.md`.
+    pub user_disconnected: bool,
 }
 
 /// Connection lifecycle state that exists only while the connection is up.
@@ -85,6 +94,11 @@ struct StoredConnectionDisk {
     interface: String,
     created_at: u64,
     updated_at: u64,
+    /// Absent in records written before this field existed; those predate
+    /// any possibility of an explicit disconnect being recorded, so `false`
+    /// is the correct default rather than a placeholder.
+    #[serde(default)]
+    user_disconnected: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -214,6 +228,7 @@ fn to_disk(conn: &StoredConnection) -> StoredConnectionDisk {
         interface: conn.interface.clone(),
         created_at: conn.created_at,
         updated_at: conn.updated_at,
+        user_disconnected: conn.user_disconnected,
     }
 }
 
@@ -230,6 +245,7 @@ fn from_disk(disk: StoredConnectionDisk) -> Result<StoredConnection> {
         interface: disk.interface,
         created_at: disk.created_at,
         updated_at: disk.updated_at,
+        user_disconnected: disk.user_disconnected,
     })
 }
 
@@ -869,6 +885,7 @@ fn boot_reconcile_candidates(connections: &[StoredConnection]) -> Vec<Connection
     connections
         .iter()
         .filter(|c| c.global && c.start_mode == ConnectionStartMode::Automatic)
+        .filter(|c| !c.user_disconnected)
         .filter(|c| !is_active(c.id).unwrap_or(false))
         .map(|c| c.id)
         .collect()
@@ -914,6 +931,7 @@ mod tests {
             config,
             created_at: now_unix(),
             updated_at: now_unix(),
+            user_disconnected: false,
         }
     }
 
@@ -1120,6 +1138,53 @@ mod tests {
         assert_eq!(loaded.interface, state.interface);
         clear_active_in(&root, id).unwrap();
         assert!(load_active_in(&root, id).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn boot_reconcile_candidates_skips_a_user_disconnected_global_connection() {
+        // Same "explicit disconnect must stick" rule the session agent
+        // applies to per-user connections (see
+        // `issues/session-agent-overrides-disconnect.md`) also has to hold
+        // for global connections re-reconciled on daemon boot, or an admin's
+        // `disconnect` of a global `Automatic` connection would be undone by
+        // the very next boot.
+        let root = temp_root("boot-candidates-user-disconnected");
+        set_test_root(root.clone());
+
+        let global_auto = ConnectionId::new();
+        let mut c1 = sample(global_auto, true, None);
+        c1.start_mode = ConnectionStartMode::Automatic;
+        c1.user_disconnected = true;
+        save_in(&root, &c1).unwrap();
+
+        let connections = load_all_in(&root).unwrap();
+        assert_eq!(boot_reconcile_candidates(&connections), Vec::new());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stored_connection_disk_defaults_user_disconnected_to_false_when_absent() {
+        // Regression test for reading a record written before this field
+        // existed: it must load as `false`, not fail to parse.
+        let root = temp_root("user-disconnected-disk-default");
+        let id = ConnectionId::new();
+        let mut conn = sample(id, true, None);
+        conn.user_disconnected = true;
+        save_in(&root, &conn).unwrap();
+
+        // Strip the field back out, simulating a pre-upgrade record.
+        let bytes = fs::read(stored_path_in(&root, id)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value.as_object_mut().unwrap().remove("user_disconnected");
+        fs::write(
+            stored_path_in(&root, id),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_in(&root, id).unwrap().unwrap();
+        assert!(!loaded.user_disconnected);
         let _ = fs::remove_dir_all(root);
     }
 
