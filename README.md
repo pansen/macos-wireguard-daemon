@@ -33,6 +33,23 @@ it serves here as the technical base.
 
 ## Install
 
+Via Homebrew (Apple Silicon only):
+
+```bash
+brew install pansen/tap/macos-wireguard-daemon
+```
+
+This installs the `wgd` binary itself. The privileged launchd daemon refuses
+to run out of `/opt/homebrew` (root-owned locations only), so finish the
+setup with the commands `brew` prints after install:
+
+```bash
+sudo install -o root -g wheel -m 755 "$(brew --prefix)/bin/wgd" /usr/local/bin/wgd
+sudo /usr/local/bin/wgd launchd install
+```
+
+From source:
+
 ```bash
 make install WGD_PROFILE=/path/to/your.conf CONNECTION_NAME=home
 ```
