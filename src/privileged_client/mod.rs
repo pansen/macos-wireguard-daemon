@@ -12,8 +12,8 @@ use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, PrivilegedRequest,
-    PrivilegedResponse,
+    ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+    DisconnectReason, PrivilegedRequest, PrivilegedResponse,
 };
 
 use self::transport::{is_transport_error, StdioSession};
@@ -277,15 +277,69 @@ impl PrivilegedClient {
         .map(|_| ())
     }
 
-    /// Bring up a stored connection. Ownership-gated only (see the design
+    /// Bring up a stored connection on the user's explicit request
+    /// (`wgd connection connect`). Ownership-gated only (see the design
     /// plan's authorization section) -- no admin-auth prompt for connecting
-    /// an already-vetted connection.
+    /// an already-vetted connection. Clears `StoredConnection::user_disconnected`
+    /// unconditionally -- see [`ConnectReason::User`]'s doc comment. Callers
+    /// bringing a connection up on their own initiative (session/boot
+    /// reconciliation), not because the user asked this specific tunnel to
+    /// come up right now, must use
+    /// [`Self::connect_connection_for_reconciliation`] instead, or a
+    /// reconciliation pass could silently undo a disconnect that races it.
     pub fn connect_connection(&self, id: ConnectionId, debug: bool) -> Result<()> {
-        self.send_unit(PrivilegedRequest::ConnectConnection { id, debug })
+        self.send_unit(PrivilegedRequest::ConnectConnection {
+            id,
+            debug,
+            reason: ConnectReason::User,
+        })
     }
 
+    /// Bring up a stored connection as part of session/boot reconciliation's
+    /// own initiative, not because the user asked this specific tunnel to
+    /// come up right now -- see [`Self::connect_connection`]'s doc comment.
+    /// Never clears `StoredConnection::user_disconnected`; if it's set, the
+    /// daemon backs off instead of connecting, re-checking under the
+    /// connection's lock rather than trusting this call's possibly-stale
+    /// candidate snapshot.
+    pub fn connect_connection_for_reconciliation(
+        &self,
+        id: ConnectionId,
+        debug: bool,
+    ) -> Result<()> {
+        self.send_unit(PrivilegedRequest::ConnectConnection {
+            id,
+            debug,
+            reason: ConnectReason::Reconciliation,
+        })
+    }
+
+    /// Disconnect a connection on the user's explicit request. Persists
+    /// "stay down" intent (`StoredConnection::user_disconnected`) that
+    /// session/boot reconciliation then honors -- see
+    /// `issues/session-agent-overrides-disconnect.md`. Callers tearing
+    /// connections down for reasons *other* than the user asking this
+    /// specific tunnel to stay down (session-agent logout, `wgd launchd
+    /// reload`/`uninstall`) must use
+    /// [`Self::disconnect_connection_for_teardown`] instead, or a fresh
+    /// login/reinstall would no longer bring an `Automatic` connection back
+    /// up.
     pub fn disconnect_connection(&self, id: ConnectionId) -> Result<()> {
-        self.send_unit(PrivilegedRequest::DisconnectConnection { id })
+        self.send_unit(PrivilegedRequest::DisconnectConnection {
+            id,
+            reason: DisconnectReason::User,
+        })
+    }
+
+    /// Disconnect a connection as part of a system-initiated teardown that
+    /// is restoring a known-good running state, not the user asking this
+    /// specific tunnel to stay down -- see [`Self::disconnect_connection`]'s
+    /// doc comment. Never persists "stay down" intent.
+    pub fn disconnect_connection_for_teardown(&self, id: ConnectionId) -> Result<()> {
+        self.send_unit(PrivilegedRequest::DisconnectConnection {
+            id,
+            reason: DisconnectReason::SessionTeardown,
+        })
     }
 
     /// Change a stored connection's start mode. Only transitions a global

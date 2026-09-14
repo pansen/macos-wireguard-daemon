@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, PeerSummary,
-    PrivilegedRequest, PrivilegedResponse,
+    ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+    DisconnectReason, PeerSummary, PrivilegedRequest, PrivilegedResponse,
 };
 
 use super::authz;
@@ -163,11 +163,13 @@ pub(super) fn dispatch(
             auth_external_form,
         } => DispatchOutcome::Immediate(handle_remove_connection(origin, id, auth_external_form)),
 
-        PrivilegedRequest::ConnectConnection { id, debug } => {
-            handle_connect_connection(origin, id, debug)
+        PrivilegedRequest::ConnectConnection { id, debug, reason } => {
+            handle_connect_connection(origin, id, debug, reason)
         }
 
-        PrivilegedRequest::DisconnectConnection { id } => handle_disconnect_connection(origin, id),
+        PrivilegedRequest::DisconnectConnection { id, reason } => {
+            handle_disconnect_connection(origin, id, reason)
+        }
 
         PrivilegedRequest::SetConnectionMode {
             id,
@@ -293,6 +295,7 @@ fn handle_add_connection(
         interface,
         created_at: now,
         updated_at: now,
+        user_disconnected: false,
     };
     match connection_store::create(&index_lock, &stored) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
@@ -377,6 +380,14 @@ fn reconcile_existing_add(
     }
     if mode_changed {
         existing.start_mode = start_mode;
+        // Same rule `SetConnectionMode` applies: a resubmission that lands
+        // on `Automatic` (e.g. `make install`'s `connection add --force
+        // --start-mode automatic`) is an explicit request to have this
+        // connection managed again, so it clears any earlier explicit
+        // disconnect -- see `StoredConnection::user_disconnected`.
+        if start_mode == ConnectionStartMode::Automatic {
+            existing.user_disconnected = false;
+        }
     }
     existing.updated_at = connection_store::now_unix();
     match connection_store::update(&conn_lock, &existing) {
@@ -428,7 +439,12 @@ fn handle_remove_connection(
     }
 }
 
-fn handle_connect_connection(origin: PeerOrigin, id: ConnectionId, debug: bool) -> DispatchOutcome {
+fn handle_connect_connection(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    debug: bool,
+    reason: ConnectReason,
+) -> DispatchOutcome {
     let stored = match connection_store::load(id) {
         Ok(Some(stored)) => stored,
         Ok(None) => return DispatchOutcome::Immediate(not_found()),
@@ -450,8 +466,18 @@ fn handle_connect_connection(origin: PeerOrigin, id: ConnectionId, debug: bool) 
             connection_store::set_test_root(root);
         }
         let response = match connection_store::lock_connection_patient(id) {
-            Ok(conn_lock) => match super::connection_ops::connect(&conn_lock, id, debug) {
-                Ok(()) => PrivilegedResponse::Unit,
+            Ok(conn_lock) => match resolve_connect_intent(&conn_lock, id, reason) {
+                Ok(true) => match super::connection_ops::connect(&conn_lock, id, debug) {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(error) => error_response(error),
+                },
+                Ok(false) => {
+                    debug!(
+                        id = %id,
+                        "reconciliation_connect_skipped_user_disconnected"
+                    );
+                    PrivilegedResponse::Unit
+                }
                 Err(error) => error_response(error),
             },
             Err(error) => lock_error_response(error),
@@ -461,7 +487,47 @@ fn handle_connect_connection(origin: PeerOrigin, id: ConnectionId, debug: bool) 
     DispatchOutcome::Pending(rx)
 }
 
-fn handle_disconnect_connection(origin: PeerOrigin, id: ConnectionId) -> DispatchOutcome {
+/// Decide whether a `ConnectConnection` may proceed, and update
+/// `StoredConnection::user_disconnected` accordingly -- both read fresh
+/// under the caller's [`ConnectionLock`] rather than trusting whatever the
+/// caller observed before racing to acquire it (see `ConnectReason`'s doc
+/// comment: a reconciliation pass's candidate list is a snapshot that can
+/// predate a user's brand-new explicit disconnect committing to disk).
+/// Returns whether `connect` should actually run.
+///
+/// `User`: unambiguous fresh intent regardless of the flag's current state,
+/// so it's cleared unconditionally (covering `connect`'s idempotent
+/// "already active" branch too) and this always returns `true`.
+///
+/// `Reconciliation`: never clears the flag; returns `false` (back off,
+/// without touching the flag) if it's set, so an automatic bring-up can
+/// never override a disconnect that has already committed by the time this
+/// lock is acquired, no matter how stale the caller's own snapshot was.
+fn resolve_connect_intent(
+    conn_lock: &connection_store::ConnectionLock,
+    id: ConnectionId,
+    reason: ConnectReason,
+) -> crate::error::Result<bool> {
+    let Some(mut stored) = connection_store::load(id)? else {
+        return Ok(true); // let `connect` produce its usual "not found" error
+    };
+    match reason {
+        ConnectReason::User => {
+            if stored.user_disconnected {
+                stored.user_disconnected = false;
+                connection_store::update(conn_lock, &stored)?;
+            }
+            Ok(true)
+        }
+        ConnectReason::Reconciliation => Ok(!stored.user_disconnected),
+    }
+}
+
+fn handle_disconnect_connection(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    reason: DisconnectReason,
+) -> DispatchOutcome {
     let stored = match connection_store::load(id) {
         Ok(Some(stored)) => stored,
         Ok(None) => return DispatchOutcome::Immediate(not_found()),
@@ -479,8 +545,11 @@ fn handle_disconnect_connection(origin: PeerOrigin, id: ConnectionId) -> Dispatc
             connection_store::set_test_root(root);
         }
         let response = match connection_store::lock_connection_patient(id) {
-            Ok(conn_lock) => match super::connection_ops::disconnect(&conn_lock, id) {
-                Ok(()) => PrivilegedResponse::Unit,
+            Ok(conn_lock) => match mark_user_disconnected(&conn_lock, id, reason) {
+                Ok(()) => match super::connection_ops::disconnect(&conn_lock, id) {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(error) => error_response(error),
+                },
                 Err(error) => error_response(error),
             },
             Err(error) => lock_error_response(error),
@@ -488,6 +557,33 @@ fn handle_disconnect_connection(origin: PeerOrigin, id: ConnectionId) -> Dispatc
         let _ = tx.send(response);
     });
     DispatchOutcome::Pending(rx)
+}
+
+/// Record `StoredConnection::user_disconnected` for an explicit
+/// (`DisconnectReason::User`) disconnect *before* tearing the tunnel down --
+/// not only on success, so that a teardown that half-fails still leaves the
+/// intent recorded and the connection down after the next agent restart
+/// (rather than looking like an ordinary crash the agent should paper over).
+/// `DisconnectReason::SessionTeardown` (session-agent logout,
+/// `wgd launchd reload`/`uninstall`) never sets it: those tear connections
+/// down to restore a known-good running state, not because anyone asked a
+/// specific tunnel to stay down. Requires the caller's [`ConnectionLock`].
+fn mark_user_disconnected(
+    conn_lock: &connection_store::ConnectionLock,
+    id: ConnectionId,
+    reason: DisconnectReason,
+) -> crate::error::Result<()> {
+    if reason != DisconnectReason::User {
+        return Ok(());
+    }
+    let Some(mut stored) = connection_store::load(id)? else {
+        return Ok(());
+    };
+    if !stored.user_disconnected {
+        stored.user_disconnected = true;
+        connection_store::update(conn_lock, &stored)?;
+    }
+    Ok(())
 }
 
 fn handle_set_connection_mode(
@@ -530,6 +626,12 @@ fn handle_set_connection_mode(
         return PrivilegedResponse::Unit;
     }
     stored.start_mode = start_mode;
+    // A mode change that lands on `Automatic` is an explicit request to have
+    // this connection managed again, so it clears any earlier explicit
+    // disconnect -- see `StoredConnection::user_disconnected`.
+    if start_mode == ConnectionStartMode::Automatic {
+        stored.user_disconnected = false;
+    }
     stored.updated_at = connection_store::now_unix();
     match connection_store::update(&conn_lock, &stored) {
         Ok(()) => PrivilegedResponse::Unit,
@@ -648,6 +750,7 @@ fn summarize(
         name: conn.name.clone(),
         interface: conn.interface.clone(),
         connected,
+        user_disconnected: conn.user_disconnected,
         addresses: conn
             .config
             .addresses
@@ -1069,6 +1172,46 @@ mod tests {
     }
 
     #[test]
+    fn add_connection_resubmission_landing_on_automatic_clears_user_disconnected() {
+        with_test_store("dedup-clears-intent", || {
+            let id = connection_id(&handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Manual,
+                None,
+                None,
+                false,
+                valid_auth(),
+            ));
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            let mut stored = connection_store::load(id).unwrap().unwrap();
+            stored.user_disconnected = true;
+            connection_store::update(&conn_lock, &stored).unwrap();
+            drop(conn_lock);
+
+            // `make install`'s `connection add --force --start-mode
+            // automatic` shape: identical content, mode moving to Automatic.
+            handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Automatic,
+                None,
+                None,
+                false,
+                None,
+            );
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
     fn add_connection_same_text_different_global_scope_is_a_distinct_connection() {
         with_test_store("scope-distinct", || {
             let global = connection_id(&add_connection(
@@ -1186,13 +1329,15 @@ mod tests {
                 valid_auth(),
             ));
 
-            match handle_connect_connection(PeerOrigin::Socket(502), id, false) {
+            match handle_connect_connection(PeerOrigin::Socket(502), id, false, ConnectReason::User)
+            {
                 DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
                 DispatchOutcome::Pending(_) => {
                     panic!("unauthorized connect must not spawn a worker")
                 }
             }
-            match handle_disconnect_connection(PeerOrigin::Socket(502), id) {
+            match handle_disconnect_connection(PeerOrigin::Socket(502), id, DisconnectReason::User)
+            {
                 DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
                 DispatchOutcome::Pending(_) => {
                     panic!("unauthorized disconnect must not spawn a worker")
@@ -1283,7 +1428,12 @@ mod tests {
     #[test]
     fn connect_on_nonexistent_connection_is_not_found() {
         with_test_store("connect-missing", || {
-            match handle_connect_connection(PeerOrigin::Socket(0), ConnectionId::new(), false) {
+            match handle_connect_connection(
+                PeerOrigin::Socket(0),
+                ConnectionId::new(),
+                false,
+                ConnectReason::User,
+            ) {
                 DispatchOutcome::Immediate(response) => {
                     assert_eq!(error_code(&response), "NotFound")
                 }
@@ -1303,7 +1453,8 @@ mod tests {
                 false,
                 valid_auth(),
             ));
-            match handle_connect_connection(PeerOrigin::Socket(501), id, false) {
+            match handle_connect_connection(PeerOrigin::Socket(501), id, false, ConnectReason::User)
+            {
                 DispatchOutcome::Pending(rx) => {
                     // The actual gotatun bring-up will fail in this
                     // environment (no root networking access); this only
@@ -1319,6 +1470,195 @@ mod tests {
                     panic!("authorized connect must spawn a worker, got {response:?}")
                 }
             }
+        });
+    }
+
+    fn wait_for_worker(rx: std::sync::mpsc::Receiver<PrivilegedResponse>) {
+        let _ = wait_for_worker_response(rx);
+    }
+
+    fn wait_for_worker_response(
+        rx: std::sync::mpsc::Receiver<PrivilegedResponse>,
+    ) -> PrivilegedResponse {
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("worker thread must eventually respond")
+    }
+
+    #[test]
+    fn explicit_disconnect_records_user_intent_even_though_teardown_fails_here() {
+        with_test_store("disconnect-marks-intent", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            // The intent must be recorded up front (see
+            // `mark_user_disconnected`'s doc comment), not only after a
+            // successful teardown -- the real `gotatun` teardown fails in
+            // this test environment (no root networking access) exactly
+            // like the `connect` worker test above.
+            match handle_disconnect_connection(PeerOrigin::Socket(501), id, DisconnectReason::User)
+            {
+                DispatchOutcome::Pending(rx) => wait_for_worker(rx),
+                DispatchOutcome::Immediate(response) => {
+                    panic!("authorized disconnect must spawn a worker, got {response:?}")
+                }
+            }
+            assert!(
+                connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn session_teardown_disconnect_does_not_record_user_intent() {
+        with_test_store("disconnect-teardown-no-intent", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            match handle_disconnect_connection(
+                PeerOrigin::Socket(501),
+                id,
+                DisconnectReason::SessionTeardown,
+            ) {
+                DispatchOutcome::Pending(rx) => wait_for_worker(rx),
+                DispatchOutcome::Immediate(response) => {
+                    panic!("authorized disconnect must spawn a worker, got {response:?}")
+                }
+            }
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_connect_clears_user_disconnected_before_bring_up_is_attempted() {
+        with_test_store("connect-clears-intent", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            let mut stored = connection_store::load(id).unwrap().unwrap();
+            stored.user_disconnected = true;
+            connection_store::update(&conn_lock, &stored).unwrap();
+            drop(conn_lock);
+
+            match handle_connect_connection(PeerOrigin::Socket(501), id, false, ConnectReason::User)
+            {
+                DispatchOutcome::Pending(rx) => wait_for_worker(rx),
+                DispatchOutcome::Immediate(response) => {
+                    panic!("authorized connect must spawn a worker, got {response:?}")
+                }
+            }
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn reconciliation_connect_backs_off_and_does_not_clear_a_fresh_user_disconnect() {
+        // Regression test for the race Copilot's review flagged on this PR:
+        // `session_agent::reconcile_connect_mine` (or boot reconciliation)
+        // can snapshot a connection as eligible, then a user's brand-new
+        // explicit disconnect commits (setting `user_disconnected`) before
+        // this reconciliation-driven `ConnectConnection` acquires the lock.
+        // The connect must back off -- re-checking the flag fresh under the
+        // lock, not trusting whatever the caller observed earlier -- and
+        // must never clear it, or the disconnect would be silently undone.
+        with_test_store("reconciliation-connect-backs-off", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            let mut stored = connection_store::load(id).unwrap().unwrap();
+            stored.user_disconnected = true;
+            connection_store::update(&conn_lock, &stored).unwrap();
+            drop(conn_lock);
+
+            let response = match handle_connect_connection(
+                PeerOrigin::Socket(501),
+                id,
+                false,
+                ConnectReason::Reconciliation,
+            ) {
+                DispatchOutcome::Pending(rx) => wait_for_worker_response(rx),
+                DispatchOutcome::Immediate(response) => {
+                    panic!("authorized connect must spawn a worker, got {response:?}")
+                }
+            };
+            // A real connect attempt always fails in this test environment
+            // (no gotatun/root networking access -- see the other worker
+            // tests' comments), so `Unit` here proves `connect` itself was
+            // never invoked, not just that the flag happened to survive.
+            assert!(
+                matches!(response, PrivilegedResponse::Unit),
+                "expected the connect to be skipped, got {response:?}"
+            );
+            assert!(
+                connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected,
+                "a reconciliation connect must never clear an explicit user disconnect"
+            );
+        });
+    }
+
+    #[test]
+    fn reconciliation_connect_proceeds_when_not_user_disconnected() {
+        with_test_store("reconciliation-connect-proceeds", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let response = match handle_connect_connection(
+                PeerOrigin::Socket(501),
+                id,
+                false,
+                ConnectReason::Reconciliation,
+            ) {
+                DispatchOutcome::Pending(rx) => wait_for_worker_response(rx),
+                DispatchOutcome::Immediate(response) => {
+                    panic!("authorized connect must spawn a worker, got {response:?}")
+                }
+            };
+            // Not skipped: the worker actually attempted `connect`, which
+            // fails in this test environment (no gotatun/root networking
+            // access) -- an `Error` here proves it was attempted rather than
+            // silently skipped.
+            assert!(
+                matches!(response, PrivilegedResponse::Error { .. }),
+                "expected the connect to actually be attempted, got {response:?}"
+            );
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
         });
     }
 
@@ -1392,6 +1732,79 @@ mod tests {
                 None,
             );
             assert!(matches!(response, PrivilegedResponse::Unit));
+        });
+    }
+
+    #[test]
+    fn set_connection_mode_to_automatic_clears_user_disconnected() {
+        with_test_store("mode-clears-intent", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            let mut stored = connection_store::load(id).unwrap().unwrap();
+            stored.user_disconnected = true;
+            connection_store::update(&conn_lock, &stored).unwrap();
+            drop(conn_lock);
+
+            // Manual -> Automatic: an actual mode change landing on Automatic.
+            let response = handle_set_connection_mode(
+                PeerOrigin::Socket(501),
+                id,
+                ConnectionStartMode::Automatic,
+                None,
+            );
+            assert!(matches!(response, PrivilegedResponse::Unit));
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn set_connection_mode_no_op_does_not_touch_user_disconnected() {
+        with_test_store("mode-noop-keeps-intent", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            handle_set_connection_mode(
+                PeerOrigin::Socket(501),
+                id,
+                ConnectionStartMode::Automatic,
+                None,
+            );
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            let mut stored = connection_store::load(id).unwrap().unwrap();
+            stored.user_disconnected = true;
+            connection_store::update(&conn_lock, &stored).unwrap();
+            drop(conn_lock);
+
+            // Already Automatic; re-requesting Automatic is a no-op and must
+            // not clear the flag -- it did not represent an actual mode
+            // change, so it is not the "mode change back to Automatic" the
+            // clearing rule targets.
+            let response = handle_set_connection_mode(
+                PeerOrigin::Socket(501),
+                id,
+                ConnectionStartMode::Automatic,
+                None,
+            );
+            assert!(matches!(response, PrivilegedResponse::Unit));
+            assert!(
+                connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
         });
     }
 
