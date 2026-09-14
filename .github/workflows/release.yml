@@ -120,7 +120,6 @@ jobs:
           sed \
             -e "s|__URL__|${{ steps.vars.outputs.url }}|" \
             -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
-            -e "s|__VERSION__|${{ steps.vars.outputs.version }}|" \
             packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Formula/macos-wireguard-daemon.rb
 
       - name: Commit and push
