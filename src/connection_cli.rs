@@ -379,6 +379,7 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     println!("start_mode:  {:?}", conn.start_mode);
     println!("interface:   {}", conn.interface);
     println!("connected:   {}", conn.connected);
+    println!("user_disconnected: {}", conn.user_disconnected);
     println!("addresses:   {}", conn.addresses.join(", "));
     println!("dns_servers: {}", conn.dns_servers.join(", "));
     println!(
