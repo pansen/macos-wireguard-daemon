@@ -72,3 +72,67 @@ jobs:
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - release
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute formula values
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          asset="wgd-${tag}-aarch64-apple-darwin.tar.gz"
+          sha256="$(cut -d' ' -f1 "dist/${asset}.sha256")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/pansen/macos-wireguard-daemon/releases/download/${tag}/${asset}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v7
+        with:
+          repository: pansen/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s|__URL__|${{ steps.vars.outputs.url }}|" \
+            -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
+            -e "s|__VERSION__|${{ steps.vars.outputs.version }}|" \
+            packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Formula/macos-wireguard-daemon.rb
+
+      - name: Commit and push
+        shell: bash
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/macos-wireguard-daemon.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git commit -m "macos-wireguard-daemon ${{ steps.vars.outputs.version }}"
+          git push origin HEAD:main
