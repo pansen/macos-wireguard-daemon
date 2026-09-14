@@ -116,6 +116,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p tap/Formula
           sed \
             -e "s|__URL__|${{ steps.vars.outputs.url }}|" \
             -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
