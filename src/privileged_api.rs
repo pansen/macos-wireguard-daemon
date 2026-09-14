@@ -68,12 +68,58 @@ pub enum ConnectionStartMode {
 /// connections as part of restoring a known-good running state, not because
 /// anyone asked a specific tunnel to stay down. A fresh login or reinstall
 /// must still bring an `Automatic` connection back up in that case.
+///
+/// `SessionTeardown` is the `#[default]` (used by `#[serde(default)]` when a
+/// request omits `reason` entirely), not `User` -- a request from a
+/// not-yet-upgraded caller has no `reason` field to omit *by choice*, it
+/// simply predates the field. The one long-lived caller that can still be
+/// running old code against an already-upgraded daemon is the session
+/// agent's logout teardown (`wgd launchd reload`/`install` replace the CLI
+/// binary and the daemon before the still-running old agent is bootstrapped
+/// out); defaulting that to `User` would mark every automatic connection it
+/// tears down as "stay down," silently breaking reconnect at the next login.
+/// Every current-version caller sets `reason` explicitly regardless of what
+/// the default is (see `PrivilegedClient::disconnect_connection` and
+/// `disconnect_connection_for_teardown`), so this default only ever matters
+/// for that version-skew window, where "behave like before this field
+/// existed" is the safe choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisconnectReason {
-    #[default]
     User,
+    #[default]
     SessionTeardown,
+}
+
+/// Why a `ConnectConnection` request was made. Mirrors `DisconnectReason`'s
+/// split: a `User` connect (`wgd connection connect`) is unambiguous fresh
+/// intent and always clears `StoredConnection::user_disconnected`; a
+/// `Reconciliation` connect (session/boot reconciliation bringing an
+/// `Automatic` connection up on its own initiative, not because anyone asked
+/// this specific tunnel to come up right now) must not. The distinction
+/// matters beyond bookkeeping: a reconciliation pass can snapshot a
+/// connection as eligible, then race a user's brand-new explicit disconnect
+/// to the connection's lock. Without this, the reconciliation connect would
+/// win the race, silently undoing the disconnect the instant it committed
+/// (see `issues/session-agent-overrides-disconnect.md`) -- so a
+/// `Reconciliation` connect must re-check `user_disconnected` under the lock
+/// immediately before connecting and back off if it's set, rather than
+/// trusting the caller's older snapshot.
+///
+/// `Reconciliation` is the `#[default]`, for the same version-skew reason
+/// `DisconnectReason` defaults to `SessionTeardown`: the one long-lived
+/// caller that can still be running old code against an already-upgraded
+/// daemon is the session agent's reconciliation loop, not the CLI (which
+/// always picks up the freshly installed binary before the daemon is
+/// upgraded -- see `DisconnectReason`'s doc comment). Every current-version
+/// caller sets `reason` explicitly (see `PrivilegedClient::connect_connection`
+/// and `connect_connection_for_reconciliation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectReason {
+    User,
+    #[default]
+    Reconciliation,
 }
 
 /// Which connections a `ListConnections` call should return. `All` is
@@ -206,6 +252,8 @@ pub enum PrivilegedRequest {
         id: ConnectionId,
         #[serde(default)]
         debug: bool,
+        #[serde(default)]
+        reason: ConnectReason,
     },
 
     DisconnectConnection {
@@ -366,11 +414,55 @@ fn validate_lease_token(token: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_interface_name;
+    use super::{validate_interface_name, ConnectReason, DisconnectReason, PrivilegedRequest};
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
         assert!(validate_interface_name("wgconf0").is_ok());
+    }
+
+    #[test]
+    fn disconnect_request_missing_reason_defaults_to_session_teardown() {
+        // Regression test for the version-skew hazard flagged in review: a
+        // `DisconnectConnection` request on the wire (JSON) from a
+        // not-yet-upgraded caller (the long-lived session agent, mid-restart
+        // across an upgrade) has no `reason` field at all, not a field
+        // explicitly set to `user`. The default for an omitted field must be
+        // the safe "don't persist stay-down intent" choice
+        // (`SessionTeardown`), or an old agent's ordinary logout teardown
+        // would get silently reinterpreted as the user asking every
+        // connection it tears down to stay down.
+        let json = serde_json::json!({
+            "kind": "disconnect_connection",
+            "id": "00000000-0000-0000-0000-000000000000",
+        });
+        let request: PrivilegedRequest = serde_json::from_value(json).unwrap();
+        match request {
+            PrivilegedRequest::DisconnectConnection { reason, .. } => {
+                assert_eq!(reason, DisconnectReason::SessionTeardown);
+            }
+            other => panic!("expected DisconnectConnection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_request_missing_reason_defaults_to_reconciliation() {
+        // Same version-skew reasoning as the disconnect case above, mirrored
+        // for `ConnectConnection`: an old session agent's automatic bring-up
+        // has no `reason` field, and must not be treated as unambiguous user
+        // intent (which would clear `user_disconnected` and reconnect a
+        // tunnel the user just explicitly disconnected).
+        let json = serde_json::json!({
+            "kind": "connect_connection",
+            "id": "00000000-0000-0000-0000-000000000000",
+        });
+        let request: PrivilegedRequest = serde_json::from_value(json).unwrap();
+        match request {
+            PrivilegedRequest::ConnectConnection { reason, .. } => {
+                assert_eq!(reason, ConnectReason::Reconciliation);
+            }
+            other => panic!("expected ConnectConnection, got {other:?}"),
+        }
     }
 
     #[test]

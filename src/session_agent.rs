@@ -197,7 +197,12 @@ fn reconcile_connect_mine() {
         }
     };
     for id in connect_candidates(&connections) {
-        if let Err(error) = client.connect_connection(id, false) {
+        // Reconciliation, not explicit user intent: the daemon re-checks
+        // `user_disconnected` under the connection's lock before acting, so
+        // a disconnect that commits after `connections` was snapshotted
+        // above still wins even though this candidate list can't see it
+        // (see `ConnectReason::Reconciliation`'s doc comment).
+        if let Err(error) = client.connect_connection_for_reconciliation(id, false) {
             warn!(id = %id, error = %error, "session_agent_connect_failed");
         }
     }
