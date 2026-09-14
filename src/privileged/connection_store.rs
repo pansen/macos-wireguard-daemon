@@ -893,6 +893,17 @@ fn boot_reconcile_candidates(connections: &[StoredConnection]) -> Vec<Connection
 
 fn reconcile_connect(id: ConnectionId) -> Result<()> {
     let conn_lock = lock_connection(id)?;
+    // Re-check `user_disconnected` under the lock, immediately before
+    // connecting: `boot_reconcile_candidates` only reflects a snapshot taken
+    // before this lock was acquired, so an admin's explicit disconnect that
+    // commits in the gap between that snapshot and this lock must still
+    // win, not be silently overridden by this reconciliation pass (see
+    // `issues/session-agent-overrides-disconnect.md`).
+    if let Some(stored) = load(id)? {
+        if stored.user_disconnected {
+            return Ok(());
+        }
+    }
     super::connection_ops::connect(&conn_lock, id, false)
 }
 
@@ -1138,6 +1149,42 @@ mod tests {
         assert_eq!(loaded.interface, state.interface);
         clear_active_in(&root, id).unwrap();
         assert!(load_active_in(&root, id).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_connect_backs_off_if_user_disconnected_commits_after_the_candidate_snapshot() {
+        // Regression test for the race flagged in review: `boot_reconcile_candidates`
+        // only reflects a snapshot taken before `reconcile_connect` acquires
+        // the per-connection lock. If an explicit disconnect commits in that
+        // gap, `reconcile_connect` must re-check `user_disconnected` fresh
+        // under the lock rather than trusting the stale snapshot -- otherwise
+        // a first-boot global `Automatic` tunnel can come back up right after
+        // the user disconnected it.
+        let root = temp_root("reconcile-connect-race");
+        set_test_root(root.clone());
+
+        let id = ConnectionId::new();
+        let mut conn = sample(id, true, None);
+        conn.start_mode = ConnectionStartMode::Automatic;
+        save_in(&root, &conn).unwrap();
+
+        // Snapshot taken, exactly as `reconcile_boot_once` does...
+        let connections = load_all_in(&root).unwrap();
+        assert_eq!(boot_reconcile_candidates(&connections), vec![id]);
+
+        // ...then an explicit disconnect commits before `reconcile_connect`
+        // runs for this candidate.
+        let mut stored = load_in(&root, id).unwrap().unwrap();
+        stored.user_disconnected = true;
+        save_in(&root, &stored).unwrap();
+
+        // Must back off (`Ok`, no connect attempt) rather than actually
+        // trying to connect -- a real attempt would fail in this test
+        // environment (no gotatun/root networking access), so `Ok` here
+        // proves `connection_ops::connect` was never invoked, not merely
+        // that it happened to fail for an unrelated reason.
+        assert!(reconcile_connect(id).is_ok());
         let _ = fs::remove_dir_all(root);
     }
 

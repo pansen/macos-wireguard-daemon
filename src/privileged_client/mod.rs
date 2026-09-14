@@ -12,8 +12,8 @@ use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary, DisconnectReason,
-    PrivilegedRequest, PrivilegedResponse,
+    ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+    DisconnectReason, PrivilegedRequest, PrivilegedResponse,
 };
 
 use self::transport::{is_transport_error, StdioSession};
@@ -277,11 +277,41 @@ impl PrivilegedClient {
         .map(|_| ())
     }
 
-    /// Bring up a stored connection. Ownership-gated only (see the design
+    /// Bring up a stored connection on the user's explicit request
+    /// (`wgd connection connect`). Ownership-gated only (see the design
     /// plan's authorization section) -- no admin-auth prompt for connecting
-    /// an already-vetted connection.
+    /// an already-vetted connection. Clears `StoredConnection::user_disconnected`
+    /// unconditionally -- see [`ConnectReason::User`]'s doc comment. Callers
+    /// bringing a connection up on their own initiative (session/boot
+    /// reconciliation), not because the user asked this specific tunnel to
+    /// come up right now, must use
+    /// [`Self::connect_connection_for_reconciliation`] instead, or a
+    /// reconciliation pass could silently undo a disconnect that races it.
     pub fn connect_connection(&self, id: ConnectionId, debug: bool) -> Result<()> {
-        self.send_unit(PrivilegedRequest::ConnectConnection { id, debug })
+        self.send_unit(PrivilegedRequest::ConnectConnection {
+            id,
+            debug,
+            reason: ConnectReason::User,
+        })
+    }
+
+    /// Bring up a stored connection as part of session/boot reconciliation's
+    /// own initiative, not because the user asked this specific tunnel to
+    /// come up right now -- see [`Self::connect_connection`]'s doc comment.
+    /// Never clears `StoredConnection::user_disconnected`; if it's set, the
+    /// daemon backs off instead of connecting, re-checking under the
+    /// connection's lock rather than trusting this call's possibly-stale
+    /// candidate snapshot.
+    pub fn connect_connection_for_reconciliation(
+        &self,
+        id: ConnectionId,
+        debug: bool,
+    ) -> Result<()> {
+        self.send_unit(PrivilegedRequest::ConnectConnection {
+            id,
+            debug,
+            reason: ConnectReason::Reconciliation,
+        })
     }
 
     /// Disconnect a connection on the user's explicit request. Persists
