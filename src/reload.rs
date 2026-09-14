@@ -55,7 +55,13 @@ fn disconnect_all_mine() -> anyhow::Result<()> {
         return Ok(());
     }
     for conn in connected {
-        if let Err(error) = client.disconnect_connection(conn.id) {
+        // Teardown ahead of a reinstall, not the user asking this tunnel to
+        // stay down -- the reinstalled session agent's own startup
+        // reconciliation is expected to bring an `Automatic` connection
+        // right back up, so this must not persist "stay down" intent (see
+        // `PrivilegedClient::disconnect_connection_for_teardown`'s doc
+        // comment).
+        if let Err(error) = client.disconnect_connection_for_teardown(conn.id) {
             eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id);
             continue;
         }

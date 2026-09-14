@@ -60,6 +60,22 @@ pub enum ConnectionStartMode {
     Automatic,
 }
 
+/// Why a `DisconnectConnection` request was made. Distinguishes the user
+/// explicitly asking a connection to go down (and to *stay* down -- see
+/// `StoredConnection::user_disconnected`) from a system-initiated teardown
+/// that just needs the tunnel gone right now: the per-user session agent's
+/// logout reconciliation and `wgd launchd reload`/`uninstall` all disconnect
+/// connections as part of restoring a known-good running state, not because
+/// anyone asked a specific tunnel to stay down. A fresh login or reinstall
+/// must still bring an `Automatic` connection back up in that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectReason {
+    #[default]
+    User,
+    SessionTeardown,
+}
+
 /// Which connections a `ListConnections` call should return. `All` is
 /// rejected in `dispatch()` for a non-root caller; `Mine` filters to the
 /// caller's own `owner_uid`.
@@ -85,6 +101,17 @@ pub struct ConnectionSummary {
     pub name: Option<String>,
     pub interface: String,
     pub connected: bool,
+    /// Whether the user explicitly disconnected this connection (`wgd
+    /// connection disconnect`) since the last explicit connect or mode
+    /// change back to `Automatic`. See `StoredConnection::user_disconnected`
+    /// and `issues/session-agent-overrides-disconnect.md`. `#[serde(default)]`
+    /// so a client built against this field can still decode a response from
+    /// an older, not-yet-upgraded daemon process that doesn't send it --
+    /// exactly the upgrade window `wgd launchd reload` exercises, where the
+    /// previous daemon process is not guaranteed to have exited yet (see
+    /// `issues/session-agent-overrides-disconnect.md`'s S3).
+    #[serde(default)]
+    pub user_disconnected: bool,
     pub addresses: Vec<String>,
     pub dns_servers: Vec<String>,
     pub mtu: Option<u16>,
@@ -183,6 +210,8 @@ pub enum PrivilegedRequest {
 
     DisconnectConnection {
         id: ConnectionId,
+        #[serde(default)]
+        reason: DisconnectReason,
     },
 
     SetConnectionMode {

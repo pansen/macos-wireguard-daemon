@@ -293,7 +293,12 @@ fn disconnect_all_connections_once() {
         }
     };
     for conn in connected {
-        match client.disconnect_connection(conn.id) {
+        // Teardown ahead of an uninstall/reinstall, not the user asking this
+        // tunnel to stay down -- a later `wgd launchd install` must still
+        // bring an `Automatic` connection back up (see
+        // `PrivilegedClient::disconnect_connection_for_teardown`'s doc
+        // comment).
+        match client.disconnect_connection_for_teardown(conn.id) {
             Ok(()) => println!("Disconnected {}", conn.id),
             Err(error) => eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id),
         }
