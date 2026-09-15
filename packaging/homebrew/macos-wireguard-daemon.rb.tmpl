@@ -40,9 +40,15 @@ cask "macos-wireguard-daemon" do
     `brew upgrade` will prompt for your password each time a new version
     ships, to reinstall the daemon from the new binary.
 
-    Manage it with `wgd status`, `wgd launchd restart`, or `wgd launchd
-    uninstall`, or remove it completely (including the wgd group and logs)
-    with:
+    Check status with `wgd status` (no sudo needed). Restarting or
+    uninstalling the daemon needs root, and must go through the trusted
+    copy at /usr/local/bin/wgd rather than the `wgd` on your PATH (which
+    points into Homebrew's prefix, a location launchd daemons refuse to
+    run from):
+      sudo /usr/local/bin/wgd launchd restart
+      sudo /usr/local/bin/wgd launchd uninstall
+
+    Remove everything, including the wgd group and logs, with:
       brew uninstall --zap macos-wireguard-daemon
   EOS
 end
