@@ -64,6 +64,12 @@ pub enum TopCommand {
 pub enum LaunchdCommand {
     /// Register and start the privileged daemon with launchd (run with sudo)
     ///
+    /// If the running binary isn't already at a trusted, root-owned location
+    /// (e.g. a plain `brew install` or a Cask's staged copy, wherever
+    /// Homebrew's prefix happens to be on this machine), it is first copied
+    /// into /usr/local/bin/wgd (root:wheel) before anything else runs, since
+    /// launchd daemons cannot run out of an admin-writable location.
+    ///
     /// The launchd plist is rendered from a template. By default this is the
     /// template baked into the binary at build time; pass --plist-template to
     /// supply your own.
