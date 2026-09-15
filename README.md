@@ -36,7 +36,7 @@ it serves here as the technical base.
 Via Homebrew (Apple Silicon only):
 
 ```bash
-brew install pansen/tap/macos-wireguard-daemon
+brew install --cask pansen/tap/macos-wireguard-daemon
 ```
 
 This installs `wgd` on your PATH and registers the privileged launchd

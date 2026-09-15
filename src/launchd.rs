@@ -151,6 +151,53 @@ const RELOCATION_DENY_PREFIXES: &[&str] = &[
     "/private/var/tmp/",
 ];
 
+/// Verify every ancestor of `path` is owned by root or by `invoking_uid` and
+/// is not world-writable.
+///
+/// `reject_unsafe_relocation_source` above only denies a fixed list of
+/// locations that are *always* attacker-controlled; by itself that allows
+/// relocating from any other path, including one another, untrusted local
+/// user made writable for themselves (e.g. `/opt/local/bin`), as long as it
+/// isn't on the denylist. Since `relocate_to_trusted_path` copies the source
+/// into a root-owned, launchd-trusted path while running as root, the source
+/// must be traced back to root or to the person who typed `sudo`, not merely
+/// checked against a list of known-bad prefixes.
+fn require_owned_by_invoking_user_or_root(path: &Path, invoking_uid: Uid) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // A symlink ancestor isn't itself rejected here: Homebrew's `bin/wgd` is
+    // routinely a symlink into its Cellar, and macOS's own `/var` and `/tmp`
+    // are symlinks into `/private/...`, so a blanket rejection would reject
+    // the exact case relocation exists to support. Ownership of the symlink
+    // entry itself is still checked below (an attacker-owned symlink in an
+    // otherwise-trusted directory fails there), and the caller separately
+    // checks `resolved` -- `current_exe()` canonicalized -- so the real,
+    // fully-dereferenced destination is always validated too.
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .with_context(|| format!("failed to inspect {}", ancestor.display()))?;
+        let owner = Uid::from_raw(metadata.uid());
+        if owner.as_raw() != 0 && owner != invoking_uid {
+            anyhow::bail!(
+                "refusing to relocate a wgd binary through {} which is owned by a \
+                 different user (uid {}); only files owned by root or by the user who \
+                 ran sudo (uid {}) are trusted as a relocation source",
+                ancestor.display(),
+                owner.as_raw(),
+                invoking_uid.as_raw()
+            );
+        }
+        if metadata.mode() & 0o002 != 0 {
+            anyhow::bail!(
+                "refusing to relocate a wgd binary through {} which is world-writable",
+                ancestor.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn reject_unsafe_relocation_source(
     path: &Path,
     invoking_user_home: Option<&Path>,
@@ -369,6 +416,15 @@ fn invoking_user_home() -> Option<PathBuf> {
     User::from_name(&user).ok().flatten().map(|u| u.dir)
 }
 
+/// UID of the user who invoked `sudo`, if any. Used only by
+/// `require_owned_by_invoking_user_or_root` to trace a relocation source's
+/// ownership back to the person who ran sudo, distinct from
+/// `invoking_user_home`, which only feeds the path-prefix check.
+fn invoking_user_uid() -> Option<Uid> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    User::from_name(&user).ok().flatten().map(|u| u.uid)
+}
+
 /// The user who ran `sudo`, i.e. who should be added to the `wgd` group.
 fn invoking_user() -> anyhow::Result<String> {
     match std::env::var("SUDO_USER") {
@@ -441,10 +497,26 @@ fn install_time_binary_path() -> anyhow::Result<PathBuf> {
 fn relocate_to_trusted_path(invoked: &Path, resolved: &Path) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
+    let home = invoking_user_home();
     // Still refuse sources that are always attacker-controlled, regardless
     // of the ownership check above having failed on them too.
-    reject_unsafe_relocation_source(invoked, invoking_user_home().as_deref())?;
-    reject_unsafe_relocation_source(resolved, invoking_user_home().as_deref())?;
+    reject_unsafe_relocation_source(invoked, home.as_deref())?;
+    reject_unsafe_relocation_source(resolved, home.as_deref())?;
+
+    // The denylist above only rules out a fixed set of always-unsafe
+    // locations; trace the source's actual ownership back to root or the
+    // invoking user so an arbitrary writable directory outside that list
+    // (e.g. one set up by a different, untrusted local user) isn't trusted
+    // purely because its path isn't on the denylist.
+    let invoking_uid = invoking_user_uid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine the invoking user (SUDO_USER is unset); run this via \
+             `sudo wgd launchd install` from your normal account"
+        )
+    })?;
+    require_owned_by_invoking_user_or_root(invoked, invoking_uid)?;
+    require_owned_by_invoking_user_or_root(resolved, invoking_uid)?;
+
     let source = resolved;
 
     let target = Path::new(TRUSTED_BIN_PATH);
@@ -816,5 +888,86 @@ mod tests {
             Some(Path::new("/opt/home/andi")),
         )
         .is_err());
+    }
+
+    #[test]
+    fn ownership_check_accepts_files_owned_by_the_invoking_user() {
+        let dir = std::env::temp_dir().join(format!("wgd-reloc-owner-ok-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wgd");
+        fs::write(&file, b"").unwrap();
+
+        assert!(require_owned_by_invoking_user_or_root(&file, Uid::current()).is_ok());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_check_rejects_a_source_owned_by_someone_else() {
+        // Simulates the attack the relocation ownership check exists to
+        // block: a source path that passes the static denylist (it isn't
+        // /Users, /tmp, etc.) but is owned by neither root nor the user who
+        // ran sudo -- e.g. another local user's files under an
+        // admin-writable prefix such as /opt/local/bin.
+        let dir = std::env::temp_dir().join(format!("wgd-reloc-owner-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wgd");
+        fs::write(&file, b"").unwrap();
+
+        let not_owner = Uid::from_raw(Uid::current().as_raw().wrapping_add(1));
+        assert!(require_owned_by_invoking_user_or_root(&file, not_owner).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_check_rejects_world_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wgd-reloc-ww-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let file = dir.join("wgd");
+        fs::write(&file, b"").unwrap();
+
+        assert!(require_owned_by_invoking_user_or_root(&file, Uid::current()).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_check_accepts_a_symlink_owned_by_the_invoking_user() {
+        // Mirrors Homebrew's own layout: `bin/wgd` is a symlink into the
+        // Cellar. The symlink entry itself must still pass ownership, but
+        // being a symlink at all must not be an automatic rejection.
+        let dir = std::env::temp_dir().join(format!("wgd-reloc-symlink-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real-wgd");
+        fs::write(&real, b"").unwrap();
+        let link = dir.join("wgd");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(require_owned_by_invoking_user_or_root(&link, Uid::current()).is_ok());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_check_rejects_a_symlink_owned_by_someone_else() {
+        // The symlink entry's own ownership is still checked: an
+        // attacker-owned symlink sitting in an otherwise-trusted directory
+        // must not be trusted just because the directory around it is fine.
+        let dir =
+            std::env::temp_dir().join(format!("wgd-reloc-symlink-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real-wgd");
+        fs::write(&real, b"").unwrap();
+        let link = dir.join("wgd");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let not_owner = Uid::from_raw(Uid::current().as_raw().wrapping_add(1));
+        assert!(require_owned_by_invoking_user_or_root(&link, not_owner).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
