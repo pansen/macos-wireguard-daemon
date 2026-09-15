@@ -92,7 +92,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Compute formula values
+      - name: Compute cask values
         id: vars
         shell: bash
         run: |
@@ -104,6 +104,7 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/pansen/macos-wireguard-daemon/releases/download/${tag}/${asset}" >> "$GITHUB_OUTPUT"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          echo "asset_dir=${asset%.tar.gz}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-tap
         uses: actions/checkout@v7
@@ -112,15 +113,17 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
-      - name: Render formula
+      - name: Render cask
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p tap/Formula
+          mkdir -p tap/Casks
           sed \
+            -e "s|__VERSION__|${{ steps.vars.outputs.version }}|" \
             -e "s|__URL__|${{ steps.vars.outputs.url }}|" \
             -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
-            packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Formula/macos-wireguard-daemon.rb
+            -e "s|__ASSET_DIR__|${{ steps.vars.outputs.asset_dir }}|" \
+            packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Casks/macos-wireguard-daemon.rb
 
       - name: Commit and push
         shell: bash
@@ -129,9 +132,10 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/macos-wireguard-daemon.rb
+          git add Casks/macos-wireguard-daemon.rb
+          git rm -f --ignore-unmatch Formula/macos-wireguard-daemon.rb
           if git diff --cached --quiet; then
-            echo "No formula changes; skipping commit."
+            echo "No cask changes; skipping commit."
             exit 0
           fi
           git commit -m "macos-wireguard-daemon ${{ steps.vars.outputs.version }}"

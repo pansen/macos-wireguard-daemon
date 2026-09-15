@@ -36,17 +36,26 @@ it serves here as the technical base.
 Via Homebrew (Apple Silicon only):
 
 ```bash
-brew install pansen/tap/macos-wireguard-daemon
+brew install --cask pansen/tap/macos-wireguard-daemon
 ```
 
-This installs the `wgd` binary itself. The privileged launchd daemon refuses
-to run out of `/opt/homebrew` (root-owned locations only), so finish the
-setup with the commands `brew` prints after install:
+If you installed `wgd` before the tap switched from a Formula to a Cask, run
+`brew uninstall macos-wireguard-daemon` first: the old Formula's `bin/wgd`
+collides with the Cask's own binary symlink and the install above fails
+until it's gone.
 
-```bash
-sudo install -o root -g wheel -m 755 "$(brew --prefix)/bin/wgd" /usr/local/bin/wgd
-sudo /usr/local/bin/wgd launchd install
-```
+This installs `wgd` on your PATH and registers the privileged launchd
+daemon, prompting for your password once (via `sudo`) to do so. `brew
+upgrade` prompts again on every new release, to reinstall the daemon from
+the upgraded binary. `brew uninstall --zap macos-wireguard-daemon` removes
+the daemon, the `wgd` group, and its logs along with the package.
+
+The binary isn't notarized yet, so Gatekeeper may refuse to run it after a
+fresh install ("cannot be opened because the developer cannot be
+verified"). Until that's in place, install with
+`brew install --no-quarantine --cask pansen/tap/macos-wireguard-daemon`, or
+remove the quarantine flag yourself: `xattr -d com.apple.quarantine
+$(brew --prefix)/bin/wgd`.
 
 From source:
 
