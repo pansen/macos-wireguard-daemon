@@ -99,10 +99,14 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           version="${tag#v}"
-          asset="wgd-${tag}-aarch64-apple-darwin.tar.gz"
+          # The cask template builds both the download URL and the asset
+          # path from its own `version` stanza (via Ruby interpolation, so
+          # `brew audit` sees a versioned url instead of flagging a bare
+          # string as "unversioned"), so the uploaded asset must be named
+          # from this same v-stripped `version`, not the raw tag.
+          asset="wgd-${version}-aarch64-apple-darwin.tar.gz"
           sha256="$(cut -d' ' -f1 "dist/${asset}.sha256")"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "url=https://github.com/pansen/macos-wireguard-daemon/releases/download/${tag}/${asset}" >> "$GITHUB_OUTPUT"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
           echo "asset_dir=${asset%.tar.gz}" >> "$GITHUB_OUTPUT"
 
@@ -120,7 +124,6 @@ jobs:
           mkdir -p tap/Casks
           sed \
             -e "s|__VERSION__|${{ steps.vars.outputs.version }}|" \
-            -e "s|__URL__|${{ steps.vars.outputs.url }}|" \
             -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
             -e "s|__ASSET_DIR__|${{ steps.vars.outputs.asset_dir }}|" \
             packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Casks/macos-wireguard-daemon.rb
