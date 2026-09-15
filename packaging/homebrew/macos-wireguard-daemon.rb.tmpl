@@ -3,7 +3,7 @@ cask "macos-wireguard-daemon" do
   sha256 "__SHA256__"
 
   url "__URL__"
-  name "wgd"
+  name "macOS WireGuard Daemon"
   desc "Daemon for running WireGuard VPN tunnels on macOS"
   homepage "https://github.com/pansen/macos-wireguard-daemon"
 
@@ -18,9 +18,10 @@ cask "macos-wireguard-daemon" do
   }
 
   uninstall script: {
-    executable: "/usr/local/bin/wgd",
-    args:       ["launchd", "uninstall"],
-    sudo:       true,
+    executable:   "/usr/local/bin/wgd",
+    args:         ["launchd", "uninstall"],
+    sudo:         true,
+    must_succeed: false,
   }
 
   zap script: {

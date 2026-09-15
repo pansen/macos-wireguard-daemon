@@ -141,6 +141,16 @@ fn validate_one(path: &Path) -> anyhow::Result<()> {
 /// -- it's the one admin-writable location `install_time_binary_path`
 /// exists to relocate rather than reject, and it no longer needs to be
 /// named for that to work.
+///
+/// This is a lexical check, not a security boundary: the sudo gesture that
+/// runs `launchd install` already executed the source binary as root, so at
+/// best this is a foot-gun guard against an obviously wrong invocation
+/// (`ownership`/writability is what `require_owned_by_invoking_user_or_root`
+/// actually enforces). The `/System/Volumes/Data` entries below exist
+/// because `fs::canonicalize` resolves through the data volume firmlink
+/// without collapsing it back to the matching `/Users`, `/tmp`, or `/var`
+/// path, so both spellings need listing for the guard to catch the same
+/// locations either way.
 const RELOCATION_DENY_PREFIXES: &[&str] = &[
     "/Users/",
     "/tmp/",
@@ -149,6 +159,13 @@ const RELOCATION_DENY_PREFIXES: &[&str] = &[
     "/private/var/folders/",
     "/var/tmp/",
     "/private/var/tmp/",
+    "/System/Volumes/Data/Users/",
+    "/System/Volumes/Data/tmp/",
+    "/System/Volumes/Data/private/tmp/",
+    "/System/Volumes/Data/var/folders/",
+    "/System/Volumes/Data/private/var/folders/",
+    "/System/Volumes/Data/var/tmp/",
+    "/System/Volumes/Data/private/var/tmp/",
 ];
 
 /// Verify every ancestor of `path` is owned by root or by `invoking_uid` and
@@ -258,12 +275,10 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     require_root("install")?;
 
     // Validate everything that can refuse the install BEFORE mutating any
-    // system state (group creation, membership, directories, plist).
+    // system state (binary relocation, group creation, membership,
+    // directories, plist). A bad --plist-template must abort before
+    // install_time_binary_path() below ever touches /usr/local/bin/wgd.
     let user = invoking_user()?;
-    let bin = install_time_binary_path()?;
-    let bin_str = bin
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("wgd binary path is not valid UTF-8: {}", bin.display()))?;
     let template = match plist_template.as_deref() {
         Some(path) => fs::read_to_string(path)
             .with_context(|| format!("failed to read plist template {}", path.display()))?,
@@ -281,6 +296,10 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     );
 
     // --- system mutation begins here ---
+    let bin = install_time_binary_path()?;
+    let bin_str = bin
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("wgd binary path is not valid UTF-8: {}", bin.display()))?;
     let (gid, member_added) = ensure_group_with_member(&user)?;
     ensure_directories(gid)?;
     register_authorization_right()?;
@@ -341,13 +360,17 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     remove_file_ignore_missing(&config::privileged_socket_path())?;
 
     println!("wgd privileged daemon uninstalled.");
-    println!("Intentionally kept (remove with `make purge/privileged` for a full removal):");
+    println!("Intentionally kept (this only unregisters the daemon):");
     println!("  the wgd binary");
     println!("  the wgd group");
     println!("  {}", config::root_log_dir().display());
     println!(
         "  the runtime directory ({})",
         config::privileged_socket_dir().display()
+    );
+    println!(
+        "For a full removal: `brew uninstall --zap macos-wireguard-daemon` (Homebrew installs) \
+         or `make purge/privileged` (installs from source)."
     );
     Ok(())
 }
@@ -469,21 +492,33 @@ fn daemon_binary_path() -> anyhow::Result<PathBuf> {
 /// and normally rejected by `validate_binary_location`), copy it into
 /// `TRUSTED_BIN_PATH` first instead of failing, as long as it isn't coming
 /// from a location that's always attacker-controlled (see
-/// `RELOCATION_DENY_PREFIXES`). `cmd_restart`/`cmd_uninstall` keep using the
-/// strict, non-relocating `daemon_binary_path` so a missing trusted copy
-/// still fails loudly there instead of silently re-copying on every restart.
+/// `RELOCATION_DENY_PREFIXES`). `cmd_restart` keeps using the strict,
+/// non-relocating `daemon_binary_path` so a missing trusted copy still fails
+/// loudly there instead of silently re-copying on every restart;
+/// `cmd_uninstall` doesn't resolve the binary at all, since removing the
+/// launchd registration doesn't need to know where it lives.
 fn install_time_binary_path() -> anyhow::Result<PathBuf> {
     let ResolvedBinary { invoked, resolved } = resolve_current_exe()?;
-    let already_trusted = validate_binary_location(&invoked, &resolved).is_ok()
+    let location_valid = validate_binary_location(&invoked, &resolved).is_ok();
+    let root_owned = location_valid
         && crate::trusted_exec::validate_root_owned_path(
             &invoked,
             crate::trusted_exec::TrustedPath::Executable,
         )
         .is_ok();
-    if already_trusted {
+    if !should_relocate(location_valid, root_owned) {
         return Ok(invoked);
     }
     relocate_to_trusted_path(&invoked, &resolved)
+}
+
+/// Whether `install_time_binary_path` must relocate the running binary
+/// before trusting it. Split out from the two filesystem checks that feed
+/// it so the decision itself is coverable by a plain unit test: the checks
+/// need real (and, for `root_owned`, often root-owned) files on disk to
+/// exercise, which a normal, non-root test run can't set up.
+fn should_relocate(location_valid: bool, root_owned: bool) -> bool {
+    !(location_valid && root_owned)
 }
 
 /// Copy `source` into `TRUSTED_BIN_PATH`, root:wheel 0755, atomically (temp
@@ -541,6 +576,14 @@ fn relocate_to_trusted_path(invoked: &Path, resolved: &Path) -> anyhow::Result<P
     let relocate_result = (|| -> anyhow::Result<()> {
         fs::copy(source, &tmp)
             .with_context(|| format!("failed to copy {} to {}", source.display(), tmp.display()))?;
+        // Homebrew propagates the com.apple.quarantine xattr from the cask
+        // download onto every staged file, and fs::copy's clonefile fast
+        // path (same-volume copies) preserves xattrs, so it would otherwise
+        // carry over into this root-owned copy and have Gatekeeper block
+        // every later launchd restart of it. Best-effort: builds from
+        // source, or an already-unquarantined source, simply don't have the
+        // attribute to remove.
+        strip_quarantine_attribute(&tmp);
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to chmod {}", tmp.display()))?;
         chown(&tmp, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
@@ -568,6 +611,20 @@ fn relocate_to_trusted_path(invoked: &Path, resolved: &Path) -> anyhow::Result<P
         source.display()
     );
     Ok(target.to_path_buf())
+}
+
+/// Remove the `com.apple.quarantine` extended attribute from `path`, if
+/// present. Best-effort: `/usr/bin/xattr -d` exits non-zero when the
+/// attribute is already absent, which is the common case for a from-source
+/// build and isn't an error worth failing the install over.
+fn strip_quarantine_attribute(path: &Path) {
+    let _ = std::process::Command::new("/usr/bin/xattr")
+        .arg("-d")
+        .arg("com.apple.quarantine")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Ensure the `wgd` group exists and that `user` is a member, returning
@@ -969,5 +1026,29 @@ mod tests {
         assert!(require_owned_by_invoking_user_or_root(&link, not_owner).is_err());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_relocate_only_when_both_checks_pass() {
+        assert!(!should_relocate(true, true));
+        assert!(should_relocate(true, false));
+        assert!(should_relocate(false, true));
+        assert!(should_relocate(false, false));
+    }
+
+    #[test]
+    fn relocation_source_check_also_denies_data_volume_firmlink_spellings() {
+        // /System/Volumes/Data/... is the same location as /..., reached
+        // through the data volume firmlink that fs::canonicalize resolves
+        // through without collapsing back to the shorter spelling.
+        assert!(reject_unsafe_relocation_source(
+            Path::new("/System/Volumes/Data/Users/andi/wgd"),
+            None,
+        )
+        .is_err());
+        assert!(
+            reject_unsafe_relocation_source(Path::new("/System/Volumes/Data/tmp/wgd"), None,)
+                .is_err()
+        );
     }
 }
