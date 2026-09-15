@@ -39,14 +39,11 @@ Via Homebrew (Apple Silicon only):
 brew install pansen/tap/macos-wireguard-daemon
 ```
 
-This installs the `wgd` binary itself. The privileged launchd daemon refuses
-to run out of `/opt/homebrew` (root-owned locations only), so finish the
-setup with the commands `brew` prints after install:
-
-```bash
-sudo install -o root -g wheel -m 755 "$(brew --prefix)/bin/wgd" /usr/local/bin/wgd
-sudo /usr/local/bin/wgd launchd install
-```
+This installs `wgd` on your PATH and registers the privileged launchd
+daemon, prompting for your password once (via `sudo`) to do so. `brew
+upgrade` prompts again on every new release, to reinstall the daemon from
+the upgraded binary. `brew uninstall --zap macos-wireguard-daemon` removes
+the daemon, the `wgd` group, and its logs along with the package.
 
 From source:
 
