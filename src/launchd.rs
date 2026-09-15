@@ -74,29 +74,74 @@ fn render_plist_from(template: &str, daemon_binary: &str, gid: u32) -> anyhow::R
     Ok(rendered)
 }
 
-/// Reject binaries in locations a regular user controls.
+/// Directories a root launchd job may run its binary from. Fixed, system
+/// directories only: the same ones `trusted_exec::SYSTEM_PATH` trusts for
+/// command resolution (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), plus
+/// `/usr/local/bin` (`TRUSTED_BIN_PATH`, wgd's own install location).
 ///
 /// The rendered plist makes launchd run this binary as root, so both the
 /// path as invoked (e.g. `current_exe()`) and its canonicalized/symlink-
-/// resolved target must live in a location that isn't writable by an
-/// unprivileged user — otherwise a user could swap the binary out from
-/// under root's launchd.
+/// resolved target must live directly inside one of these -- otherwise a
+/// user could swap the binary out from under root's launchd.
 ///
-/// Finding 3 — Executable substitution through PATH: these lexical checks
-/// reject known user-controlled locations. The installer additionally checks
-/// ownership and write permissions of the actual binary and its ancestors.
-pub fn validate_binary_location(
-    invoked: &Path,
-    resolved: &Path,
-    invoking_user_home: Option<&Path>,
-) -> anyhow::Result<()> {
-    validate_one(invoked, invoking_user_home)?;
-    validate_one(resolved, invoking_user_home)?;
+/// Finding 3 — Executable substitution through PATH: an allow-list of the
+/// small, fixed set of directories root is expected to control, rather than
+/// an open-ended (and inevitably incomplete) list of locations to reject.
+/// The installer additionally checks ownership and write permissions of the
+/// actual binary and its ancestors (`trusted_exec::validate_root_owned_path`).
+const ALLOWED_BINARY_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin"];
+
+/// Where a not-yet-trusted binary is copied to before it's trusted.
+/// Matches the Makefile's `WGD_BIN` convention.
+const TRUSTED_BIN_PATH: &str = "/usr/local/bin/wgd";
+
+pub fn validate_binary_location(invoked: &Path, resolved: &Path) -> anyhow::Result<()> {
+    validate_one(invoked)?;
+    validate_one(resolved)?;
     Ok(())
 }
 
-const REJECTED_PREFIXES: &[&str] = &[
-    "/opt/homebrew/",
+fn validate_one(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "refusing to install a launchd daemon that runs a non-absolute path ({}); \
+             install a build from a system location such as /usr/local/bin with root-owned parent directories",
+            path.display()
+        );
+    }
+
+    let in_allowed_dir = path.parent().is_some_and(|parent| {
+        ALLOWED_BINARY_DIRS
+            .iter()
+            .any(|dir| parent == Path::new(dir))
+    });
+    if !in_allowed_dir {
+        anyhow::bail!(
+            "refusing to install a launchd daemon that runs a binary from an untrusted \
+             location ({}); place the wgd binary directly in one of: {}",
+            path.display(),
+            ALLOWED_BINARY_DIRS.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Locations `install_time_binary_path` refuses to relocate from: a regular
+/// user's home directory, `/tmp`, and `/var/folders` are always
+/// attacker-controlled, so copying a binary from one of these into a
+/// root-owned, launchd-trusted path would be a privilege escalation
+/// regardless of ownership.
+///
+/// This can't be expressed as an allow-list like `ALLOWED_BINARY_DIRS`
+/// above: relocation exists precisely to accept binaries from *outside*
+/// that fixed set (Homebrew's prefix, wherever it resolves to on this
+/// machine, being the motivating case), so the set of acceptable sources is
+/// open-ended by design. Homebrew's prefix is deliberately not in this list
+/// -- it's the one admin-writable location `install_time_binary_path`
+/// exists to relocate rather than reject, and it no longer needs to be
+/// named for that to work.
+const RELOCATION_DENY_PREFIXES: &[&str] = &[
     "/Users/",
     "/tmp/",
     "/private/tmp/",
@@ -106,7 +151,10 @@ const REJECTED_PREFIXES: &[&str] = &[
     "/private/var/tmp/",
 ];
 
-fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Result<()> {
+fn reject_unsafe_relocation_source(
+    path: &Path,
+    invoking_user_home: Option<&Path>,
+) -> anyhow::Result<()> {
     if !path.is_absolute() {
         anyhow::bail!(
             "refusing to install a launchd daemon that runs a non-absolute path ({}); \
@@ -117,7 +165,7 @@ fn validate_one(path: &Path, invoking_user_home: Option<&Path>) -> anyhow::Resul
 
     let path_str = path.to_string_lossy();
 
-    for prefix in REJECTED_PREFIXES {
+    for prefix in RELOCATION_DENY_PREFIXES {
         if path_str.starts_with(prefix) {
             anyhow::bail!(
                 "refusing to install a launchd daemon that runs a binary from a user-writable \
@@ -165,7 +213,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     // Validate everything that can refuse the install BEFORE mutating any
     // system state (group creation, membership, directories, plist).
     let user = invoking_user()?;
-    let bin = daemon_binary_path()?;
+    let bin = install_time_binary_path()?;
     let bin_str = bin
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("wgd binary path is not valid UTF-8: {}", bin.display()))?;
@@ -313,10 +361,9 @@ fn require_root(cmd_hint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Home directory of the user who invoked `sudo`, if any. Used only to feed
-/// `validate_binary_location`'s third argument so non-standard home
-/// locations are still covered; the function's static prefix denylist
-/// applies regardless.
+/// Home directory of the user who invoked `sudo`, if any. Used only by
+/// `reject_unsafe_relocation_source` to catch a home directory that isn't
+/// under the standard `/Users/` prefix its static denylist matches.
 fn invoking_user_home() -> Option<PathBuf> {
     let user = std::env::var("SUDO_USER").ok()?;
     User::from_name(&user).ok().flatten().map(|u| u.dir)
@@ -334,19 +381,121 @@ fn invoking_user() -> anyhow::Result<String> {
     }
 }
 
-/// Validate the installed daemon and its parents before placing its path in a
-/// root launchd job. The executable must be a regular file, not a Homebrew link.
-fn daemon_binary_path() -> anyhow::Result<PathBuf> {
+struct ResolvedBinary {
+    invoked: PathBuf,
+    resolved: PathBuf,
+}
+
+/// Resolve `current_exe()` and its symlink target, without validating either.
+fn resolve_current_exe() -> anyhow::Result<ResolvedBinary> {
     let invoked =
         std::env::current_exe().context("failed to determine the running wgd binary path")?;
     let resolved = fs::canonicalize(&invoked)
         .with_context(|| format!("failed to resolve {}", invoked.display()))?;
-    validate_binary_location(&invoked, &resolved, invoking_user_home().as_deref())?;
+    Ok(ResolvedBinary { invoked, resolved })
+}
+
+/// Validate the installed daemon and its parents before placing its path in a
+/// root launchd job. The executable must be a regular file, not a Homebrew link.
+fn daemon_binary_path() -> anyhow::Result<PathBuf> {
+    let ResolvedBinary { invoked, resolved } = resolve_current_exe()?;
+    validate_binary_location(&invoked, &resolved)?;
     crate::trusted_exec::validate_root_owned_path(
         &invoked,
         crate::trusted_exec::TrustedPath::Executable,
     )?;
     Ok(invoked)
+}
+
+/// Like `daemon_binary_path`, but used only by `cmd_install`: when the
+/// running binary isn't already at a trusted, root-owned location (e.g. a
+/// plain `brew install` or a Cask's `staged_path`, both admin/group-writable
+/// and normally rejected by `validate_binary_location`), copy it into
+/// `TRUSTED_BIN_PATH` first instead of failing, as long as it isn't coming
+/// from a location that's always attacker-controlled (see
+/// `RELOCATION_DENY_PREFIXES`). `cmd_restart`/`cmd_uninstall` keep using the
+/// strict, non-relocating `daemon_binary_path` so a missing trusted copy
+/// still fails loudly there instead of silently re-copying on every restart.
+fn install_time_binary_path() -> anyhow::Result<PathBuf> {
+    let ResolvedBinary { invoked, resolved } = resolve_current_exe()?;
+    let already_trusted = validate_binary_location(&invoked, &resolved).is_ok()
+        && crate::trusted_exec::validate_root_owned_path(
+            &invoked,
+            crate::trusted_exec::TrustedPath::Executable,
+        )
+        .is_ok();
+    if already_trusted {
+        return Ok(invoked);
+    }
+    relocate_to_trusted_path(&invoked, &resolved)
+}
+
+/// Copy `source` into `TRUSTED_BIN_PATH`, root:wheel 0755, atomically (temp
+/// file + rename, mirroring `write_plist`). `install_time_binary_path` calls
+/// this for a binary that isn't yet at a trusted location -- typically
+/// Homebrew's admin/group-writable prefix -- so this copy is what lets a
+/// root-run launchd job trust the binary afterward. It runs under the same
+/// `sudo` gesture that already authorizes the rest of `launchd install`, the
+/// same trust `sudo install ... /usr/local/bin/wgd` gave it by hand before
+/// this existed.
+fn relocate_to_trusted_path(invoked: &Path, resolved: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Still refuse sources that are always attacker-controlled, regardless
+    // of the ownership check above having failed on them too.
+    reject_unsafe_relocation_source(invoked, invoking_user_home().as_deref())?;
+    reject_unsafe_relocation_source(resolved, invoking_user_home().as_deref())?;
+    let source = resolved;
+
+    let target = Path::new(TRUSTED_BIN_PATH);
+    let target_dir = target
+        .parent()
+        .expect("TRUSTED_BIN_PATH has a parent directory");
+
+    fs::create_dir_all(target_dir)
+        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    crate::trusted_exec::validate_root_owned_path(
+        target_dir,
+        crate::trusted_exec::TrustedPath::Directory,
+    )
+    .with_context(|| {
+        format!(
+            "cannot relocate the wgd binary into {}",
+            target_dir.display()
+        )
+    })?;
+
+    let tmp = PathBuf::from(format!("{TRUSTED_BIN_PATH}.tmp"));
+    let relocate_result = (|| -> anyhow::Result<()> {
+        fs::copy(source, &tmp)
+            .with_context(|| format!("failed to copy {} to {}", source.display(), tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+        chown(&tmp, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+            .with_context(|| format!("failed to chown {}", tmp.display()))?;
+        fs::rename(&tmp, target)
+            .with_context(|| format!("failed to install {}", target.display()))?;
+        Ok(())
+    })();
+
+    if relocate_result.is_err() {
+        // Best-effort cleanup; ignore errors.
+        let _ = fs::remove_file(&tmp);
+    }
+    relocate_result?;
+
+    crate::trusted_exec::validate_root_owned_path(
+        target,
+        crate::trusted_exec::TrustedPath::Executable,
+    )
+    .context("relocated wgd binary still failed the trusted-path check")?;
+
+    println!(
+        "Copied wgd to {TRUSTED_BIN_PATH} (root-owned; launchd daemons cannot run from \
+         {} since it isn't root-owned).",
+        source.display()
+    );
+    Ok(target.to_path_buf())
 }
 
 /// Ensure the `wgd` group exists and that `user` is a member, returning
@@ -560,16 +709,13 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/Users/andi/p/wgd/target/release/wgd"),
             Path::new("/Users/andi/p/wgd/target/release/wgd"),
-            None,
         )
         .is_err());
     }
 
     #[test]
     fn rejects_tmp() {
-        assert!(
-            validate_binary_location(Path::new("/tmp/wgd"), Path::new("/tmp/wgd"), None).is_err()
-        );
+        assert!(validate_binary_location(Path::new("/tmp/wgd"), Path::new("/tmp/wgd")).is_err());
     }
 
     #[test]
@@ -577,7 +723,6 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/private/var/folders/xx/wgd"),
             Path::new("/private/var/folders/xx/wgd"),
-            None,
         )
         .is_err());
     }
@@ -587,14 +732,13 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/var/tmp/wgd"),
             Path::new("/private/var/tmp/wgd"),
-            None,
         )
         .is_err());
     }
 
     #[test]
     fn rejects_relative_path() {
-        assert!(validate_binary_location(Path::new("wgd"), Path::new("wgd"), None).is_err());
+        assert!(validate_binary_location(Path::new("wgd"), Path::new("wgd")).is_err());
     }
 
     #[test]
@@ -604,29 +748,42 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/usr/local/bin/wgd"),
             Path::new("/Users/andi/target/release/wgd"),
-            None,
         )
         .is_err());
     }
 
     #[test]
-    fn rejects_non_standard_home_via_invoking_user_home() {
+    fn rejects_custom_system_directory_outside_allow_list() {
+        // Not a home directory or /tmp -- just some other system path that
+        // isn't one of the fixed ALLOWED_BINARY_DIRS.
         assert!(validate_binary_location(
-            Path::new("/opt/home/andi/wgd"),
-            Path::new("/opt/home/andi/wgd"),
-            Some(Path::new("/opt/home/andi")),
+            Path::new("/opt/wgd/bin/wgd"),
+            Path::new("/opt/wgd/bin/wgd"),
         )
         .is_err());
     }
 
     #[test]
-    fn accepts_usr_local_bin() {
+    fn rejects_nested_subdirectory_of_an_allowed_dir() {
+        // Allowed dirs hold binaries directly; a subdirectory underneath
+        // one isn't itself an allowed location.
         assert!(validate_binary_location(
-            Path::new("/usr/local/bin/wgd"),
-            Path::new("/usr/local/bin/wgd"),
-            None,
+            Path::new("/usr/local/bin/extra/wgd"),
+            Path::new("/usr/local/bin/extra/wgd"),
         )
-        .is_ok());
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_every_allowed_binary_dir() {
+        for dir in ALLOWED_BINARY_DIRS {
+            let path = Path::new(dir).join("wgd");
+            assert!(
+                validate_binary_location(&path, &path).is_ok(),
+                "{} should be accepted",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -634,7 +791,29 @@ mod tests {
         assert!(validate_binary_location(
             Path::new("/opt/homebrew/bin/wgd"),
             Path::new("/opt/homebrew/Cellar/wgd/0.9.0/bin/wgd"),
-            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn relocation_source_check_allows_homebrew_but_not_user_controlled_locations() {
+        // Homebrew's prefix (Apple Silicon here, but the point is that it's
+        // not name-checked at all) is relocation-eligible...
+        assert!(reject_unsafe_relocation_source(Path::new("/opt/homebrew/bin/wgd"), None).is_ok());
+        // ...as is some other admin-writable, non-Homebrew prefix, since the
+        // check no longer depends on matching Homebrew's literal path.
+        assert!(reject_unsafe_relocation_source(Path::new("/opt/local/bin/wgd"), None).is_ok());
+        // But genuinely user-controlled locations stay denied even for
+        // relocation.
+        assert!(reject_unsafe_relocation_source(Path::new("/Users/andi/wgd"), None).is_err());
+        assert!(reject_unsafe_relocation_source(Path::new("/tmp/wgd"), None).is_err());
+        assert!(
+            reject_unsafe_relocation_source(Path::new("/private/var/folders/xx/wgd"), None,)
+                .is_err()
+        );
+        assert!(reject_unsafe_relocation_source(
+            Path::new("/opt/home/andi/wgd"),
+            Some(Path::new("/opt/home/andi")),
         )
         .is_err());
     }
