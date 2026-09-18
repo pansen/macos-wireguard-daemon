@@ -167,7 +167,7 @@ struct MacosNetworkFingerprint {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct MacosRoute {
     is_ipv6: bool,
     destination: String,
@@ -543,6 +543,7 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                                 let routes_changed = macos_reconcile_routes(&state);
                                 let dns_changed = macos_reconcile_dns(&state);
                                 if routes_changed || dns_changed {
+                                    log_macos_network_diagnostics("after_reconcile", &state.reconcile);
                                     log_macos_network_overview("reconcile", &state);
                                 }
                             })
@@ -906,10 +907,20 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
     trace!(command = %format_command_for_log(name, args), "userspace_helper_command");
-    crate::trusted_exec::command(name)?
+    let output = crate::trusted_exec::command(name)?
         .args(args)
         .output()
-        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
+        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))?;
+    if !output.status.success() {
+        debug!(
+            command = %format_command_for_log(name, args),
+            status = %output.status,
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_command_failed"
+        );
+    }
+    Ok(output)
 }
 
 #[cfg(unix)]
@@ -949,6 +960,7 @@ fn configure_network_macos(
         has_ipv4_address,
         has_ipv6_address,
     };
+    log_macos_network_diagnostics("before_connect", &inputs);
 
     let mut routes_added: Vec<MacosRoute> = Vec::new();
     let mut dns_services: Vec<MacosDnsServiceState> = Vec::new();
@@ -1287,7 +1299,13 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
     // a physical interface's connected LAN route, and taking the prefix from a
     // LAN we are attached to makes that whole LAN unreachable.
     if route.interface.is_some() && route.gateway.is_none() {
-        match macos_route_destination(route).and_then(macos_route_table_entry) {
+        let entry = macos_route_destination(route).and_then(macos_route_table_entry);
+        debug!(
+            destination = route.destination,
+            existing_entry = ?entry,
+            "userspace_helper_route_install_lookup"
+        );
+        match entry {
             Some(entry) if !entry.is_tunnel_owned() => {
                 debug!(
                     destination = %route.destination,
@@ -1310,7 +1328,8 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
         }
     }
 
-    run_command_with_exists_ok("route", &refs)?;
+    let created = run_command_with_exists_ok("route", &refs)?;
+    debug!(route = ?route, created, "userspace_helper_route_install_result");
     Ok(MacosRouteInstall::Owned)
 }
 
@@ -1487,6 +1506,13 @@ fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
     args.push(route.destination.clone());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_command_capture_output("route", &refs)?;
+    debug!(
+        route = ?route,
+        status = %output.status,
+        stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+        "userspace_helper_route_delete_result"
+    );
     if output.status.success() {
         return Ok(());
     }
@@ -1808,6 +1834,14 @@ fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
 
     let desired = macos_desired_routes(inputs, &fingerprint);
     let current = routing.routes_added.clone();
+    debug!(
+        interface = inputs.interface,
+        previous_routes = ?current,
+        desired_routes = ?desired,
+        endpoint_pin = inputs.endpoint_needs_pin,
+        "userspace_helper_route_reconcile_plan"
+    );
+    log_macos_network_diagnostics("before_route_reconcile", inputs);
     let mut installed: Vec<MacosRoute> = Vec::new();
     let (mut added, mut removed, mut errors) = (0usize, 0usize, 0usize);
 
@@ -1997,7 +2031,10 @@ fn macos_current_dns_fingerprint() -> anyhow::Result<MacosDnsFingerprint> {
     let mut observed = Vec::with_capacity(services.len());
     for svc in &services {
         // None on error → treat as "unknown/unset"; never panic the tick.
-        let dns = get_macos_dns_servers(svc).ok().flatten();
+        let dns = get_macos_dns_servers(svc).unwrap_or_else(|error| {
+            debug!(service = svc, error = %error, "userspace_helper_dns_read_failed");
+            None
+        });
         observed.push((svc.clone(), dns));
     }
 
@@ -2133,6 +2170,20 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     }
 
     let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
+    debug!(
+        interface = inputs.interface,
+        primary_service = ?fingerprint.primary_service,
+        fallback_to_all_services = collision.is_none()
+            && DNS_POLICY == DnsPolicy::PrimaryOnly
+            && !fingerprint.primary_service.as_ref().is_some_and(|primary| fingerprint.services.contains(primary)),
+        tunnel_dns = ?inputs.dns_servers,
+        previous_observed_dns = ?previous.observed,
+        observed_dns = ?fingerprint.observed,
+        owned_services = ?owned,
+        target_services = ?targets,
+        actions = ?actions,
+        "userspace_helper_dns_reconcile_plan"
+    );
 
     let (mut applied, mut captured, mut restored, mut dropped, mut errors) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -2239,20 +2290,35 @@ fn scutil_global_primary_interface() -> Option<String> {
         .expect("system command is approved")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_spawn_failed"))
         .ok()?;
     child
         .stdin
         .as_mut()?
         .write_all(b"show State:/Network/Global/IPv4\n")
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_write_failed"))
         .ok()?;
     // `wait_with_output` closes stdin first, so scutil sees EOF and exits.
-    let output = child.wait_with_output().ok()?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_wait_failed"))
+        .ok()?;
     if !output.status.success() {
+        debug!(
+            status = %output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_primary_interface_read_failed"
+        );
         return None;
     }
-    parse_scutil_primary_interface(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let primary = parse_scutil_primary_interface(&text);
+    if primary.is_none() {
+        debug!(state = %text.trim(), "userspace_helper_primary_interface_missing");
+    }
+    primary
 }
 
 /// Parse `PrimaryInterface : en0` out of `scutil show State:/Network/Global/IPv4`.
@@ -2278,7 +2344,82 @@ fn macos_service_name_for_device(device: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    parse_service_name_for_device(&String::from_utf8_lossy(&output.stdout), device)
+    let text = String::from_utf8_lossy(&output.stdout);
+    let service = parse_service_name_for_device(&text, device);
+    if service.is_none() {
+        debug!(device, service_order = %text.trim(), "userspace_helper_primary_service_unmapped");
+    }
+    service
+}
+
+/// Read-only snapshots around network changes. Unlike the overview's owned-route
+/// list, these show actual kernel routes (including split-tunnel default routes),
+/// physical addresses/link state and DHCP's last received packet. The commands
+/// are sequential observations, not an atomic snapshot or a live DHCP capture.
+/// Keep them off steady-state ticks and skip all work unless DEBUG is enabled.
+#[cfg(target_os = "macos")]
+fn log_macos_network_diagnostics(reason: &str, inputs: &MacosReconcileInputs) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let endpoint = inputs.endpoint.to_string();
+    let family = if inputs.endpoint_is_ipv6 {
+        "-inet6"
+    } else {
+        "-inet"
+    };
+    for (command, args) in [
+        ("ifconfig", vec![]),
+        ("scutil", vec!["--nwi"]),
+        ("scutil", vec!["--dns"]),
+        ("netstat", vec!["-rn"]),
+        ("route", vec!["-n", "get", "-inet", "default"]),
+        ("route", vec!["-n", "get", "-inet6", "default"]),
+        ("route", vec!["-n", "get", family, endpoint.as_str()]),
+    ] {
+        log_macos_diagnostic_command(reason, &inputs.interface, command, &args);
+    }
+    // Include IPv6-only and link-local-only physical interfaces, since their
+    // missing IPv4 lease is precisely what we need to investigate after wake.
+    let mut devices: Vec<String> = macos_connected_subnets_by_device(&inputs.interface)
+        .into_iter()
+        .map(|(device, _)| device)
+        .collect();
+    devices.sort();
+    devices.dedup();
+    for device in devices {
+        log_macos_diagnostic_command(
+            reason,
+            &inputs.interface,
+            "ipconfig",
+            &["getpacket", &device],
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn log_macos_diagnostic_command(reason: &str, interface: &str, name: &str, args: &[&str]) {
+    let started = std::time::Instant::now();
+    match run_command_capture_output(name, args) {
+        Ok(output) => debug!(
+            reason,
+            interface,
+            command = %format_command_for_log(name, args),
+            status = %output.status,
+            elapsed_ms = started.elapsed().as_millis(),
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_network_diagnostic"
+        ),
+        Err(error) => debug!(
+            reason,
+            interface,
+            command = %format_command_for_log(name, args),
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %error,
+            "userspace_helper_network_diagnostic_failed"
+        ),
+    }
 }
 
 /// Parse `networksetup -listnetworkserviceorder` output, returning the service
@@ -2944,7 +3085,18 @@ fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (Ip
         .output()
     {
         Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
+        Ok(output) => {
+            debug!(
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "userspace_helper_ifconfig_read_failed"
+            );
+            return Vec::new();
+        }
+        Err(error) => {
+            debug!(error = %error, "userspace_helper_ifconfig_read_failed");
+            return Vec::new();
+        }
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut subnets = Vec::new();

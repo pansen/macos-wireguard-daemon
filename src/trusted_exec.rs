@@ -65,6 +65,8 @@ pub fn command(name: &str) -> io::Result<Command> {
     let path = match name {
         "ifconfig" | "route" => PathBuf::from("/sbin").join(name),
         "networksetup" | "scutil" => PathBuf::from("/usr/sbin").join(name),
+        #[cfg(target_os = "macos")]
+        "netstat" | "ipconfig" => PathBuf::from("/usr/sbin").join(name),
         "id" => PathBuf::from("/usr/bin/id"),
         // Interpreter for a connection's PreUp/PostUp/PreDown/PostDown hook
         // lines (see `privileged::connection_ops::run_hook`). The hook
