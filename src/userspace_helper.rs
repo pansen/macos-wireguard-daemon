@@ -167,7 +167,7 @@ struct MacosNetworkFingerprint {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct MacosRoute {
     is_ipv6: bool,
     destination: String,
@@ -543,6 +543,7 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                                 let routes_changed = macos_reconcile_routes(&state);
                                 let dns_changed = macos_reconcile_dns(&state);
                                 if routes_changed || dns_changed {
+                                    log_macos_network_diagnostics("after_reconcile", &state.reconcile);
                                     log_macos_network_overview("reconcile", &state);
                                 }
                             })
@@ -906,10 +907,20 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
 #[cfg(unix)]
 fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
     trace!(command = %format_command_for_log(name, args), "userspace_helper_command");
-    crate::trusted_exec::command(name)?
+    let output = crate::trusted_exec::command(name)?
         .args(args)
         .output()
-        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
+        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))?;
+    if !output.status.success() {
+        debug!(
+            command = %format_command_for_log(name, args),
+            status = %output.status,
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_command_failed"
+        );
+    }
+    Ok(output)
 }
 
 #[cfg(unix)]
@@ -949,6 +960,7 @@ fn configure_network_macos(
         has_ipv4_address,
         has_ipv6_address,
     };
+    log_macos_network_diagnostics("before_connect", &inputs);
 
     let mut routes_added: Vec<MacosRoute> = Vec::new();
     let mut dns_services: Vec<MacosDnsServiceState> = Vec::new();
@@ -1287,31 +1299,125 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
     // a physical interface's connected LAN route, and taking the prefix from a
     // LAN we are attached to makes that whole LAN unreachable.
     if route.interface.is_some() && route.gateway.is_none() {
-        match macos_route_destination(route).and_then(macos_route_table_entry) {
+        let entry = macos_route_destination(route).and_then(macos_route_table_entry);
+        debug!(
+            destination = route.destination,
+            existing_entry = ?entry,
+            "userspace_helper_route_install_lookup"
+        );
+        match entry {
             Some(entry) if !entry.is_tunnel_owned() => {
-                debug!(
+                let holder = entry.interface.clone();
+                let tunnel = route.interface.as_deref().unwrap_or("");
+                // A read failure leaves us unable to tell a live physical
+                // route from a stale one; default to leaving it alone rather
+                // than risking deletion of a LAN route that is still in use.
+                let is_live = match macos_connected_subnets_by_device(tunnel) {
+                    Some(connected) => macos_route_entry_is_live(&entry, &connected),
+                    None => {
+                        debug!(
+                            destination = %route.destination,
+                            "userspace_helper_route_liveness_check_skipped_ifconfig_failed"
+                        );
+                        true
+                    }
+                };
+                if is_live {
+                    debug!(
+                        destination = %route.destination,
+                        holder = holder.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_prefix_held_by_physical_interface"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
+                // The holder has no address in the prefix: a leftover from a
+                // network we since left, which would blackhole the prefix.
+                warn!(
                     destination = %route.destination,
-                    holder = entry.interface.as_deref().unwrap_or("gateway"),
-                    "userspace_helper_route_prefix_held_by_physical_interface"
+                    holder = holder.as_deref().unwrap_or("gateway"),
+                    "userspace_helper_route_stale_physical_entry_replaced"
                 );
-                return Ok(MacosRouteInstall::Foreign);
+                if let Some(remaining) = macos_clear_route_entry(route, holder.as_deref()) {
+                    warn!(
+                        destination = %route.destination,
+                        holder = remaining.interface.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_stale_physical_entry_survived_cleanup"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
             }
             Some(_) => {
-                let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
-                delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-                // Match del_macos_route: without -host/-net the delete can fail to match a
-                // CIDR destination, leaving the stale dev-bound route behind.
-                delete_args.push(macos_route_target_kind(route).into());
-                delete_args.push(route.destination.clone());
-                let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
-                let _ = run_command("route", &delete_refs);
+                if let Some(remaining) = macos_clear_route_entry(route, None) {
+                    warn!(
+                        destination = %route.destination,
+                        holder = remaining.interface.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_stale_physical_entry_survived_cleanup"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
             }
             None => {}
         }
     }
 
-    run_command_with_exists_ok("route", &refs)?;
+    let created = run_command_with_exists_ok("route", &refs)?;
+    debug!(route = ?route, created, "userspace_helper_route_install_result");
     Ok(MacosRouteInstall::Owned)
+}
+
+/// Best-effort delete of the routing-table entry for `route`'s prefix,
+/// re-probed afterwards since `route delete` failures are common (a stale
+/// entry can be interface-scoped, or already gone) and silent. Returns the
+/// entry that still occupies the prefix if it is not tunnel-owned, so the
+/// caller can back off instead of reporting the route as installed while the
+/// kernel still routes the prefix elsewhere.
+///
+/// When `ifscope` names the interface holding the entry, retry the delete with
+/// `-ifscope`: stale connected routes survive a network switch as
+/// interface-scoped entries, and a plain delete answers "not in table" for
+/// those without removing anything.
+#[cfg(target_os = "macos")]
+fn macos_clear_route_entry(route: &MacosRoute, ifscope: Option<&str>) -> Option<MacosRouteEntry> {
+    let family = if route.is_ipv6 { "-inet6" } else { "-inet" };
+    // Match del_macos_route: without -host/-net the delete can fail to match a
+    // CIDR destination, leaving the stale dev-bound route behind.
+    let kind = macos_route_target_kind(route);
+    let args: Vec<&str> = vec!["-q", "-n", "delete", family, kind, &route.destination];
+    let _ = run_command("route", &args);
+    if let Some(device) = ifscope {
+        let mut scoped = args.clone();
+        scoped.push("-ifscope");
+        scoped.push(device);
+        let _ = run_command("route", &scoped);
+    }
+    macos_route_destination(route)
+        .and_then(macos_route_table_entry)
+        .filter(|entry| !entry.is_tunnel_owned())
+}
+
+/// Whether a routing-table entry reflects the current network state.
+///
+/// A dev-bound entry is live only while its holder interface has an address
+/// whose connected subnet overlaps the entry's prefix. Without one the entry is
+/// a leftover from a network we since left (macOS keeps interface-scoped clones
+/// across Wi-Fi switches), and yielding to it would blackhole the prefix.
+/// Gateway entries are somebody's deliberate configuration and count as live.
+#[cfg(target_os = "macos")]
+fn macos_route_entry_is_live(
+    entry: &MacosRouteEntry,
+    connected: &[(String, (IpAddr, u8))],
+) -> bool {
+    if entry.has_gateway() {
+        return true;
+    }
+    let Some(holder) = entry.interface.as_deref() else {
+        return true;
+    };
+    connected.iter().any(|(device, local)| {
+        device == holder
+            && (macos_subnet_contains(local, &entry.destination)
+                || macos_subnet_contains(&entry.destination, local))
+    })
 }
 
 /// One entry of the kernel routing table, as `route -n get` reports it.
@@ -1321,16 +1427,22 @@ struct MacosRouteEntry {
     /// Network base and prefix length of the entry that answered the lookup.
     destination: (IpAddr, u8),
     interface: Option<String>,
-    has_gateway: bool,
+    gateway: Option<String>,
+    /// Path MTU of the entry; `None` when the kernel reports 0 (unset).
+    mtu: Option<u32>,
 }
 
 #[cfg(target_os = "macos")]
 impl MacosRouteEntry {
+    fn has_gateway(&self) -> bool {
+        self.gateway.is_some()
+    }
+
     /// True when a tunnel device holds this prefix directly, i.e. this or
     /// another tunnel installed it rather than the kernel deriving it from a
     /// physical interface address.
     fn is_tunnel_owned(&self) -> bool {
-        !self.has_gateway
+        !self.has_gateway()
             && self
                 .interface
                 .as_deref()
@@ -1375,10 +1487,13 @@ fn macos_route_table_entry(destination: (IpAddr, u8)) -> Option<MacosRouteEntry>
     (entry.destination == destination).then_some(entry)
 }
 
-/// Parse the `key: value` block `route -n get` prints for one lookup.
+/// Parse the `key: value` block `route -n get` prints for one lookup, plus the
+/// mtu column of the trailing statistics table.
 #[cfg(target_os = "macos")]
 fn parse_macos_route_get(text: &str, is_ipv6: bool) -> Option<MacosRouteEntry> {
     let (mut destination, mut mask, mut gateway, mut interface) = (None, None, None, None);
+    let mut mtu = None;
+    let mut stats_mtu_column = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("destination:") {
@@ -1389,6 +1504,15 @@ fn parse_macos_route_get(text: &str, is_ipv6: bool) -> Option<MacosRouteEntry> {
             gateway = Some(value.trim().to_string());
         } else if let Some(value) = trimmed.strip_prefix("interface:") {
             interface = Some(value.trim().to_string());
+        } else if let Some(column) = stats_mtu_column.take() {
+            // The value row directly under the "recvpipe ... mtu expire" header.
+            mtu = trimmed
+                .split_whitespace()
+                .nth(column)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value != 0);
+        } else if trimmed.starts_with("recvpipe") {
+            stats_mtu_column = trimmed.split_whitespace().position(|name| name == "mtu");
         }
     }
     // A default route reports "default" rather than an address; it never is the
@@ -1409,7 +1533,8 @@ fn parse_macos_route_get(text: &str, is_ipv6: bool) -> Option<MacosRouteEntry> {
     Some(MacosRouteEntry {
         destination: (macos_network_base(destination, prefix), prefix),
         interface,
-        has_gateway: gateway.is_some(),
+        gateway,
+        mtu,
     })
 }
 
@@ -1487,6 +1612,13 @@ fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
     args.push(route.destination.clone());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_command_capture_output("route", &refs)?;
+    debug!(
+        route = ?route,
+        status = %output.status,
+        stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+        "userspace_helper_route_delete_result"
+    );
     if output.status.success() {
         return Ok(());
     }
@@ -1808,6 +1940,14 @@ fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
 
     let desired = macos_desired_routes(inputs, &fingerprint);
     let current = routing.routes_added.clone();
+    debug!(
+        interface = inputs.interface,
+        previous_routes = ?current,
+        desired_routes = ?desired,
+        endpoint_pin = inputs.endpoint_needs_pin,
+        "userspace_helper_route_reconcile_plan"
+    );
+    log_macos_network_diagnostics("before_route_reconcile", inputs);
     let mut installed: Vec<MacosRoute> = Vec::new();
     let (mut added, mut removed, mut errors) = (0usize, 0usize, 0usize);
 
@@ -1997,7 +2137,10 @@ fn macos_current_dns_fingerprint() -> anyhow::Result<MacosDnsFingerprint> {
     let mut observed = Vec::with_capacity(services.len());
     for svc in &services {
         // None on error → treat as "unknown/unset"; never panic the tick.
-        let dns = get_macos_dns_servers(svc).ok().flatten();
+        let dns = get_macos_dns_servers(svc).unwrap_or_else(|error| {
+            debug!(service = svc, error = %error, "userspace_helper_dns_read_failed");
+            None
+        });
         observed.push((svc.clone(), dns));
     }
 
@@ -2133,6 +2276,20 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     }
 
     let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
+    debug!(
+        interface = inputs.interface,
+        primary_service = ?fingerprint.primary_service,
+        fallback_to_all_services = collision.is_none()
+            && DNS_POLICY == DnsPolicy::PrimaryOnly
+            && !fingerprint.primary_service.as_ref().is_some_and(|primary| fingerprint.services.contains(primary)),
+        tunnel_dns = ?inputs.dns_servers,
+        previous_observed_dns = ?previous.observed,
+        observed_dns = ?fingerprint.observed,
+        owned_services = ?owned,
+        target_services = ?targets,
+        actions = ?actions,
+        "userspace_helper_dns_reconcile_plan"
+    );
 
     let (mut applied, mut captured, mut restored, mut dropped, mut errors) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -2239,20 +2396,35 @@ fn scutil_global_primary_interface() -> Option<String> {
         .expect("system command is approved")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_spawn_failed"))
         .ok()?;
     child
         .stdin
         .as_mut()?
         .write_all(b"show State:/Network/Global/IPv4\n")
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_write_failed"))
         .ok()?;
     // `wait_with_output` closes stdin first, so scutil sees EOF and exits.
-    let output = child.wait_with_output().ok()?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| debug!(error = %error, "userspace_helper_primary_interface_wait_failed"))
+        .ok()?;
     if !output.status.success() {
+        debug!(
+            status = %output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_primary_interface_read_failed"
+        );
         return None;
     }
-    parse_scutil_primary_interface(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let primary = parse_scutil_primary_interface(&text);
+    if primary.is_none() {
+        debug!(state = %text.trim(), "userspace_helper_primary_interface_missing");
+    }
+    primary
 }
 
 /// Parse `PrimaryInterface : en0` out of `scutil show State:/Network/Global/IPv4`.
@@ -2278,7 +2450,83 @@ fn macos_service_name_for_device(device: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    parse_service_name_for_device(&String::from_utf8_lossy(&output.stdout), device)
+    let text = String::from_utf8_lossy(&output.stdout);
+    let service = parse_service_name_for_device(&text, device);
+    if service.is_none() {
+        debug!(device, service_order = %text.trim(), "userspace_helper_primary_service_unmapped");
+    }
+    service
+}
+
+/// Read-only snapshots around network changes. Unlike the overview's owned-route
+/// list, these show actual kernel routes (including split-tunnel default routes),
+/// physical addresses/link state and DHCP's last received packet. The commands
+/// are sequential observations, not an atomic snapshot or a live DHCP capture.
+/// Keep them off steady-state ticks and skip all work unless DEBUG is enabled.
+#[cfg(target_os = "macos")]
+fn log_macos_network_diagnostics(reason: &str, inputs: &MacosReconcileInputs) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let endpoint = inputs.endpoint.to_string();
+    let family = if inputs.endpoint_is_ipv6 {
+        "-inet6"
+    } else {
+        "-inet"
+    };
+    for (command, args) in [
+        ("ifconfig", vec![]),
+        ("scutil", vec!["--nwi"]),
+        ("scutil", vec!["--dns"]),
+        ("netstat", vec!["-rn"]),
+        ("route", vec!["-n", "get", "-inet", "default"]),
+        ("route", vec!["-n", "get", "-inet6", "default"]),
+        ("route", vec!["-n", "get", family, endpoint.as_str()]),
+    ] {
+        log_macos_diagnostic_command(reason, &inputs.interface, command, &args);
+    }
+    // Include IPv6-only and link-local-only physical interfaces, since their
+    // missing IPv4 lease is precisely what we need to investigate after wake.
+    let mut devices: Vec<String> = macos_connected_subnets_by_device(&inputs.interface)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(device, _)| device)
+        .collect();
+    devices.sort();
+    devices.dedup();
+    for device in devices {
+        log_macos_diagnostic_command(
+            reason,
+            &inputs.interface,
+            "ipconfig",
+            &["getpacket", &device],
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn log_macos_diagnostic_command(reason: &str, interface: &str, name: &str, args: &[&str]) {
+    let started = std::time::Instant::now();
+    match run_command_capture_output(name, args) {
+        Ok(output) => debug!(
+            reason,
+            interface,
+            command = %format_command_for_log(name, args),
+            status = %output.status,
+            elapsed_ms = started.elapsed().as_millis(),
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "userspace_helper_network_diagnostic"
+        ),
+        Err(error) => debug!(
+            reason,
+            interface,
+            command = %format_command_for_log(name, args),
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %error,
+            "userspace_helper_network_diagnostic_failed"
+        ),
+    }
 }
 
 /// Parse `networksetup -listnetworkserviceorder` output, returning the service
@@ -2444,11 +2692,13 @@ fn format_macos_network_overview_table(
             format_subnets(&route_fingerprint.local_subnets)
         ),
         String::new(),
-        "Routes".to_string(),
+        "Routes (AllowedIPs + endpoint pin, with what became of each)".to_string(),
     ];
     lines.extend(format_table(
-        &["DESTINATION", "VIA", "FAMILY", "STATUS"],
-        &macos_route_overview_rows(routes),
+        &["DESTINATION", "VIA", "FAMILY", "LIVE", "MTU", "STATUS"],
+        &macos_route_overview_rows(inputs, route_fingerprint, routes, &|route| {
+            macos_route_destination(route).and_then(macos_route_table_entry)
+        }),
     ));
     lines.push(String::new());
     let dns_collision =
@@ -2739,31 +2989,189 @@ fn tailscaled_socket_present() -> bool {
     std::path::Path::new("/var/run/tailscaled.socket").exists()
 }
 
+/// The destination as the kernel actually routes it: normalized to the network
+/// base, so `192.168.188.1/24` reads as `192.168.188.0/24` and matches the
+/// AllowedIPs line `wg` prints.
 #[cfg(target_os = "macos")]
-fn macos_route_overview_rows(routes: &[MacosRoute]) -> Vec<Vec<String>> {
-    if routes.is_empty() {
+fn macos_route_display_destination(route: &MacosRoute) -> String {
+    match macos_route_destination(route) {
+        Some((base, prefix)) => format!("{base}/{prefix}"),
+        None => route.destination.clone(),
+    }
+}
+
+/// How the kernel's answer for a prefix reads in the LIVE column: the device
+/// or gateway that actually holds the entry right now, or "absent".
+#[cfg(target_os = "macos")]
+fn macos_route_live_cell(entry: &Option<MacosRouteEntry>) -> String {
+    match entry {
+        None => "absent".to_string(),
+        Some(entry) => match (&entry.gateway, &entry.interface) {
+            (Some(gateway), Some(interface)) => format!("{interface} via {gateway}"),
+            (Some(gateway), None) => format!("via {gateway}"),
+            (None, Some(interface)) => interface.clone(),
+            (None, None) => "?".to_string(),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_mtu_cell(entry: &Option<MacosRouteEntry>) -> String {
+    entry
+        .as_ref()
+        .and_then(|entry| entry.mtu)
+        .map(|mtu| mtu.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Rows for the Routes table: every route the tunnel *wants* — the AllowedIPs
+/// routes plus the endpoint pin — each with its outcome, next to what the
+/// kernel table actually holds (LIVE/MTU). The earlier owned-only listing hid
+/// exactly the entries worth debugging: a prefix excluded because we sit in
+/// that LAN, one a foreign route-table entry keeps off the tunnel, or an
+/// "owned" route the kernel has since dropped.
+///
+/// `probe` answers the route-table lookup for a destination (injected so tests
+/// need no live routing table).
+#[cfg(target_os = "macos")]
+fn macos_route_overview_rows(
+    inputs: &MacosReconcileInputs,
+    fingerprint: &MacosNetworkFingerprint,
+    owned: &[MacosRoute],
+    probe: &dyn Fn(&MacosRoute) -> Option<MacosRouteEntry>,
+) -> Vec<Vec<String>> {
+    let family = |is_ipv6: bool| if is_ipv6 { "IPv6" } else { "IPv4" }.to_string();
+    let mut rows = Vec::new();
+
+    // The endpoint pin exists so handshake traffic itself stays off the tunnel.
+    if inputs.endpoint_needs_pin {
+        let endpoint = inputs.endpoint.to_string();
+        let pin = owned
+            .iter()
+            .find(|route| route.gateway.is_some() && route.destination == endpoint);
+        let entry = pin.and_then(probe);
+        rows.push(vec![
+            endpoint,
+            match pin.and_then(|route| route.gateway.as_deref()) {
+                Some(gateway) => format!("gateway {gateway}"),
+                None => "-".to_string(),
+            },
+            family(inputs.endpoint_is_ipv6),
+            macos_route_live_cell(&entry),
+            macos_route_mtu_cell(&entry),
+            if pin.is_some() {
+                "owned (endpoint pin: handshakes bypass the tunnel)".to_string()
+            } else {
+                "missing: no default gateway to pin the endpoint to".to_string()
+            },
+        ]);
+    }
+
+    let candidates = macos_allowed_routes(
+        &inputs.allowed_ips,
+        &inputs.interface,
+        inputs.has_ipv4_address,
+        inputs.has_ipv6_address,
+    );
+    for route in &candidates {
+        let entry = probe(route);
+        let (via, status) = if let Some(subnet) =
+            macos_route_excluded_by_local_subnet(route, &fingerprint.local_subnets)
+        {
+            let device = macos_connected_subnet_device(subnet, &inputs.interface);
+            (
+                format!("direct ({})", device.as_deref().unwrap_or("attached LAN")),
+                format!(
+                    "excluded: we are inside {}/{}, kept off the tunnel",
+                    subnet.0, subnet.1
+                ),
+            )
+        } else if owned.contains(route) {
+            let kernel_agrees = entry
+                .as_ref()
+                .is_some_and(|entry| entry.interface == route.interface && !entry.has_gateway());
+            (
+                format!("interface {}", inputs.interface),
+                if kernel_agrees {
+                    "owned".to_string()
+                } else if entry.is_none() {
+                    "owned, but absent from the kernel table (drift)".to_string()
+                } else {
+                    "owned, but the kernel entry disagrees (see LIVE)".to_string()
+                },
+            )
+        } else {
+            match &entry {
+                Some(entry) if !entry.is_tunnel_owned() => (
+                    "-".to_string(),
+                    format!(
+                        "blocked: route table entry held by {}, unreachable via tunnel",
+                        entry.interface.as_deref().unwrap_or("a gateway")
+                    ),
+                ),
+                _ => (
+                    "-".to_string(),
+                    "not installed: reconcile pending".to_string(),
+                ),
+            }
+        };
+        rows.push(vec![
+            macos_route_display_destination(route),
+            via,
+            family(route.is_ipv6),
+            macos_route_live_cell(&entry),
+            macos_route_mtu_cell(&entry),
+            status,
+        ]);
+    }
+
+    // AllowedIPs of a family the tunnel has no address for never became
+    // route candidates; show why instead of dropping them silently.
+    for allowed in &inputs.allowed_ips {
+        let is_ipv6 = allowed.contains(':');
+        if (is_ipv6 && !inputs.has_ipv6_address) || (!is_ipv6 && !inputs.has_ipv4_address) {
+            rows.push(vec![
+                allowed.clone(),
+                "-".to_string(),
+                family(is_ipv6),
+                "-".to_string(),
+                "-".to_string(),
+                format!("not installed: tunnel has no {} address", family(is_ipv6)),
+            ]);
+        }
+    }
+
+    // Owned leftovers no longer derived from AllowedIPs (mid-reconcile state).
+    for route in owned {
+        if candidates.contains(route) || (inputs.endpoint_needs_pin && route.gateway.is_some()) {
+            continue;
+        }
+        let entry = probe(route);
+        rows.push(vec![
+            macos_route_display_destination(route),
+            match (&route.gateway, &route.interface) {
+                (Some(gateway), _) => format!("gateway {gateway}"),
+                (None, Some(interface)) => format!("interface {interface}"),
+                (None, None) => "system".to_string(),
+            },
+            family(route.is_ipv6),
+            macos_route_live_cell(&entry),
+            macos_route_mtu_cell(&entry),
+            "owned: no longer desired, cleanup pending".to_string(),
+        ]);
+    }
+
+    if rows.is_empty() {
         return vec![vec![
             "none".to_string(),
             "-".to_string(),
             "-".to_string(),
-            "no routes owned".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "no routes desired".to_string(),
         ]];
     }
-    routes
-        .iter()
-        .map(|route| {
-            vec![
-                route.destination.clone(),
-                match (&route.gateway, &route.interface) {
-                    (Some(gateway), _) => format!("gateway {gateway}"),
-                    (None, Some(interface)) => format!("interface {interface}"),
-                    (None, None) => "system".to_string(),
-                },
-                if route.is_ipv6 { "IPv6" } else { "IPv4" }.to_string(),
-                "owned".to_string(),
-            ]
-        })
-        .collect()
+    rows
 }
 
 #[cfg(target_os = "macos")]
@@ -2916,6 +3324,7 @@ fn format_table_row(values: &[String], widths: &[usize]) -> String {
 #[cfg(target_os = "macos")]
 fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
     let mut subnets: Vec<(IpAddr, u8)> = macos_connected_subnets_by_device(tunnel_interface)
+        .unwrap_or_default()
         .into_iter()
         .map(|(_, subnet)| subnet)
         .collect();
@@ -2928,15 +3337,22 @@ fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
 #[cfg(target_os = "macos")]
 fn macos_connected_subnet_device(subnet: (IpAddr, u8), tunnel_interface: &str) -> Option<String> {
     macos_connected_subnets_by_device(tunnel_interface)
+        .unwrap_or_default()
         .into_iter()
         .find(|(_, candidate)| *candidate == subnet)
         .map(|(device, _)| device)
 }
 
 /// Every connected subnet paired with the interface it belongs to, in ifconfig
-/// order.
+/// order. `None` means the `ifconfig` read itself failed, distinct from a
+/// successful read that simply found no connected subnets; callers that use
+/// this to decide whether a route entry is stale must not conflate the two,
+/// since a transient read failure would otherwise look like every physical
+/// interface having lost its address.
 #[cfg(target_os = "macos")]
-fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (IpAddr, u8))> {
+fn macos_connected_subnets_by_device(
+    tunnel_interface: &str,
+) -> Option<Vec<(String, (IpAddr, u8))>> {
     // Call ifconfig directly (not run_command_capture_output) to avoid emitting
     // a debug command log line on every reconcile tick.
     let output = match crate::trusted_exec::command("ifconfig")
@@ -2944,7 +3360,18 @@ fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (Ip
         .output()
     {
         Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
+        Ok(output) => {
+            debug!(
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "userspace_helper_ifconfig_read_failed"
+            );
+            return None;
+        }
+        Err(error) => {
+            debug!(error = %error, "userspace_helper_ifconfig_read_failed");
+            return None;
+        }
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut subnets = Vec::new();
@@ -2979,7 +3406,7 @@ fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (Ip
             }
         }
     }
-    subnets
+    Some(subnets)
 }
 
 #[cfg(target_os = "macos")]
@@ -3203,6 +3630,143 @@ mod tests {
     }
 
     #[test]
+    fn route_overview_reports_every_allowed_ip_with_its_outcome() {
+        let mut inputs = split_inputs();
+        inputs.allowed_ips = vec![
+            "55.56.57.0/24".to_string(),    // attached LAN -> excluded
+            "100.64.0.0/24".to_string(),    // installed, kernel agrees -> owned
+            "100.64.9.0/24".to_string(),    // installed, kernel lost it -> drift
+            "10.20.30.0/24".to_string(),    // foreign table entry -> blocked
+            "192.168.188.1/24".to_string(), // not owned -> pending, display normalized
+            "2a01:db8::/64".to_string(),    // no IPv6 address -> not installed
+        ];
+        let fingerprint = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("55.56.57.0/24")],
+            endpoint_gateway: None,
+        };
+        let tunnel_route = |destination: &str| MacosRoute {
+            is_ipv6: false,
+            destination: destination.to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        let owned = vec![tunnel_route("100.64.0.0/24"), tunnel_route("100.64.9.0/24")];
+        let probe = |route: &MacosRoute| match route.destination.as_str() {
+            "100.64.0.0/24" => Some(MacosRouteEntry {
+                destination: subnet("100.64.0.0/24"),
+                interface: Some("utun6".to_string()),
+                gateway: None,
+                mtu: Some(1384),
+            }),
+            "10.20.30.0/24" => Some(MacosRouteEntry {
+                destination: subnet("10.20.30.0/24"),
+                interface: Some("en0".to_string()),
+                gateway: None,
+                mtu: Some(1500),
+            }),
+            _ => None,
+        };
+
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &owned, &probe);
+        let cell = |destination: &str, column: usize| -> &str {
+            &rows
+                .iter()
+                .find(|row| row[0] == destination)
+                .unwrap_or_else(|| panic!("no row for {destination}"))[column]
+        };
+        let (live, mtu, status) = (3, 4, 5);
+
+        assert!(cell("55.56.57.0/24", status).starts_with("excluded: we are inside 55.56.57.0/24"));
+        assert_eq!(cell("100.64.0.0/24", status), "owned");
+        assert_eq!(cell("100.64.0.0/24", live), "utun6");
+        assert_eq!(cell("100.64.0.0/24", mtu), "1384");
+        assert!(cell("100.64.9.0/24", status).starts_with("owned, but absent from the kernel"));
+        assert_eq!(cell("100.64.9.0/24", live), "absent");
+        assert!(cell("10.20.30.0/24", status).starts_with("blocked: route table entry held by en0"));
+        assert_eq!(cell("10.20.30.0/24", live), "en0");
+        assert_eq!(cell("10.20.30.0/24", mtu), "1500");
+        // Destination is normalized to the network base for display.
+        assert!(cell("192.168.188.0/24", status).starts_with("not installed: reconcile pending"));
+        assert_eq!(
+            cell("2a01:db8::/64", status),
+            "not installed: tunnel has no IPv6 address"
+        );
+    }
+
+    #[test]
+    fn route_overview_shows_endpoint_pin_state() {
+        let mut inputs = split_inputs();
+        inputs.allowed_ips = Vec::new();
+        inputs.endpoint_needs_pin = true;
+        let fingerprint = MacosNetworkFingerprint::default();
+        let probe = |route: &MacosRoute| {
+            (route.destination == "23.88.101.22").then(|| MacosRouteEntry {
+                destination: subnet("23.88.101.22/32"),
+                interface: Some("en0".to_string()),
+                gateway: Some("192.168.1.1".to_string()),
+                mtu: Some(1430),
+            })
+        };
+
+        let pinned = vec![MacosRoute {
+            is_ipv6: false,
+            destination: "23.88.101.22".to_string(),
+            interface: None,
+            gateway: Some("192.168.1.1".to_string()),
+        }];
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &pinned, &probe);
+        assert_eq!(rows[0][0], "23.88.101.22");
+        assert_eq!(rows[0][1], "gateway 192.168.1.1");
+        assert_eq!(rows[0][3], "en0 via 192.168.1.1");
+        assert_eq!(rows[0][4], "1430");
+        assert!(rows[0][5].starts_with("owned (endpoint pin"));
+
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &[], &probe);
+        assert!(rows[0][5].starts_with("missing: no default gateway"));
+    }
+
+    #[test]
+    fn stale_physical_route_entry_is_not_live_without_a_backing_address() {
+        let entry = MacosRouteEntry {
+            destination: subnet("10.66.77.0/24"),
+            interface: Some("en0".to_string()),
+            gateway: None,
+            mtu: None,
+        };
+
+        // en0 left the 10.66.77.0/24 LAN; only an unrelated subnet remains.
+        let elsewhere = vec![("en0".to_string(), subnet("192.0.0.2/32"))];
+        assert!(!macos_route_entry_is_live(&entry, &elsewhere));
+        assert!(!macos_route_entry_is_live(&entry, &[]));
+
+        // Attached to the LAN: the connected route must be respected.
+        let attached = vec![("en0".to_string(), subnet("10.66.77.0/24"))];
+        assert!(macos_route_entry_is_live(&entry, &attached));
+
+        // The same subnet on a different interface does not back en0's entry.
+        let other_device = vec![("en1".to_string(), subnet("10.66.77.0/24"))];
+        assert!(!macos_route_entry_is_live(&entry, &other_device));
+
+        // Overlap in either direction counts as backed.
+        let broader_entry = MacosRouteEntry {
+            destination: subnet("10.66.0.0/16"),
+            interface: Some("en0".to_string()),
+            gateway: None,
+            mtu: None,
+        };
+        assert!(macos_route_entry_is_live(&broader_entry, &attached));
+
+        // Gateway entries are deliberate configuration, never treated as stale.
+        let gateway = MacosRouteEntry {
+            destination: subnet("10.66.77.0/24"),
+            interface: Some("en0".to_string()),
+            gateway: Some("10.66.77.1".to_string()),
+            mtu: None,
+        };
+        assert!(macos_route_entry_is_live(&gateway, &elsewhere));
+    }
+
+    #[test]
     fn macos_route_delete_uses_destination_kind_without_add_qualifiers() {
         let network = MacosRoute {
             is_ipv6: false,
@@ -3235,10 +3799,13 @@ mod tests {
                     destination: 192.168.168.0\n\
                            mask: 255.255.255.0\n\
                       interface: en0\n\
-                          flags: <UP,DONE,CLONING>\n";
+                          flags: <UP,DONE,CLONING>\n\
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire\n\
+       0         0         0         0         0         0      1500         0\n";
         let entry = parse_macos_route_get(lan, false).expect("parsed");
         assert_eq!(entry.destination, subnet("192.168.168.0/24"));
         assert_eq!(entry.interface.as_deref(), Some("en0"));
+        assert_eq!(entry.mtu, Some(1500));
         assert!(!entry.is_tunnel_owned());
 
         let tunnel = "   route to: 10.66.77.0\n\
@@ -3280,7 +3847,8 @@ mod tests {
         let entry = MacosRouteEntry {
             destination: subnet("23.88.101.22/32"),
             interface: Some("utun6".to_string()),
-            has_gateway: true,
+            gateway: Some("192.168.168.1".to_string()),
+            mtu: None,
         };
         assert!(!entry.is_tunnel_owned());
     }
