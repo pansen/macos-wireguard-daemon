@@ -173,4 +173,4 @@ check.privileged:
 .PHONY: check
 check:
 	mkdir -p target
-	$(MAKE) logs.privileged check.privileged 2>&1 | tee target/$$(date +%Y-%m-%d%d_%H-%M.%s)_check.log
+	$(MAKE) logs.privileged check.privileged 2>&1 | tee target/$$(date +%Y-%m-%d_%H-%M.%s)_check.log
