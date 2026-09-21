@@ -1309,7 +1309,20 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
             Some(entry) if !entry.is_tunnel_owned() => {
                 let holder = entry.interface.clone();
                 let tunnel = route.interface.as_deref().unwrap_or("");
-                if macos_route_entry_is_live(&entry, &macos_connected_subnets_by_device(tunnel)) {
+                // A read failure leaves us unable to tell a live physical
+                // route from a stale one; default to leaving it alone rather
+                // than risking deletion of a LAN route that is still in use.
+                let is_live = match macos_connected_subnets_by_device(tunnel) {
+                    Some(connected) => macos_route_entry_is_live(&entry, &connected),
+                    None => {
+                        debug!(
+                            destination = %route.destination,
+                            "userspace_helper_route_liveness_check_skipped_ifconfig_failed"
+                        );
+                        true
+                    }
+                };
+                if is_live {
                     debug!(
                         destination = %route.destination,
                         holder = holder.as_deref().unwrap_or("gateway"),
@@ -1324,9 +1337,25 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
                     holder = holder.as_deref().unwrap_or("gateway"),
                     "userspace_helper_route_stale_physical_entry_replaced"
                 );
-                macos_clear_route_entry(route, holder.as_deref());
+                if let Some(remaining) = macos_clear_route_entry(route, holder.as_deref()) {
+                    warn!(
+                        destination = %route.destination,
+                        holder = remaining.interface.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_stale_physical_entry_survived_cleanup"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
             }
-            Some(_) => macos_clear_route_entry(route, None),
+            Some(_) => {
+                if let Some(remaining) = macos_clear_route_entry(route, None) {
+                    warn!(
+                        destination = %route.destination,
+                        holder = remaining.interface.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_stale_physical_entry_survived_cleanup"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
+            }
             None => {}
         }
     }
@@ -1336,14 +1365,19 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
     Ok(MacosRouteInstall::Owned)
 }
 
-/// Best-effort delete of the routing-table entry for `route`'s prefix.
+/// Best-effort delete of the routing-table entry for `route`'s prefix,
+/// re-probed afterwards since `route delete` failures are common (a stale
+/// entry can be interface-scoped, or already gone) and silent. Returns the
+/// entry that still occupies the prefix if it is not tunnel-owned, so the
+/// caller can back off instead of reporting the route as installed while the
+/// kernel still routes the prefix elsewhere.
 ///
 /// When `ifscope` names the interface holding the entry, retry the delete with
 /// `-ifscope`: stale connected routes survive a network switch as
 /// interface-scoped entries, and a plain delete answers "not in table" for
 /// those without removing anything.
 #[cfg(target_os = "macos")]
-fn macos_clear_route_entry(route: &MacosRoute, ifscope: Option<&str>) {
+fn macos_clear_route_entry(route: &MacosRoute, ifscope: Option<&str>) -> Option<MacosRouteEntry> {
     let family = if route.is_ipv6 { "-inet6" } else { "-inet" };
     // Match del_macos_route: without -host/-net the delete can fail to match a
     // CIDR destination, leaving the stale dev-bound route behind.
@@ -1356,6 +1390,9 @@ fn macos_clear_route_entry(route: &MacosRoute, ifscope: Option<&str>) {
         scoped.push(device);
         let _ = run_command("route", &scoped);
     }
+    macos_route_destination(route)
+        .and_then(macos_route_table_entry)
+        .filter(|entry| !entry.is_tunnel_owned())
 }
 
 /// Whether a routing-table entry reflects the current network state.
@@ -2451,6 +2488,7 @@ fn log_macos_network_diagnostics(reason: &str, inputs: &MacosReconcileInputs) {
     // Include IPv6-only and link-local-only physical interfaces, since their
     // missing IPv4 lease is precisely what we need to investigate after wake.
     let mut devices: Vec<String> = macos_connected_subnets_by_device(&inputs.interface)
+        .unwrap_or_default()
         .into_iter()
         .map(|(device, _)| device)
         .collect();
@@ -3286,6 +3324,7 @@ fn format_table_row(values: &[String], widths: &[usize]) -> String {
 #[cfg(target_os = "macos")]
 fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
     let mut subnets: Vec<(IpAddr, u8)> = macos_connected_subnets_by_device(tunnel_interface)
+        .unwrap_or_default()
         .into_iter()
         .map(|(_, subnet)| subnet)
         .collect();
@@ -3298,15 +3337,22 @@ fn macos_local_connected_subnets(tunnel_interface: &str) -> Vec<(IpAddr, u8)> {
 #[cfg(target_os = "macos")]
 fn macos_connected_subnet_device(subnet: (IpAddr, u8), tunnel_interface: &str) -> Option<String> {
     macos_connected_subnets_by_device(tunnel_interface)
+        .unwrap_or_default()
         .into_iter()
         .find(|(_, candidate)| *candidate == subnet)
         .map(|(device, _)| device)
 }
 
 /// Every connected subnet paired with the interface it belongs to, in ifconfig
-/// order.
+/// order. `None` means the `ifconfig` read itself failed, distinct from a
+/// successful read that simply found no connected subnets; callers that use
+/// this to decide whether a route entry is stale must not conflate the two,
+/// since a transient read failure would otherwise look like every physical
+/// interface having lost its address.
 #[cfg(target_os = "macos")]
-fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (IpAddr, u8))> {
+fn macos_connected_subnets_by_device(
+    tunnel_interface: &str,
+) -> Option<Vec<(String, (IpAddr, u8))>> {
     // Call ifconfig directly (not run_command_capture_output) to avoid emitting
     // a debug command log line on every reconcile tick.
     let output = match crate::trusted_exec::command("ifconfig")
@@ -3320,11 +3366,11 @@ fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (Ip
                 stderr = %String::from_utf8_lossy(&output.stderr).trim(),
                 "userspace_helper_ifconfig_read_failed"
             );
-            return Vec::new();
+            return None;
         }
         Err(error) => {
             debug!(error = %error, "userspace_helper_ifconfig_read_failed");
-            return Vec::new();
+            return None;
         }
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -3360,7 +3406,7 @@ fn macos_connected_subnets_by_device(tunnel_interface: &str) -> Vec<(String, (Ip
             }
         }
     }
-    subnets
+    Some(subnets)
 }
 
 #[cfg(target_os = "macos")]
