@@ -68,10 +68,22 @@ impl StdioSession {
     }
 }
 
+/// Whether a failed connect means "nothing is listening here" -- the only
+/// condition autostart is meant to repair. `PermissionDenied` deliberately
+/// is not included here even though it also stops a connect from
+/// succeeding: it means a daemon *is* listening but this caller can't reach
+/// it (e.g. not a member of its authorized group), and autostarting another
+/// one on top of a live, merely-unreachable daemon can't fix that -- it
+/// either steals the live daemon's socket out from under it (the bug fixed
+/// in `privileged::serve`) or, now that `serve` refuses to do that, spawns a
+/// daemon that immediately bails because the original is still there,
+/// leaving `wait_until_ready` to poll a socket this caller was never going
+/// to be able to reach anyway until it times out. Surfacing the permission
+/// error immediately instead is slower to fix but tells the caller what's
+/// actually wrong.
 pub(crate) fn is_autostart_connect_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotFound
         || err.kind() == std::io::ErrorKind::ConnectionRefused
-        || err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 pub(crate) fn is_transport_error(err: &AppError) -> bool {
@@ -111,9 +123,16 @@ impl PrivilegedClient {
                     self.socket_path.display(),
                     e
                 );
+                let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    "; a privileged daemon is running but you may not be a member of its \
+                     authorized group (log out and back in after `wgd launchd install` adds \
+                     you, or check --authorized-group)"
+                } else {
+                    ""
+                };
                 return Err(AppError::Other(format!(
-                    "failed to connect to privileged socket: {}",
-                    e
+                    "failed to connect to privileged socket: {}{}",
+                    e, hint
                 )));
             }
             Err(e) => {
