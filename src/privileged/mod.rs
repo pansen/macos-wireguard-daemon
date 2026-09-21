@@ -121,7 +121,35 @@ pub fn serve(
         None => {
             let socket_path = config::privileged_socket_path();
             if socket_path.exists() {
-                let _ = std::fs::remove_file(&socket_path);
+                // A stale socket file (left behind by a crashed or killed
+                // predecessor) is safe to unlink and rebind over. A socket
+                // file that still has a live listener behind it is not:
+                // unlinking it would silently orphan that daemon (its
+                // listening fd stays open and functional, but no new client
+                // can ever reach it again to ask it to shut down), leaving a
+                // second privileged root process running forever. Probe
+                // liveness first and refuse to start rather than steal it.
+                match std::os::unix::net::UnixStream::connect(&socket_path) {
+                    Ok(_) => {
+                        anyhow::bail!(
+                            "a privileged wgd daemon is already listening on {}; refusing to start a duplicate",
+                            socket_path.display()
+                        );
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ConnectionRefused
+                            || e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        let _ = std::fs::remove_file(&socket_path);
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "failed to probe existing socket {} before startup: {}",
+                            socket_path.display(),
+                            e
+                        );
+                    }
+                }
             }
 
             let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
