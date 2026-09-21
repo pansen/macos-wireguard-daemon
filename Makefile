@@ -166,7 +166,9 @@ check.privileged:
 	id | tr ',' '\n' | grep wgd || echo "  not in wgd group — re-login required"
 	sudo log show --predicate 'sender == "launchd"' --last 10m --info | grep wgd | tail -n30
 	ps axu | grep wgd
-	ping -c1 1.1.1.1 || true
+	ping -c1 -m1 1.1.1.1 || true
+	ping -c1 -m1 100.64.1.1 || true
+	ping -c1 -m1 10.66.77.2 || true
 
 .PHONY: check
 check:
