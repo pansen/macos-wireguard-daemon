@@ -1307,23 +1307,26 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
         );
         match entry {
             Some(entry) if !entry.is_tunnel_owned() => {
-                debug!(
+                let holder = entry.interface.clone();
+                let tunnel = route.interface.as_deref().unwrap_or("");
+                if macos_route_entry_is_live(&entry, &macos_connected_subnets_by_device(tunnel)) {
+                    debug!(
+                        destination = %route.destination,
+                        holder = holder.as_deref().unwrap_or("gateway"),
+                        "userspace_helper_route_prefix_held_by_physical_interface"
+                    );
+                    return Ok(MacosRouteInstall::Foreign);
+                }
+                // The holder has no address in the prefix: a leftover from a
+                // network we since left, which would blackhole the prefix.
+                warn!(
                     destination = %route.destination,
-                    holder = entry.interface.as_deref().unwrap_or("gateway"),
-                    "userspace_helper_route_prefix_held_by_physical_interface"
+                    holder = holder.as_deref().unwrap_or("gateway"),
+                    "userspace_helper_route_stale_physical_entry_replaced"
                 );
-                return Ok(MacosRouteInstall::Foreign);
+                macos_clear_route_entry(route, holder.as_deref());
             }
-            Some(_) => {
-                let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
-                delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-                // Match del_macos_route: without -host/-net the delete can fail to match a
-                // CIDR destination, leaving the stale dev-bound route behind.
-                delete_args.push(macos_route_target_kind(route).into());
-                delete_args.push(route.destination.clone());
-                let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
-                let _ = run_command("route", &delete_refs);
-            }
+            Some(_) => macos_clear_route_entry(route, None),
             None => {}
         }
     }
@@ -1331,6 +1334,53 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<MacosRouteInstall> {
     let created = run_command_with_exists_ok("route", &refs)?;
     debug!(route = ?route, created, "userspace_helper_route_install_result");
     Ok(MacosRouteInstall::Owned)
+}
+
+/// Best-effort delete of the routing-table entry for `route`'s prefix.
+///
+/// When `ifscope` names the interface holding the entry, retry the delete with
+/// `-ifscope`: stale connected routes survive a network switch as
+/// interface-scoped entries, and a plain delete answers "not in table" for
+/// those without removing anything.
+#[cfg(target_os = "macos")]
+fn macos_clear_route_entry(route: &MacosRoute, ifscope: Option<&str>) {
+    let family = if route.is_ipv6 { "-inet6" } else { "-inet" };
+    // Match del_macos_route: without -host/-net the delete can fail to match a
+    // CIDR destination, leaving the stale dev-bound route behind.
+    let kind = macos_route_target_kind(route);
+    let args: Vec<&str> = vec!["-q", "-n", "delete", family, kind, &route.destination];
+    let _ = run_command("route", &args);
+    if let Some(device) = ifscope {
+        let mut scoped = args.clone();
+        scoped.push("-ifscope");
+        scoped.push(device);
+        let _ = run_command("route", &scoped);
+    }
+}
+
+/// Whether a routing-table entry reflects the current network state.
+///
+/// A dev-bound entry is live only while its holder interface has an address
+/// whose connected subnet overlaps the entry's prefix. Without one the entry is
+/// a leftover from a network we since left (macOS keeps interface-scoped clones
+/// across Wi-Fi switches), and yielding to it would blackhole the prefix.
+/// Gateway entries are somebody's deliberate configuration and count as live.
+#[cfg(target_os = "macos")]
+fn macos_route_entry_is_live(
+    entry: &MacosRouteEntry,
+    connected: &[(String, (IpAddr, u8))],
+) -> bool {
+    if entry.has_gateway {
+        return true;
+    }
+    let Some(holder) = entry.interface.as_deref() else {
+        return true;
+    };
+    connected.iter().any(|(device, local)| {
+        device == holder
+            && (macos_subnet_contains(local, &entry.destination)
+                || macos_subnet_contains(&entry.destination, local))
+    })
 }
 
 /// One entry of the kernel routing table, as `route -n get` reports it.
@@ -3352,6 +3402,44 @@ mod tests {
     fn subnet(value: &str) -> (IpAddr, u8) {
         let (ip, prefix) = parse_cidr(value).expect("valid cidr");
         (macos_network_base(ip, prefix), prefix)
+    }
+
+    #[test]
+    fn stale_physical_route_entry_is_not_live_without_a_backing_address() {
+        let entry = MacosRouteEntry {
+            destination: subnet("10.66.77.0/24"),
+            interface: Some("en0".to_string()),
+            has_gateway: false,
+        };
+
+        // en0 left the 10.66.77.0/24 LAN; only an unrelated subnet remains.
+        let elsewhere = vec![("en0".to_string(), subnet("192.0.0.2/32"))];
+        assert!(!macos_route_entry_is_live(&entry, &elsewhere));
+        assert!(!macos_route_entry_is_live(&entry, &[]));
+
+        // Attached to the LAN: the connected route must be respected.
+        let attached = vec![("en0".to_string(), subnet("10.66.77.0/24"))];
+        assert!(macos_route_entry_is_live(&entry, &attached));
+
+        // The same subnet on a different interface does not back en0's entry.
+        let other_device = vec![("en1".to_string(), subnet("10.66.77.0/24"))];
+        assert!(!macos_route_entry_is_live(&entry, &other_device));
+
+        // Overlap in either direction counts as backed.
+        let broader_entry = MacosRouteEntry {
+            destination: subnet("10.66.0.0/16"),
+            interface: Some("en0".to_string()),
+            has_gateway: false,
+        };
+        assert!(macos_route_entry_is_live(&broader_entry, &attached));
+
+        // Gateway entries are deliberate configuration, never treated as stale.
+        let gateway = MacosRouteEntry {
+            destination: subnet("10.66.77.0/24"),
+            interface: Some("en0".to_string()),
+            has_gateway: true,
+        };
+        assert!(macos_route_entry_is_live(&gateway, &elsewhere));
     }
 
     #[test]
