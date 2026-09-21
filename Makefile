@@ -150,6 +150,10 @@ uninstall: uninstall.autostart uninstall.privileged uninstall.dns
 purge: uninstall purge.privileged
 
 
+.PHONY: logs.privileged
+logs.privileged:
+	sudo find /var/log/wgd/ -type f -name '*.log' -exec sudo tail -n 150 {} +
+
 .PHONY: check.privileged
 check.privileged:
 	@echo "==> daemon (expect: state = not running, sockets registered)"
@@ -161,9 +165,12 @@ check.privileged:
 	@echo "==> group membership (expect: wgd listed)"
 	id | tr ',' '\n' | grep wgd || echo "  not in wgd group — re-login required"
 	sudo log show --predicate 'sender == "launchd"' --last 10m --info | grep wgd | tail -n30
-	sudo tail -n20  /var/log/wgd/*
 	ps axu | grep wgd
-	ping -c2 55.56.57.2
+	ping -c1 -m1 1.1.1.1 || true
+	ping -c1 -m1 100.64.1.1 || true
+	ping -c1 -m1 10.66.77.2 || true
 
 .PHONY: check
-check: check.privileged
+check:
+	mkdir -p target
+	$(MAKE) logs.privileged check.privileged 2>&1 | tee target/$$(date +%Y-%m-%d_%H-%M.%s)_check.log
