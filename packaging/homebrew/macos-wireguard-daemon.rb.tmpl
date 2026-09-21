@@ -2,7 +2,7 @@ cask "macos-wireguard-daemon" do
   version "__VERSION__"
   sha256 "__SHA256__"
 
-  url "https://github.com/pansen/macos-wireguard-daemon/releases/download/#{version}/wgd-#{version}-aarch64-apple-darwin.tar.gz"
+  url "https://github.com/pansen/macos-wireguard-daemon/releases/download/v#{version}/wgd-#{version}-aarch64-apple-darwin.dmg"
   name "macOS WireGuard Daemon"
   desc "Daemon for running WireGuard VPN tunnels"
   homepage "https://github.com/pansen/macos-wireguard-daemon"
@@ -10,11 +10,11 @@ cask "macos-wireguard-daemon" do
   depends_on arch: :arm64
 
   installer script: {
-    executable: "__ASSET_DIR__/wgd",
+    executable: "wgd",
     args:       ["launchd", "install"],
     sudo:       true,
   }
-  binary "__ASSET_DIR__/wgd", target: "wgd"
+  binary "wgd", target: "wgd"
 
   uninstall script: {
     executable:   "/usr/local/bin/wgd",

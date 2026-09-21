@@ -50,6 +50,9 @@ jobs:
     with:
       ref: ${{ inputs.tag || github.ref_name }}
       version: ${{ inputs.tag || github.ref_name }}
+    # Signing and notarization in manual-build.yml need the MACOS_* and
+    # ASC_* repository secrets.
+    secrets: inherit
 
   release:
     name: Publish GitHub Release
@@ -99,16 +102,16 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           version="${tag#v}"
-          # The cask template builds both the download URL and the asset
-          # path from its own `version` stanza (via Ruby interpolation, so
-          # `brew audit` sees a versioned url instead of flagging a bare
-          # string as "unversioned"), so the uploaded asset must be named
-          # from this same v-stripped `version`, not the raw tag.
-          asset="wgd-${version}-aarch64-apple-darwin.tar.gz"
+          # The cask template builds the download URL from its own
+          # `version` stanza (via Ruby interpolation, prefixing the `v`
+          # back for the tag path segment), so the uploaded DMG must be
+          # named from this same v-stripped `version`, not the raw tag.
+          # The DMG (notarized and stapled) is the artifact the cask
+          # installs from; the tar.gz stays a plain download.
+          asset="wgd-${version}-aarch64-apple-darwin.dmg"
           sha256="$(cut -d' ' -f1 "dist/${asset}.sha256")"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
-          echo "asset_dir=${asset%.tar.gz}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-tap
         uses: actions/checkout@v7
@@ -125,7 +128,6 @@ jobs:
           sed \
             -e "s|__VERSION__|${{ steps.vars.outputs.version }}|" \
             -e "s|__SHA256__|${{ steps.vars.outputs.sha256 }}|" \
-            -e "s|__ASSET_DIR__|${{ steps.vars.outputs.asset_dir }}|" \
             packaging/homebrew/macos-wireguard-daemon.rb.tmpl > tap/Casks/macos-wireguard-daemon.rb
 
       - name: Commit and push
