@@ -11,7 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use nix::unistd::{chown, geteuid, Gid, Group, Uid, User};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::{chown, geteuid, Gid, Group, Pid, Uid, User};
+use tracing::debug;
 
 use crate::cli::LaunchdCommand;
 use crate::config;
@@ -306,6 +308,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     let plist = render_plist_from(&template, bin_str, gid)?;
     write_plist(&plist)?;
     bootstrap()?;
+    reap_stray_privileged_daemons();
 
     println!("wgd privileged daemon installed.");
     println!("  binary: {}", bin.display());
@@ -355,6 +358,7 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     // disabled. `cmd_install`'s `launchctl enable` clears this again on
     // reinstall.
     run_ignore_failure("/bin/launchctl", &["disable", &format!("system/{LABEL}")]);
+    reap_stray_privileged_daemons();
 
     remove_file_ignore_missing(Path::new(PLIST_PATH))?;
     remove_file_ignore_missing(&config::privileged_socket_path())?;
@@ -770,6 +774,105 @@ fn bootstrap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Kill any `wgd privileged --serve` process launchd is not currently
+/// tracking under our label.
+///
+/// These are leftovers from the client-side sudo-autostart fallback
+/// (`PrivilegedClient::spawn_privileged_daemon`): they never register with
+/// launchd, so `bootout`/`bootstrap` above can neither stop them nor even
+/// see them. And once a newer daemon (ad hoc or launchd-bootstrapped) takes
+/// over the control socket path, no client can dial an older one again to
+/// ask it to shut down -- it just runs forever. Install and uninstall are
+/// the two points an admin has already deliberately decided this daemon's
+/// identity should change, so they're the right place to sweep up anything
+/// left over from before. Best-effort: a failure here must not abort
+/// install/uninstall, which both have more important work to do.
+///
+/// Snapshots the process list *before* asking launchd for its tracked pid,
+/// not after: a client connecting between the two calls would make launchd
+/// spawn the real daemon in the gap, and checking launchd first would then
+/// read that fresh spawn as untracked and kill it out from under the
+/// connecting client.
+fn reap_stray_privileged_daemons() {
+    let candidates = find_privileged_daemon_pids();
+    let tracked_pid = launchd_tracked_pid();
+    for pid in candidates {
+        if Some(pid) == tracked_pid {
+            continue;
+        }
+        debug!(pid, ?tracked_pid, "reaping_stray_privileged_daemon");
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+}
+
+/// The pid launchd currently has running for our label, if any (idle
+/// on-demand jobs and not-yet-installed labels both report none).
+fn launchd_tracked_pid() -> Option<u32> {
+    let output = std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("system/{LABEL}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_launchd_tracked_pid(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_launchd_tracked_pid(print_output: &str) -> Option<u32> {
+    print_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = ")?.parse::<u32>().ok())
+}
+
+/// Pids of every running root-owned `wgd ... privileged --serve ...`
+/// process, ad hoc or launchd-managed alike. Identified by uid and full
+/// command line rather than executable name or path: the same binary also
+/// runs as the gotatun tunnel helper (`wgd <interface>`), the per-user
+/// session agent, and every ordinary CLI invocation, all sharing
+/// `/usr/local/bin/wgd` -- and, unlike the daemon, all normally running as
+/// the invoking user rather than root.
+fn find_privileged_daemon_pids() -> Vec<u32> {
+    let output = match std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,uid=,args="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_privileged_daemon_pids(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_privileged_daemon_pids(ps_output: &str) -> Vec<u32> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid_str, rest) = line.split_once(char::is_whitespace)?;
+            let pid = pid_str.parse::<u32>().ok()?;
+            let (uid_str, args) = rest.trim_start().split_once(char::is_whitespace)?;
+            if uid_str.trim().parse::<u32>().ok()? != 0 {
+                return None;
+            }
+            let mut tokens = args.split_whitespace();
+            let is_wgd = tokens
+                .next()
+                .is_some_and(|argv0| Path::new(argv0).file_name() == Some("wgd".as_ref()));
+            let tokens: Vec<&str> = tokens.collect();
+            // `--stdio` is the per-command stdio helper
+            // (`spawn_privileged_stdio_session_non_interactive`): a dedicated
+            // process for one client's request/response pair, torn down when
+            // that client is done. It also matches `privileged --serve`, but
+            // killing it here would abort whatever command is using it.
+            let is_stdio_helper = tokens.contains(&"--stdio");
+            (is_wgd
+                && !is_stdio_helper
+                && tokens.contains(&"privileged")
+                && tokens.contains(&"--serve"))
+            .then_some(pid)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +888,51 @@ mod tests {
         }
         let err = require_root("install").expect_err("must not be root");
         assert!(err.to_string().contains("sudo wgd launchd install"));
+    }
+
+    #[test]
+    fn parses_launchd_tracked_pid_from_print_output() {
+        let output = "system/me.pansen.wgd.privileged = {\n\
+             \tactive count = 1\n\
+             \tstate = running\n\
+             \n\
+             \tprogram = /usr/local/bin/wgd\n\
+             \tpid = 48766\n\
+             \tsocket manager = 1\n\
+             }";
+        assert_eq!(parse_launchd_tracked_pid(output), Some(48766));
+    }
+
+    #[test]
+    fn no_tracked_pid_when_job_is_idle_or_absent() {
+        let idle = "system/me.pansen.wgd.privileged = {\n\tstate = waiting\n}";
+        assert_eq!(parse_launchd_tracked_pid(idle), None);
+        assert_eq!(parse_launchd_tracked_pid(""), None);
+    }
+
+    #[test]
+    fn finds_privileged_daemon_pids_and_ignores_look_alikes() {
+        // Same binary, seven different invocations, all root-owned except
+        // the CLI command: the launchd-style daemon, the ad hoc
+        // sudo-autostart daemon, the per-command stdio helper (also matches
+        // `privileged --serve` but must not be reaped mid-command), the
+        // gotatun tunnel helper (whose "interface" argument happens to start
+        // with a digit, not a flag), the session agent, an ordinary CLI
+        // command running as the invoking user, and a real `privileged
+        // --serve` daemon that isn't root (shouldn't happen, excluded
+        // anyway). Only the first two are stray-daemon candidates.
+        let ps = "\
+              100     0 /usr/local/bin/wgd --debug privileged --serve --authorized-group wgd --autostarted --idle-timeout-ms 60000\n\
+              200     0 /usr/local/bin/wgd privileged --serve --autostarted --authorized-group staff --debug\n\
+              250     0 /usr/local/bin/wgd privileged --serve --stdio --autostarted --authorized-group staff\n\
+              300     0 /usr/local/bin/wgd wg-ca40dce0\n\
+              400   503 /usr/local/bin/wgd launchd agent run\n\
+              500   503 /usr/local/bin/wgd connection list\n\
+              700   503 /usr/local/bin/wgd privileged --serve --stdio\n\
+              600     0 /usr/bin/grep privileged --serve\n";
+        let mut pids = parse_privileged_daemon_pids(ps);
+        pids.sort_unstable();
+        assert_eq!(pids, vec![100, 200]);
     }
 
     #[test]
