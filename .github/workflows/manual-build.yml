@@ -69,12 +69,17 @@ jobs:
           keychain="$RUNNER_TEMP/signing.keychain-db"
           keychain_password="$(openssl rand -hex 32)"
           echo "::add-mask::${keychain_password}"
+          # Secrets set from a file or a pasted clipboard often carry a
+          # trailing newline; that newline becomes a literal character in the
+          # `-P` argument below and `security import` reports it as a wrong
+          # password, so strip embedded newlines rather than fail on them.
+          cert_password="$(printf '%s' "${CERT_PASSWORD}" | tr -d '\n')"
           security create-keychain -p "${keychain_password}" "${keychain}"
           security set-keychain-settings -lut 21600 "${keychain}"
           security unlock-keychain -p "${keychain_password}" "${keychain}"
           printf '%s' "${CERT_BASE64}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "${keychain}" \
-            -P "${CERT_PASSWORD}" -T /usr/bin/codesign
+            -P "${cert_password}" -T /usr/bin/codesign
           rm "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S "apple-tool:,apple:,codesign:" \
             -s -k "${keychain_password}" "${keychain}" >/dev/null
