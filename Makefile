@@ -51,8 +51,11 @@ install.completion:
 	@# Bash completion. `wgd` serves its own completions: run with
 	@# COMPLETE=bash it prints the registration script, and the shell then
 	@# calls back into the binary for candidates, so completions follow the
-	@# CLI without a checked-in script to regenerate. Appended only when
-	@# absent, so repeated `make install` runs don't stack duplicate lines.
+	@# CLI without a checked-in script to regenerate. Written between
+	@# `# begin: wgd managed` / `# end: wgd managed` markers: each run strips
+	@# any existing marked block first, then appends a fresh one, so repeated
+	@# `make install` runs -- or a future edit to the block below -- update
+	@# .bashrc in place instead of stacking duplicate lines.
 	@#
 	@# `eval "$$(...)"` rather than clap_complete's documented
 	@# `source <(COMPLETE=bash wgd)`: process substitution loses the
@@ -60,7 +63,8 @@ install.completion:
 	@# completion function undefined. The eval form registers correctly on
 	@# both 3.2 and bash 5. stderr is dropped so a removed binary (see
 	@# `make purge`) leaves a dead no-op here instead of an error on every
-	@# new shell.
+	@# new shell. The `[ -f ... ]` guard skips invoking a removed binary
+	@# entirely, rather than just swallowing its stderr on every new shell.
 	@#
 	@# zsh and fish use the same mechanism (`COMPLETE=zsh`/`COMPLETE=fish`);
 	@# only bash is wired up here.
@@ -71,8 +75,15 @@ install.completion:
 	@# `wgd` either way -- clap uses its own command name there, not the
 	@# path it was invoked by -- so completion works for whichever `wgd`
 	@# the user's PATH resolves.
-	@grep -qxF 'eval "$$(COMPLETE=bash $(WGD_BIN) 2>/dev/null)"' "$(HOME)/.bashrc" 2>/dev/null || \
-		echo 'eval "$$(COMPLETE=bash $(WGD_BIN) 2>/dev/null)"' >> "$(HOME)/.bashrc"
+	@touch "$(HOME)/.bashrc"
+	@sed -i '' '/# begin: wgd managed/,/# end: wgd managed/d' "$(HOME)/.bashrc"
+	@{ \
+		echo '# begin: wgd managed'; \
+		echo 'if [ -f $(WGD_BIN) ]; then'; \
+		echo '  eval "$$(COMPLETE=bash $(WGD_BIN) 2>/dev/null)"'; \
+		echo 'fi'; \
+		echo '# end: wgd managed'; \
+	} >> "$(HOME)/.bashrc"
 
 .PHONY: uninstall.legacy-autoconnect
 uninstall.legacy-autoconnect:
