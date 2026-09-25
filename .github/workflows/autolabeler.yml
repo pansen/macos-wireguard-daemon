@@ -1,0 +1,20 @@
+name: Auto Label
+
+# Labels PRs from their branch prefix (see `autolabeler` in
+# .github/release-drafter.yml) so Release Drafter can categorize them.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-label:
+    name: Label PR from branch name
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Apply labels
+        uses: release-drafter/release-drafter/autolabeler@v7

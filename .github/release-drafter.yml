@@ -1,0 +1,58 @@
+# Config for .github/workflows/release-drafter.yml and autolabeler.yml.
+# Tags follow the existing `vX.Y.Z` scheme; publishing the draft creates the
+# tag, which triggers release.yml to build and attach the artifacts.
+name-template: 'v$RESOLVED_VERSION'
+# Branches are named `<type>/<user>/<topic>`, e.g. `chore/andi/release-drafter`.
+autolabeler:
+  - label: 'feature'
+    branch:
+      - '/^feat(ure)?\//'
+  - label: 'fix'
+    branch:
+      - '/^(bug|hot)?fix\//'
+  - label: 'chore'
+    branch:
+      - '/^chore\//'
+  - label: 'ci'
+    branch:
+      - '/^ci\//'
+  - label: 'documentation'
+    branch:
+      - '/^docs?\//'
+  - label: 'dependencies'
+    branch:
+      - '/^deps\//'
+tag-template: 'v$RESOLVED_VERSION'
+categories:
+  - title: 'Features'
+    semver-increment: minor
+    when:
+      labels:
+        - 'feature'
+        - 'enhancement'
+  - title: 'Bug Fixes'
+    when:
+      labels:
+        - 'fix'
+        - 'bug'
+  - title: 'Maintenance'
+    when:
+      labels:
+        - 'chore'
+        - 'ci'
+        - 'dependencies'
+        - 'documentation'
+  - type: 'version-resolver'
+    semver-increment: major
+    when:
+      label: 'major'
+  # Fallback when no label matches.
+  - type: 'version-resolver'
+    semver-increment: patch
+change-template: '- $TITLE (#$NUMBER) @$AUTHOR'
+template: |
+  ## Changes
+
+  $CHANGES
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION

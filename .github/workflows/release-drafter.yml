@@ -1,0 +1,27 @@
+name: Release Drafter
+
+# A merged PR lands on main as a push, so this covers both PR merges and
+# direct commits to main.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-drafter
+  cancel-in-progress: false
+
+jobs:
+  update-release-draft:
+    name: Update release draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Draft release notes
+        uses: release-drafter/release-drafter@v7
