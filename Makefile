@@ -76,7 +76,12 @@ install.completion:
 	@# path it was invoked by -- so completion works for whichever `wgd`
 	@# the user's PATH resolves.
 	@touch "$(HOME)/.bashrc"
-	@sed -i '' '/# begin: wgd managed/,/# end: wgd managed/d' "$(HOME)/.bashrc"
+	@# Not `sed -i`: BSD sed refuses symlinked files (dotfile setups link
+	@# ~/.bashrc elsewhere). Filter to a temp file and write it back with
+	@# `cat >`, which keeps the symlink and the target's permissions.
+	@tmp=$$(mktemp) && \
+	sed '/# begin: wgd managed/,/# end: wgd managed/d' "$(HOME)/.bashrc" > "$$tmp" && \
+	cat "$$tmp" > "$(HOME)/.bashrc" && rm -f "$$tmp"
 	@{ \
 		echo '# begin: wgd managed'; \
 		echo 'if [ -f $(WGD_BIN) ]; then'; \
