@@ -73,7 +73,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/*
-          generate_release_notes: true
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
 
   update-homebrew-tap:
