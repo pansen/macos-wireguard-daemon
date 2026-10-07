@@ -50,12 +50,10 @@ upgrade` prompts again on every new release, to reinstall the daemon from
 the upgraded binary. `brew uninstall --zap macos-wireguard-daemon` removes
 the daemon, the `wgd` group, and its logs along with the package.
 
-The binary isn't notarized yet, so Gatekeeper may refuse to run it after a
-fresh install ("cannot be opened because the developer cannot be
-verified"). Until that's in place, install with
-`brew install --no-quarantine --cask pansen/tap/macos-wireguard-daemon`, or
-remove the quarantine flag yourself: `xattr -d com.apple.quarantine
-$(brew --prefix)/bin/wgd`.
+The release DMG the cask installs from is signed with a Developer ID
+certificate, notarized by Apple, and stapled, so Gatekeeper accepts it
+without any quarantine workaround. Binaries you build from source are not
+signed or notarized.
 
 From source:
 
