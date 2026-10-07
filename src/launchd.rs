@@ -421,8 +421,8 @@ fn disconnect_all_connections_once() {
         // `PrivilegedClient::disconnect_connection_for_teardown`'s doc
         // comment).
         match client.disconnect_connection_for_teardown(conn.id) {
-            Ok(()) => println!("Disconnected {}", conn.id),
-            Err(error) => eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id),
+            Ok(()) => println!("Disconnected {}", conn.label()),
+            Err(error) => eprintln!("Warning: failed to disconnect {}: {error:#}", conn.label()),
         }
     }
 }

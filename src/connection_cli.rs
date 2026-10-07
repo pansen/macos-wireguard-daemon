@@ -86,6 +86,15 @@ fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<Con
     }
 }
 
+/// Id plus name for output. Best effort: falls back to the bare id if the
+/// lookup fails, since the action being reported has already succeeded.
+fn label_for(client: &PrivilegedClient, id: ConnectionId) -> String {
+    match client.get_connection(id) {
+        Ok(conn) => conn.label(),
+        Err(_) => id.to_string(),
+    }
+}
+
 /// How long a completion lookup will wait on the daemon before giving up.
 ///
 /// A <TAB> that hangs the terminal is worse than one that offers nothing, and
@@ -186,7 +195,7 @@ fn cmd_add(
         std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
     let client = PrivilegedClient::new();
     let id = client.add_connection(&conf_text, global, start_mode, name.clone(), mtu, force)?;
-    println!("Connection id: {id}");
+    println!("Connection id: {}", id.label(name.as_deref()));
     println!(
         "  (byte-for-byte-identical resubmissions of this file will return the same id \
          without prompting again)"
@@ -213,8 +222,9 @@ fn cmd_add(
             .collect();
         for conn in stale {
             println!(
-                "Removing stale connection {} (same name {name:?}, superseded by {id})",
-                conn.id
+                "Removing stale connection {} (same name {name:?}, superseded by {})",
+                conn.label(),
+                id.label(Some(name.as_str()))
             );
             disconnect_and_remove_stale(&client, conn.id)?;
         }
@@ -306,8 +316,9 @@ fn print_connections(scope: ConnectionScope) -> anyhow::Result<()> {
 fn cmd_remove(id: &str) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
+    let label = label_for(&client, id);
     client.remove_connection(id)?;
-    println!("Removed connection {id}");
+    println!("Removed connection {label}");
     Ok(())
 }
 
@@ -315,7 +326,7 @@ fn cmd_connect(id: &str, debug: bool) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
     client.connect_connection(id, debug)?;
-    println!("Connected {id}");
+    println!("Connected {}", label_for(&client, id));
     Ok(())
 }
 
@@ -337,9 +348,9 @@ fn cmd_disconnect(id: Option<&str>, all: bool) -> anyhow::Result<()> {
         let mut failed = false;
         for conn in connected {
             match client.disconnect_connection(conn.id) {
-                Ok(()) => println!("Disconnected {}", conn.id),
+                Ok(()) => println!("Disconnected {}", conn.label()),
                 Err(error) => {
-                    eprintln!("Failed to disconnect {}: {error:#}", conn.id);
+                    eprintln!("Failed to disconnect {}: {error:#}", conn.label());
                     failed = true;
                 }
             }
@@ -351,7 +362,7 @@ fn cmd_disconnect(id: Option<&str>, all: bool) -> anyhow::Result<()> {
     // clap enforces exactly one of `id`/`--all` at parse time.
     let id = resolve_id(&client, id.expect("clap enforces id is set without --all"))?;
     client.disconnect_connection(id)?;
-    println!("Disconnected {id}");
+    println!("Disconnected {}", label_for(&client, id));
     Ok(())
 }
 
@@ -359,7 +370,10 @@ fn cmd_mode(id: &str, start_mode: ConnectionStartMode) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
     client.set_connection_mode(id, start_mode)?;
-    println!("Set {id} start mode to {start_mode:?}");
+    println!(
+        "Set {} start mode to {start_mode:?}",
+        label_for(&client, id)
+    );
     Ok(())
 }
 

@@ -62,10 +62,10 @@ fn disconnect_all_mine() -> anyhow::Result<()> {
         // `PrivilegedClient::disconnect_connection_for_teardown`'s doc
         // comment).
         if let Err(error) = client.disconnect_connection_for_teardown(conn.id) {
-            eprintln!("Warning: failed to disconnect {}: {error:#}", conn.id);
+            eprintln!("Warning: failed to disconnect {}: {error:#}", conn.label());
             continue;
         }
-        println!("Disconnected {}", conn.id);
+        println!("Disconnected {}", conn.label());
     }
     Ok(())
 }

@@ -39,6 +39,35 @@ impl Default for ConnectionId {
     }
 }
 
+/// Default string joining a connection id and its name in user-facing output.
+pub const LABEL_GLUE: &str = "::";
+
+impl ConnectionId {
+    /// `<id><glue><name>` for informative output, or just the id when the
+    /// connection has no name.
+    #[must_use]
+    pub fn label_with(&self, name: Option<&str>, glue: &str) -> String {
+        match name {
+            Some(name) => format!("{self}{glue}{name}"),
+            None => self.to_string(),
+        }
+    }
+
+    /// [`Self::label_with`] using [`LABEL_GLUE`].
+    #[must_use]
+    pub fn label(&self, name: Option<&str>) -> String {
+        self.label_with(name, LABEL_GLUE)
+    }
+}
+
+impl ConnectionSummary {
+    /// Id plus name, see [`ConnectionId::label`].
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.id.label(self.name.as_deref())
+    }
+}
+
 impl std::fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
