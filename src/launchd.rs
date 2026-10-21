@@ -95,7 +95,7 @@ const ALLOWED_BINARY_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin",
 
 /// Where a not-yet-trusted binary is copied to before it's trusted.
 /// Matches the Makefile's `WGD_BIN` convention.
-const TRUSTED_BIN_PATH: &str = "/usr/local/bin/wgd";
+pub(crate) const TRUSTED_BIN_PATH: &str = "/usr/local/bin/wgd";
 
 pub fn validate_binary_location(invoked: &Path, resolved: &Path) -> anyhow::Result<()> {
     validate_one(invoked)?;
@@ -309,6 +309,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     write_plist(&plist)?;
     bootstrap()?;
     reap_stray_privileged_daemons();
+    wait_for_launchd_socket();
 
     println!("wgd privileged daemon installed.");
     println!("  binary: {}", bin.display());
@@ -776,6 +777,40 @@ fn bootstrap() -> anyhow::Result<()> {
     run_checked("/bin/launchctl", &["enable", &target])?;
     run_checked("/bin/launchctl", &["bootstrap", "system", PLIST_PATH])?;
     Ok(())
+}
+
+/// Block until launchd accepts connections on the control socket again.
+///
+/// `launchctl bootstrap` returns before launchd has set up the job's
+/// `Sockets`: for a few hundred milliseconds afterwards the previous socket
+/// file is still on disk with nothing listening, so connects fail with
+/// `ECONNREFUSED`. A client in that window (e.g. `wgd launchd reload`'s very
+/// next step) would otherwise read the daemon as down. Connecting makes
+/// launchd spawn the daemon on demand, which then idles out as usual.
+/// Best-effort: a socket that never shows up is reported, not fatal, since
+/// the plist is already installed and `launchd restart` can recover it.
+fn wait_for_launchd_socket() {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let socket_path = config::privileged_socket_path();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(_) => return,
+            Err(error) if std::time::Instant::now() >= deadline => {
+                eprintln!(
+                    "Warning: launchd socket {} not reachable after {}s: {error}; \
+                     try: sudo {TRUSTED_BIN_PATH} launchd restart",
+                    socket_path.display(),
+                    TIMEOUT.as_secs()
+                );
+                return;
+            }
+            Err(error) => {
+                debug!(error = %error, "launchd_socket_not_ready");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// Kill any `wgd privileged --serve` process launchd is not currently

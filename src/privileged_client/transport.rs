@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -86,6 +86,35 @@ pub(crate) fn is_autostart_connect_error(err: &std::io::Error) -> bool {
         || err.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
+/// Whether `wgd launchd install` registered the privileged daemon with
+/// launchd. If so, launchd is the only thing allowed to start it: see
+/// `PrivilegedClient::wait_for_launchd_socket`.
+fn launchd_daemon_installed() -> bool {
+    std::path::Path::new(crate::launchd::PLIST_PATH).exists()
+}
+
+/// The running wgd binary, if root may execute it. A daemon or stdio helper
+/// started from anywhere else (e.g. Homebrew's user-owned `/opt/homebrew`)
+/// answers requests but refuses to spawn tunnel helpers (see
+/// `privileged::daemon::self_executable_for_spawn`), so it must never be
+/// started in the first place.
+fn trusted_current_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
+    crate::trusted_exec::validate_root_owned_path(
+        &exe,
+        crate::trusted_exec::TrustedPath::Executable,
+    )
+    .map_err(|e| {
+        AppError::Other(format!(
+            "refusing to start the privileged daemon via sudo: {}; or install the daemon \
+             with: sudo wgd launchd install",
+            e
+        ))
+    })?;
+    Ok(exe)
+}
+
 pub(crate) fn is_transport_error(err: &AppError) -> bool {
     match err {
         AppError::Other(message) => {
@@ -151,6 +180,10 @@ impl PrivilegedClient {
             )));
         }
 
+        if launchd_daemon_installed() {
+            return self.wait_for_launchd_socket();
+        }
+
         self.autostart_daemon()?;
         self.try_connect_socket().map_err(|e| {
             AppError::Other(format!(
@@ -174,6 +207,41 @@ impl PrivilegedClient {
         self.wait_until_ready()?;
         tracing::trace!("privileged_ctl_autostart_ready");
         Ok(())
+    }
+
+    /// The socket of a launchd-managed daemon refused or is missing. launchd
+    /// owns both the socket and the process, so the only safe reaction is to
+    /// wait for it; a sudo-autostarted daemon would treat the refusing socket
+    /// as stale, unlink it, and take over the path from launchd for good.
+    /// Gives up after `autostart_timeout` with a pointer to the launchd
+    /// restart instead of falling back to autostart.
+    fn wait_for_launchd_socket(&self) -> Result<UnixStream> {
+        debug!(
+            plist = crate::launchd::PLIST_PATH,
+            timeout_ms = self.autostart_timeout.as_millis() as u64,
+            "privileged_ctl_launchd_managed_wait"
+        );
+        let deadline = Instant::now() + self.autostart_timeout;
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            match self.try_connect_socket() {
+                Ok(stream) => {
+                    debug!("privileged_ctl_launchd_managed_connect_ok");
+                    return Ok(stream);
+                }
+                Err(e) if is_autostart_connect_error(&e) && Instant::now() < deadline => {}
+                Err(e) => {
+                    return Err(AppError::Other(format!(
+                        "privileged daemon is managed by launchd ({}) but its socket {} is \
+                         unavailable: {}; restart it with: sudo {} launchd restart",
+                        crate::launchd::PLIST_PATH,
+                        self.socket_path.display(),
+                        e,
+                        crate::launchd::TRUSTED_BIN_PATH
+                    )));
+                }
+            }
+        }
     }
 
     fn acquire_startup_lock(&self) -> Result<std::fs::File> {
@@ -228,8 +296,9 @@ impl PrivilegedClient {
 
     fn spawn_privileged_daemon(&self) -> Result<()> {
         const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
+        let exe = trusted_current_exe()?;
         debug!("privileged_daemon_start_non_interactive_launch_attempt");
-        if self.run_sudo_non_interactive_launch()? {
+        if self.run_sudo_non_interactive_launch(&exe)? {
             debug!("privileged_daemon_start_non_interactive_launch_ok");
             return Ok(());
         }
@@ -279,7 +348,7 @@ impl PrivilegedClient {
         }
 
         debug!("privileged_daemon_start_retry_non_interactive_after_validate");
-        if self.run_sudo_non_interactive_launch()? {
+        if self.run_sudo_non_interactive_launch(&exe)? {
             debug!("privileged_daemon_start_retry_launch_ok");
             return Ok(());
         }
@@ -298,9 +367,7 @@ impl PrivilegedClient {
         )))
     }
 
-    fn run_sudo_non_interactive_launch(&self) -> Result<bool> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
+    fn run_sudo_non_interactive_launch(&self, exe: &Path) -> Result<bool> {
         let mut command = Command::new("sudo");
         command
             .arg("-n")
@@ -371,6 +438,7 @@ impl PrivilegedClient {
     pub(crate) fn spawn_privileged_stdio_session(&self) -> Result<StdioSession> {
         const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
 
+        let exe = trusted_current_exe()?;
         let probe = self.run_sudo_non_interactive_probe()?;
         if !probe.status.success() {
             let stderr = String::from_utf8_lossy(&probe.stderr);
@@ -406,13 +474,10 @@ impl PrivilegedClient {
             }
         }
 
-        self.spawn_privileged_stdio_session_non_interactive()
+        self.spawn_privileged_stdio_session_non_interactive(&exe)
     }
 
-    fn spawn_privileged_stdio_session_non_interactive(&self) -> Result<StdioSession> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
-
+    fn spawn_privileged_stdio_session_non_interactive(&self, exe: &Path) -> Result<StdioSession> {
         debug!("privileged_stdio_helper_spawn_begin");
         let mut command = Command::new("sudo");
         command
@@ -698,11 +763,21 @@ enum Frame {
 #[cfg(test)]
 mod tests {
     use super::super::{PrivilegedClient, PrivilegedResponse};
-    use super::{read_framed_response, Frame, Level, LogLineFilter};
+    use super::{read_framed_response, trusted_current_exe, Frame, Level, LogLineFilter};
     use crate::privileged_api::{ConnectionScope, PrivilegedRequest};
     use std::io::Cursor;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn sudo_start_refuses_a_user_owned_executable() {
+        // The test binary lives under the user-owned `target/`, the same
+        // situation as Homebrew's `/opt/homebrew/bin/wgd`.
+        let err = trusted_current_exe().expect_err("user-owned binary must be refused");
+        assert!(err
+            .to_string()
+            .contains("untrusted privileged executable path"));
+    }
 
     #[test]
     fn request_timeout_bounds_a_peer_that_accepts_but_never_answers() {
