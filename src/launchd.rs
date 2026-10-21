@@ -459,28 +459,80 @@ fn reconnect_automatic_connections() {
     // Per-user connections belong to a GUI session: only bring them up for
     // the user running the install, and only while their session agent is
     // loaded (it tears them down again at logout).
-    let session_owner = invoking_user_uid()
-        .map(Uid::as_raw)
-        .filter(|&uid| crate::session_agent::is_loaded(uid));
-    for conn in connections
-        .iter()
-        .filter(|conn| is_post_install_candidate(conn, session_owner))
-    {
-        match client.connect_connection_for_reconciliation(conn.id, false) {
-            Ok(()) => println!("Reconnected {}", conn.label()),
-            Err(error) => eprintln!("Warning: failed to reconnect {}: {error:#}", conn.label()),
+    let session = invoking_user_uid().map(|uid| InstallSession {
+        uid: uid.as_raw(),
+        agent_loaded: crate::session_agent::is_loaded(uid.as_raw()),
+    });
+    for conn in &connections {
+        match post_install_action(conn, session) {
+            PostInstallAction::Ignore => {}
+            // Said out loud: a tunnel that silently stays down after an
+            // upgrade is indistinguishable from this step not running at all.
+            PostInstallAction::Skip(reason) => {
+                println!("Not reconnecting {}: {reason}", conn.label());
+            }
+            PostInstallAction::Reconnect => {
+                match client.connect_connection_for_reconciliation(conn.id, false) {
+                    Ok(()) => println!("Reconnected {}", conn.label()),
+                    Err(error) => {
+                        eprintln!("Warning: failed to reconnect {}: {error:#}", conn.label());
+                    }
+                }
+            }
         }
     }
 }
 
-/// Whether `reconnect_automatic_connections` should bring `conn` up:
-/// `Automatic`, currently down, not explicitly disconnected, and either
-/// global or owned by `session_owner`.
-fn is_post_install_candidate(conn: &ConnectionSummary, session_owner: Option<u32>) -> bool {
-    conn.start_mode == ConnectionStartMode::Automatic
-        && !conn.connected
-        && !conn.user_disconnected
-        && (conn.global || (session_owner.is_some() && conn.owner_uid == session_owner))
+/// The user who ran the install via `sudo`, as seen by
+/// `reconnect_automatic_connections`.
+#[derive(Clone, Copy)]
+struct InstallSession {
+    uid: u32,
+    agent_loaded: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostInstallAction {
+    /// Not an `Automatic` connection that is down; nothing to explain.
+    Ignore,
+    /// Down although `Automatic`, and deliberately left down for this reason.
+    Skip(String),
+    Reconnect,
+}
+
+/// What `reconnect_automatic_connections` does with `conn`: bring up every
+/// `Automatic` connection that is down, unless it was explicitly
+/// disconnected or is a per-user connection without a matching GUI session.
+fn post_install_action(
+    conn: &ConnectionSummary,
+    session: Option<InstallSession>,
+) -> PostInstallAction {
+    if conn.start_mode != ConnectionStartMode::Automatic || conn.connected {
+        return PostInstallAction::Ignore;
+    }
+    if conn.user_disconnected {
+        return PostInstallAction::Skip(
+            "explicitly disconnected; `wgd connection connect` brings it back".into(),
+        );
+    }
+    if conn.global {
+        return PostInstallAction::Reconnect;
+    }
+    let owner = conn
+        .owner_uid
+        .map_or_else(|| "-".to_string(), |uid| uid.to_string());
+    match session {
+        None => PostInstallAction::Skip(format!(
+            "owned by uid {owner}, but the install did not run via sudo from a user session"
+        )),
+        Some(session) if conn.owner_uid != Some(session.uid) => PostInstallAction::Skip(format!(
+            "owned by uid {owner}; its session agent reconnects it at that user's next login"
+        )),
+        Some(session) if !session.agent_loaded => PostInstallAction::Skip(format!(
+            "session agent for uid {owner} is not loaded (install it with `wgd launchd agent install`)"
+        )),
+        Some(_) => PostInstallAction::Reconnect,
+    }
 }
 
 /// Bail unless running as root, with a hint on how to re-invoke this command.
@@ -989,26 +1041,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn post_install_reconnects_down_automatic_connections_of_the_session_owner_and_globals() {
-        assert!(is_post_install_candidate(
-            &summary(false, Some(501)),
-            Some(501)
-        ));
-        assert!(is_post_install_candidate(&summary(true, None), Some(501)));
-        assert!(is_post_install_candidate(&summary(true, None), None));
+    fn session(uid: u32, agent_loaded: bool) -> Option<InstallSession> {
+        Some(InstallSession { uid, agent_loaded })
+    }
+
+    fn is_skip(action: PostInstallAction) -> bool {
+        matches!(action, PostInstallAction::Skip(_))
     }
 
     #[test]
-    fn post_install_skips_other_users_and_sessionless_installs() {
-        assert!(!is_post_install_candidate(
+    fn post_install_reconnects_down_automatic_connections_of_the_session_owner_and_globals() {
+        let mine = summary(false, Some(501));
+        let global = summary(true, None);
+        assert_eq!(
+            post_install_action(&mine, session(501, true)),
+            PostInstallAction::Reconnect
+        );
+        assert_eq!(
+            post_install_action(&global, session(501, false)),
+            PostInstallAction::Reconnect
+        );
+        assert_eq!(
+            post_install_action(&global, None),
+            PostInstallAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn post_install_explains_per_user_connections_it_leaves_down() {
+        let mine = summary(false, Some(501));
+        assert!(is_skip(post_install_action(
             &summary(false, Some(502)),
-            Some(501)
-        ));
-        // No GUI session (e.g. an upgrade over ssh): per-user tunnels stay down
-        // until that user's session agent starts.
-        assert!(!is_post_install_candidate(&summary(false, Some(501)), None));
-        assert!(!is_post_install_candidate(&summary(false, None), None));
+            session(501, true)
+        )));
+        // No GUI session agent (e.g. an upgrade over ssh): per-user tunnels
+        // stay down until that user's session agent starts.
+        assert!(is_skip(post_install_action(&mine, session(501, false))));
+        assert!(is_skip(post_install_action(&mine, None)));
     }
 
     #[test]
@@ -1020,9 +1089,18 @@ mod tests {
         let mut user_disconnected = summary(true, None);
         user_disconnected.user_disconnected = true;
 
-        assert!(!is_post_install_candidate(&manual, Some(501)));
-        assert!(!is_post_install_candidate(&up, Some(501)));
-        assert!(!is_post_install_candidate(&user_disconnected, Some(501)));
+        assert_eq!(
+            post_install_action(&manual, session(501, true)),
+            PostInstallAction::Ignore
+        );
+        assert_eq!(
+            post_install_action(&up, session(501, true)),
+            PostInstallAction::Ignore
+        );
+        assert!(is_skip(post_install_action(
+            &user_disconnected,
+            session(501, true)
+        )));
     }
 
     #[test]

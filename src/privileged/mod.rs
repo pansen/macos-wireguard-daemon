@@ -35,7 +35,9 @@ use nix::unistd::{chown, Gid};
 use tracing::{debug, info};
 
 use crate::config;
-use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
+use crate::privileged_api::{
+    ConnectReason, DisconnectReason, PrivilegedRequest, PrivilegedResponse,
+};
 
 use dispatch::dispatch;
 
@@ -399,6 +401,7 @@ fn process_request_payload(
     }
 
     let request_kind = describe_request(&request);
+    let reason = request_reason(&request);
     // `None` (stdio) means the caller has already proven root by reaching
     // this process at all -- see `dispatch::PeerOrigin`'s doc comment.
     let origin = match peer {
@@ -407,13 +410,17 @@ fn process_request_payload(
                 transport = ?"socket",
                 uid = ?uid,
                 gid = ?gid,
-                request = ?request_kind, "privileged_request_received");
+                request = ?request_kind,
+                reason,
+                "privileged_request_received");
             dispatch::PeerOrigin::Socket(uid)
         }
         None => {
             info!(
                 transport = ?"stdio",
-                request = ?request_kind, "privileged_request_received");
+                request = ?request_kind,
+                reason,
+                "privileged_request_received");
             dispatch::PeerOrigin::Stdio
         }
     };
@@ -442,6 +449,23 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::ListConnections { .. } => "ListConnections",
         PrivilegedRequest::GetConnection { .. } => "GetConnection",
         PrivilegedRequest::ListDnsCustody => "ListDnsCustody",
+    }
+}
+
+/// Why a connect/disconnect was requested. Logged with the request because
+/// it decides `user_disconnected`, which in turn decides whether automatic
+/// reconnects (session agent, post-install) leave a tunnel down.
+fn request_reason(request: &PrivilegedRequest) -> Option<&'static str> {
+    match request {
+        PrivilegedRequest::ConnectConnection { reason, .. } => Some(match reason {
+            ConnectReason::User => "user",
+            ConnectReason::Reconciliation => "reconciliation",
+        }),
+        PrivilegedRequest::DisconnectConnection { reason, .. } => Some(match reason {
+            DisconnectReason::User => "user",
+            DisconnectReason::SessionTeardown => "teardown",
+        }),
+        _ => None,
     }
 }
 
