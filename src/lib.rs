@@ -6,8 +6,10 @@
 // Provider-agnostic infrastructure
 pub mod cli;
 pub mod color;
+pub mod completion;
 pub mod config;
 pub mod dns_custody;
+pub mod doctor;
 // Also home to the `<ID>` completer `cli` attaches to its connection
 // positionals, so `cli` cannot compile without it.
 pub mod connection_cli;
@@ -15,10 +17,12 @@ pub mod error;
 pub mod launchctl;
 pub mod launchd;
 pub mod logging;
+pub mod logs;
 pub mod macos_dns;
 pub mod reload;
 pub mod session_agent;
 pub mod state_file;
+pub mod status;
 pub mod trusted_exec;
 
 // WireGuard config parsing shared by the CLI and the privileged daemon.

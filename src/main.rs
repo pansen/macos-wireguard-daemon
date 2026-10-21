@@ -1,12 +1,15 @@
 mod cli;
 mod color;
+mod completion;
 mod config;
 mod connection_cli;
 mod dns_custody;
+mod doctor;
 mod error;
 mod launchctl;
 mod launchd;
 mod logging;
+mod logs;
 mod macos_dns;
 mod privileged;
 mod privileged_api;
@@ -14,6 +17,7 @@ mod privileged_client;
 mod reload;
 mod session_agent;
 mod state_file;
+mod status;
 mod trusted_exec;
 mod userspace_helper;
 mod wireguard;
@@ -21,8 +25,8 @@ mod wireguard;
 use clap::{CommandFactory, Parser};
 use tracing::error;
 
-use cli::{Cli, LaunchdCommand, TopCommand};
-use privileged_api::ConnectionScope;
+use anyhow::Context;
+use cli::{Cli, DnsCommand, LaunchdCommand, TopCommand};
 
 fn main() {
     if userspace_helper::maybe_run_from_env() {
@@ -75,10 +79,53 @@ fn main() {
             }
         }
         // Status is a quick sync command, no tokio needed.
-        TopCommand::Status => {
+        TopCommand::Status { dns } => {
             init_logging(cli.verbose);
-            if let Err(e) = cmd_status() {
+            let result = status::cmd_status();
+            // Printed even when the daemon is unreachable: live DNS is read
+            // straight from `networksetup` and matters most exactly then.
+            if dns {
+                status::print_service_dns();
+            }
+            if let Err(e) = result {
                 error!( command = ?"status", error = ?e.to_string(), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Doctor {
+            report,
+            caller_in_wgd_group,
+        } => {
+            init_logging(cli.verbose);
+            if let Err(e) = doctor::dispatch(report, caller_in_wgd_group) {
+                error!(command = ?"doctor", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Logs(args) => {
+            init_logging(cli.verbose);
+            if let Err(e) = logs::dispatch(args) {
+                error!(command = ?"logs", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Dns {
+            command: DnsCommand::Repair,
+        } => {
+            init_logging(cli.verbose);
+            if let Err(e) = cmd_dns_repair() {
+                error!(command = ?"dns repair", error = %format!("{e:#}"), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Completion { command } => {
+            init_logging(cli.verbose);
+            if let Err(e) = completion::dispatch(command) {
+                error!(command = ?"completion", error = %format!("{e:#}"), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -112,122 +159,30 @@ fn defaults_to_debug(command: &TopCommand) -> bool {
     matches!(command, TopCommand::Launchd { command: LaunchdCommand::Reload(args) } if !args.silent)
 }
 
-/// `wgd status`: built entirely from the privileged connection store --
-/// this user's own connections plus every global one (global connections
-/// have no owner to match `Mine`, so it's fetched as a second, disjoint
-/// scope and appended).
-fn cmd_status() -> anyhow::Result<()> {
-    let client = privileged_client::PrivilegedClient::new();
-    let mut connections = client.list_connections(ConnectionScope::Mine)?;
-    connections.extend(client.list_connections(ConnectionScope::Global)?);
-
-    if connections.is_empty() {
-        println!("No stored connections. Add one with: wgd connection add --file <path>");
-        print_dns_custody_notes(&client);
-        return Ok(());
+/// `wgd dns repair`: the visible name for `wgd privileged --sweep-dns`.
+/// Re-invokes itself through `sudo` when not root, like `launchd purge`.
+fn cmd_dns_repair() -> anyhow::Result<()> {
+    if nix::unistd::geteuid().is_root() {
+        return privileged::sweep_dns_once();
     }
-
-    let headers = ["Id", "Name", "Global", "Mode", "Connected", "Interface"];
-    let rows: Vec<[String; 6]> = connections
-        .iter()
-        .map(|conn| {
-            [
-                conn.id.to_string(),
-                conn.name.clone().unwrap_or_else(|| "-".to_string()),
-                conn.global.to_string(),
-                format!("{:?}", conn.start_mode),
-                conn.connected.to_string(),
-                conn.interface.clone(),
-            ]
-        })
-        .collect();
-
-    // Size each column to the widest of its header and cells so long values
-    // don't push the table out of alignment.
-    let mut widths = headers.map(str::len);
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
+    let exe = std::env::current_exe().context("failed to determine the running wgd binary path")?;
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg(&exe);
+    if logging::debug_enabled() {
+        cmd.arg("--debug");
     }
-
-    let render_row = |cells: &[String]| {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
-
-    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
-    println!(
-        "{}",
-        color::table_frame(render_row(&header_cells).trim_end())
+    cmd.args(["dns", "repair"]);
+    tracing::warn!(
+        action = "dns_repair",
+        method = "sudo",
+        cause = "restoring DNS on macOS network services requires root",
+        "admin_authentication_requested"
     );
-    let rule = widths
-        .iter()
-        .map(|w| "-".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("-+-");
-    println!("{}", color::table_frame(&rule));
-    for row in &rows {
-        println!("{}", render_row(row).trim_end());
-    }
-
-    // Beneath the summary table, print per-connected-interface detail: the
-    // WireGuard tunnel state from `wg show`, and the live route/DNS overview.
-    // Both live behind the privileged service and are best-effort: a fetch
-    // failure prints to stderr but never fails `status`. A non-root caller
-    // is denied these two calls for a *global* connection by the daemon's
-    // own `legacy_interface_access_denied` (global detail is root-only,
-    // matching every other global mutation/read), so skip them here rather
-    // than printing an `Auth` error to stderr for every global connection on
-    // every plain `wgd status` a non-admin user runs.
-    let is_root = nix::unistd::geteuid().is_root();
-    for conn in connections
-        .iter()
-        .filter(|c| c.connected && (is_root || !c.global))
-    {
-        match client.wg_show(&conn.interface) {
-            Ok(output) if !output.trim().is_empty() => {
-                println!();
-                println!("{}", color::wg_show(output.trim_end()));
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("wg show {} failed: {}", conn.interface, e),
-        }
-
-        match client.network_overview(&conn.interface) {
-            Ok(Some(overview)) => {
-                println!();
-                println!("{}", color::tables(overview.trim_end()));
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("network overview for {} unavailable: {}", conn.interface, e),
-        }
-    }
-
-    print_dns_custody_notes(&client);
+    let status = cmd
+        .status()
+        .context("failed to run sudo for wgd dns repair")?;
+    anyhow::ensure!(status.success(), "sudo wgd dns repair failed ({status})");
     Ok(())
-}
-
-/// Print DNS custody state that is not normal; a healthy system prints
-/// nothing. Best-effort like the per-interface detail above: an older daemon
-/// that does not know the request, or a failed call, only costs these lines.
-fn print_dns_custody_notes(client: &privileged_client::PrivilegedClient) {
-    match client.list_dns_custody() {
-        Ok(status) => {
-            let lines = connection_cli::format_dns_custody_notes(&status);
-            if !lines.is_empty() {
-                println!();
-                for line in lines {
-                    println!("{line}");
-                }
-            }
-        }
-        Err(e) => tracing::debug!(error = %e, "dns_custody_status_unavailable"),
-    }
 }
 
 #[cfg(test)]
@@ -244,7 +199,7 @@ mod tests {
         assert!(!defaults_to_debug(&TopCommand::Launchd {
             command: LaunchdCommand::Reload(ReloadArgs { silent: true }),
         }));
-        assert!(!defaults_to_debug(&TopCommand::Status));
+        assert!(!defaults_to_debug(&TopCommand::Status { dns: false }));
     }
 
     #[test]

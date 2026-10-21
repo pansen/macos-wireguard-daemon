@@ -209,9 +209,9 @@ pub fn serve(
     )
 }
 
-/// `wgd privileged --sweep-dns`: restore DNS left by dead helpers once, without
-/// a daemon, then remove `dns-custody/` if no record is left. Used by
-/// `make uninstall.dns`.
+/// `wgd dns repair` (and hidden alias `wgd privileged --sweep-dns`): restore
+/// DNS left by dead helpers once, without a daemon, then remove `dns-custody/`
+/// if no record is left.
 pub fn sweep_dns_once() -> anyhow::Result<()> {
     anyhow::ensure!(
         nix::unistd::geteuid().is_root(),
@@ -229,12 +229,34 @@ pub fn sweep_dns_once() -> anyhow::Result<()> {
     for kept in &outcome.kept {
         println!(
             "Kept the DNS record of {}: {} not in the current network location. \
-             Switch location and rerun this command, or use `make purge` to drop it.",
+             Switch location and rerun `wgd dns repair`, or use `wgd launchd purge` to drop it.",
             kept.interface,
             kept.services.join(", ")
         );
     }
     Ok(())
+}
+
+/// Best-effort DNS custody sweep run by `wgd launchd purge` before it deletes
+/// `/Library/Application Support/wgd`, so a crashed helper's DNS override is
+/// restored before its custody record is wiped.
+pub(crate) fn sweep_dns_for_purge() {
+    if !config::dns_custody_dir().exists() {
+        return;
+    }
+    match dns_sweep::sweep_once_and_clean() {
+        Ok(outcome) => {
+            if outcome.summary.restored + outcome.summary.cleared > 0 {
+                println!(
+                    "Restored DNS on {} service(s) (cleared {}).",
+                    outcome.summary.restored, outcome.summary.cleared
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("Warning: DNS sweep before purge failed: {error}");
+        }
+    }
 }
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
