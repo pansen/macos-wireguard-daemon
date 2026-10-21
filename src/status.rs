@@ -44,8 +44,19 @@ pub fn render_status(
     diag: &mut String,
 ) -> anyhow::Result<Vec<ConnectionSummary>> {
     let client = PrivilegedClient::new();
-    let mut connections = client.list_connections(ConnectionScope::Mine)?;
-    connections.extend(client.list_connections(ConnectionScope::Global)?);
+    let is_root = nix::unistd::geteuid().is_root();
+    let connections = if is_root {
+        let all = client.list_connections(ConnectionScope::All)?;
+        let sudo_uid = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&uid| uid != 0);
+        select_root_status_connections(all, sudo_uid)
+    } else {
+        let mut connections = client.list_connections(ConnectionScope::Mine)?;
+        connections.extend(client.list_connections(ConnectionScope::Global)?);
+        connections
+    };
 
     if connections.is_empty() {
         let _ = writeln!(
@@ -114,7 +125,6 @@ pub fn render_status(
     // matching every other global mutation/read), so skip them here rather
     // than printing an `Auth` error for every global connection on
     // every plain `wgd status` a non-admin user runs.
-    let is_root = nix::unistd::geteuid().is_root();
     for conn in connections
         .iter()
         .filter(|c| c.connected && (is_root || !c.global))
@@ -185,5 +195,76 @@ fn render_dns_custody_notes(client: &PrivilegedClient, out: &mut String) {
             }
         }
         Err(e) => tracing::debug!(error = %e, "dns_custody_status_unavailable"),
+    }
+}
+
+/// Under `sudo` (including the root child `wgd doctor` spawns), the socket
+/// peer has UID 0, so `ConnectionScope::Mine` would match `owner_uid == Some(0)`
+/// and miss every per-user connection of the invoking user. Filter `All` to
+/// the invoking user's connections (`SUDO_UID`) plus globals (or keep all
+/// connections when `SUDO_UID` is absent), preserving the per-user-then-global
+/// ordering of the unprivileged path.
+fn select_root_status_connections(
+    all: Vec<ConnectionSummary>,
+    sudo_uid: Option<u32>,
+) -> Vec<ConnectionSummary> {
+    let (mut per_user, globals): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .filter(|conn| match sudo_uid {
+            Some(uid) => conn.global || conn.owner_uid == Some(uid),
+            None => true,
+        })
+        .partition(|conn| !conn.global);
+    per_user.extend(globals);
+    per_user
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::privileged_api::{ConnectionId, ConnectionStartMode};
+
+    fn sample_conn(name: &str, global: bool, owner_uid: Option<u32>) -> ConnectionSummary {
+        ConnectionSummary {
+            id: ConnectionId::new(),
+            global,
+            owner_uid,
+            start_mode: ConnectionStartMode::Manual,
+            name: Some(name.to_string()),
+            interface: format!("wg-{name}"),
+            connected: true,
+            user_disconnected: false,
+            addresses: vec![],
+            dns_servers: vec![],
+            mtu: None,
+            peers: vec![],
+            fingerprint: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn root_status_selects_sudo_users_per_user_connections_and_globals_in_order() {
+        let global = sample_conn("corp", true, None);
+        let alice = sample_conn("alice_vpn", false, Some(501));
+        let bob = sample_conn("bob_vpn", false, Some(502));
+
+        let selected = select_root_status_connections(
+            vec![global.clone(), alice.clone(), bob.clone()],
+            Some(501),
+        );
+        let names: Vec<&str> = selected
+            .iter()
+            .map(|c| c.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alice_vpn", "corp"]);
+
+        let all_for_direct_root = select_root_status_connections(vec![global, alice, bob], None);
+        let all_names: Vec<&str> = all_for_direct_root
+            .iter()
+            .map(|c| c.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(all_names, vec!["alice_vpn", "bob_vpn", "corp"]);
     }
 }

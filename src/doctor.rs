@@ -146,9 +146,7 @@ fn build_report(privileged: bool, caller_in_wgd_group: Option<bool>) -> String {
     for name in SECTIONS {
         let body = match name {
             "header" => header_section(),
-            "launchd status" if privileged => {
-                crate::launchd::collect_status_report(caller_in_wgd_group)
-            }
+            "launchd status" => crate::launchd::collect_status_report(caller_in_wgd_group),
             "dns per network service" => {
                 let mut body = String::new();
                 let mut diag = String::new();
@@ -494,21 +492,36 @@ pub fn redact_report(text: &str) -> String {
 
 fn redact_line(line: &str) -> String {
     let line = redact_secret_values(line);
+    // Reachability lines (`ok    <host>  peer endpoint ...`) always name an
+    // endpoint, even when the hostname uses a TLD outside `TLDS`.
+    let line_has_peer_endpoint = line.contains("  peer endpoint");
     let mut out = String::with_capacity(line.len());
     let mut token = String::new();
+    let mut next_is_endpoint = false;
     for c in line.chars() {
         if is_token_char(c) {
             token.push(c);
         } else {
             if !token.is_empty() {
-                out.push_str(&redact_token(&token));
+                let is_ep_label = matches!(
+                    token.to_ascii_lowercase().as_str(),
+                    "endpoint:" | "endpoint="
+                );
+                out.push_str(&redact_token_with_context(
+                    &token,
+                    next_is_endpoint || line_has_peer_endpoint,
+                ));
+                next_is_endpoint = is_ep_label;
                 token.clear();
             }
             out.push(c);
         }
     }
     if !token.is_empty() {
-        out.push_str(&redact_token(&token));
+        out.push_str(&redact_token_with_context(
+            &token,
+            next_is_endpoint || line_has_peer_endpoint,
+        ));
     }
     out
 }
@@ -564,11 +577,17 @@ fn redact_secret_values(line: &str) -> String {
     out
 }
 
-fn redact_token(token: &str) -> String {
+fn redact_token_with_context(token: &str, endpoint_context: bool) -> String {
     // `key=value`: keep the key, treat the value as its own token.
     if let Some(i) = token.find('=') {
         if i + 1 < token.len() && !is_wg_key(token) {
-            return format!("{}{}", &token[..=i], redact_token(&token[i + 1..]));
+            let key = &token[..i];
+            let is_ep = key.eq_ignore_ascii_case("endpoint");
+            return format!(
+                "{}{}",
+                &token[..=i],
+                redact_token_with_context(&token[i + 1..], endpoint_context || is_ep)
+            );
         }
     }
     if is_wg_key(token) {
@@ -577,8 +596,24 @@ fn redact_token(token: &str) -> String {
     }
     let core = token.trim_end_matches('.');
     let trail = &token[core.len()..];
-    if let Some(masked) = mask_ip_token(core).or_else(|| mask_domain_token(core)) {
+    if let Some(masked) = mask_ip_token(core).or_else(|| mask_domain_token(core, endpoint_context))
+    {
         return format!("{masked}{trail}");
+    }
+    // Unquoted bracketed lists (`allowed_ips=[203.0.113.42/32, 198.51.100.7/32]`,
+    // `[vpn.example.com:51820]`): strip outer `[` / `]` and retry so `[` and `]`
+    // in `is_token_char` (kept for `[v6]:port`) don't shield list elements.
+    let inner = core.trim_start_matches('[').trim_end_matches(']');
+    if inner.len() != core.len() && !inner.is_empty() {
+        let lead_len = core.len() - core.trim_start_matches('[').len();
+        let end_pos = lead_len + inner.len();
+        let lead = &core[..lead_len];
+        let close = &core[end_pos..];
+        if let Some(masked) =
+            mask_ip_token(inner).or_else(|| mask_domain_token(inner, endpoint_context))
+        {
+            return format!("{lead}{masked}{close}{trail}");
+        }
     }
     token.to_string()
 }
@@ -679,8 +714,9 @@ fn is_public_v4(ip: std::net::Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
-/// A hostname ending in a known TLD, with an optional `:port`.
-fn mask_domain_token(core: &str) -> Option<String> {
+/// A hostname ending in a known TLD (or any alphabetic TLD when in an explicit
+/// `endpoint` context), with an optional `:port`.
+fn mask_domain_token(core: &str, allow_any_tld: bool) -> Option<String> {
     let (host, port) = match core.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
             (h, format!(":{p}"))
@@ -705,7 +741,12 @@ fn mask_domain_token(core: &str) -> Option<String> {
         return None;
     }
     let tld = labels[labels.len() - 1].to_ascii_lowercase();
-    if !TLDS.contains(&tld.as_str()) {
+    let valid_tld = if allow_any_tld {
+        tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())
+    } else {
+        TLDS.contains(&tld.as_str())
+    };
+    if !valid_tld {
         return None;
     }
     let n = host.len();
@@ -904,6 +945,26 @@ mod tests {
         assert_eq!(
             redact_report("endpoint: vpn.example.com:51820"),
             "endpoint: v*************m:51820"
+        );
+        // Unlisted TLDs are still masked in explicit endpoint contexts
+        // (`endpoint:`, `endpoint=`, reachability `peer endpoint`).
+        assert_eq!(
+            redact_report("  endpoint: gw.corp.ovh:51820"),
+            "  endpoint: g*********h:51820"
+        );
+        assert_eq!(
+            redact_report("endpoint=gw.corp.hetzner:51820"),
+            "endpoint=g*************r:51820"
+        );
+        assert_eq!(
+            redact_report("info  gw.corp.ovh  peer endpoint (home): no ICMP reply"),
+            "info  g*********h  peer endpoint (home): no ICMP reply"
+        );
+        // Unquoted bracketed lists (`allowed_ips=[...]`) still mask public IPs
+        // and hostnames at the list boundaries.
+        assert_eq!(
+            redact_report("allowed_ips=[203.0.113.42/32, 10.0.0.1/32, 198.51.100.7/32]"),
+            "allowed_ips=[203.*.*.42/32, 10.0.0.1/32, 198.*.*.7/32]"
         );
         for keep in [
             "/var/log/wgd/wg-ca40dce0.log",

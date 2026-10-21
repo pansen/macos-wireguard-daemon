@@ -401,7 +401,13 @@ fn uninstall_daemon_core() -> anyhow::Result<()> {
 fn cmd_status(caller_in_wgd_group: Option<bool>) -> anyhow::Result<()> {
     if !geteuid().is_root() {
         let in_group = caller_has_wgd_gid_in_process();
-        return escalate_launchd_status(in_group);
+        if let Err(e) = escalate_launchd_status(in_group) {
+            tracing::warn!(error = %format!("{e:#}"), "launchd_status_escalation_failed");
+            eprintln!("sudo unavailable or declined; running the unprivileged checks only");
+            let report = collect_status_report(Some(in_group));
+            print!("{report}");
+        }
+        return Ok(());
     }
 
     let report = collect_status_report(caller_in_wgd_group);
@@ -611,6 +617,9 @@ pub(crate) fn collect_status_report(caller_in_wgd_group: Option<bool>) -> String
         out,
         "==> daemon (expect: state = not running unless a DNS tunnel is up, sockets registered)"
     );
+    // `launchctl print system/...` works without root; only the custody
+    // watch note does not, because `dns-custody/` is 0700 root and
+    // `exists()` would just report false there.
     match std::process::Command::new("/bin/launchctl")
         .args(["print", &format!("system/{LABEL}")])
         .output()
@@ -637,7 +646,9 @@ pub(crate) fn collect_status_report(caller_in_wgd_group: Option<bool>) -> String
             let _ = writeln!(out, "  failed to run /bin/launchctl: {err}");
         }
     }
-    if config::dns_custody_watch_path().exists() {
+    if !geteuid().is_root() {
+        let _ = writeln!(out, "  DNS custody watch: skipped (needs sudo)");
+    } else if config::dns_custody_watch_path().exists() {
         let _ = writeln!(
             out,
             "  note: {} is present (DNS custody KeepAlive active)",
@@ -725,6 +736,9 @@ fn check_path_permissions(
                 "MISSING  {} (expected {expected_symbolic} root:{GROUP_NAME})",
                 path.display()
             );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && !geteuid().is_root() => {
+            return format!("skipped (needs sudo)  {}", path.display());
         }
         Err(err) => {
             return format!("ERROR  {}: {err}", path.display());
