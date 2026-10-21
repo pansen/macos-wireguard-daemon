@@ -21,6 +21,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// gotatun helper); this bounds how long the client's connection is kept open
 /// waiting for it, separate from the ordinary per-request `IO_TIMEOUT`.
 const PENDING_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the accept loop re-evaluates idle-exit while the DNS custody watch
+/// keeps the daemon resident.
+const RESIDENT_RECHECK_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 /// How often the accept loop re-checks a pending worker thread's channel when
 /// nothing else has woken it. Short enough that a finished worker's response
 /// is written promptly; long enough not to busy-loop the accept thread.
@@ -170,6 +177,7 @@ pub(super) fn serve(
     state: &mut ControlState,
     idle_timeout: Option<Duration>,
     background_work: &AtomicUsize,
+    resident: &AtomicUsize,
 ) -> anyhow::Result<()> {
     listener.set_nonblocking(true)?;
     let mut clients = Vec::new();
@@ -207,20 +215,27 @@ pub(super) fn serve(
         // mid-reconcile and kill the daemon while the gotatun helper it just
         // started is still coming up, leaving a connected tunnel with no
         // `active/<id>.json` record for it.
+        //
+        // `resident` is the DNS custody watch (see `dns_watch`): a daemon that
+        // watches a live helper must stay up, or nobody would notice its death.
         if clients.is_empty()
             && background_work.load(Ordering::SeqCst) == 0
+            && resident.load(Ordering::SeqCst) == 0
             && (state.should_exit_now()
                 || idle_timeout.is_some_and(|timeout| last_activity.elapsed() >= timeout))
         {
             return Ok(());
         }
-        wait_for_io(
-            &listener,
-            &clients,
-            last_activity,
-            idle_timeout,
-            background_work,
-        );
+        // While resident the idle deadline cannot fire, so a plain wait on it
+        // would spin. Sleep until the listener or a client needs attention, but
+        // re-check now and then: the watch releasing its count is not an event
+        // this poll can see.
+        let (wake_from, wake_after) = if resident.load(Ordering::SeqCst) == 0 {
+            (last_activity, idle_timeout)
+        } else {
+            (Instant::now(), Some(RESIDENT_RECHECK_INTERVAL))
+        };
+        wait_for_io(&listener, &clients, wake_from, wake_after, background_work);
     }
 }
 
@@ -346,6 +361,37 @@ mod tests {
     }
 
     #[test]
+    fn resident_count_blocks_idle_exit_until_released() {
+        let path = std::env::temp_dir().join(format!("wgd-resident-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let resident = std::sync::Arc::new(AtomicUsize::new(1));
+        let worker = {
+            let resident = resident.clone();
+            std::thread::spawn(move || {
+                serve(
+                    listener,
+                    &mut ControlState::new(false),
+                    Some(Duration::from_millis(20)),
+                    &AtomicUsize::new(0),
+                    &resident,
+                )
+                .unwrap();
+            })
+        };
+        // Well past the idle timeout: still serving because of the watch.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!worker.is_finished());
+        resident.store(0, Ordering::SeqCst);
+        let released = Instant::now();
+        while !worker.is_finished() && released.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker.is_finished());
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn listener_services_request_behind_idle_connection() {
         let path = std::env::temp_dir().join(format!("wgd-listener-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&path).unwrap();
@@ -359,6 +405,7 @@ mod tests {
                 listener,
                 &mut ControlState::new(false),
                 Some(Duration::from_millis(20)),
+                &AtomicUsize::new(0),
                 &AtomicUsize::new(0),
             )
             .unwrap();

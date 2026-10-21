@@ -30,13 +30,38 @@ fn socket_path(interface: &str) -> PathBuf {
 /// `Connect`/`Disconnect` (and on the boot/session reconciliation threads
 /// that call into this same `connect`/`disconnect`), not on the accept
 /// thread, so the daemon keeps serving other clients while this waits.
-fn lock_system_network_mutation() -> Result<std::fs::File> {
+pub(super) fn lock_system_network_mutation() -> Result<std::fs::File> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     crate::state_file::lock_with_timeout(
         &crate::config::privileged_runtime_dir().join("tunnel-operation.lock"),
         TIMEOUT,
     )
     .map_err(Into::into)
+}
+
+/// Confirm the helper behind a lingering socket is dead and remove what it left
+/// behind: DNS (via its custody record, if any) and its runtime files. Takes the
+/// system network mutation lock so no helper can be mid-start meanwhile.
+fn clear_dead_helper_leftovers(id: ConnectionId, interface: &str) -> Result<()> {
+    let _network_lock = lock_system_network_mutation()?;
+    // With a record: restores DNS and, for a dead helper, removes its files.
+    if let Err(error) =
+        super::dns_sweep::sweep_locked(super::dns_sweep::Scope::Interface(interface))
+    {
+        warn!(id = %id, error = %error, "connection_connect_dns_sweep_failed");
+    }
+    // Without a record (no DNS, or started before records existed) only the pid
+    // file can vouch for the helper. A record that is still on disk belongs to
+    // a live or already handled helper; leave that to the sweep above.
+    let has_record = crate::dns_custody::record_path(interface)
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    if !has_record {
+        super::runtime_files::remove_if_dead_locked(interface, || {
+            connection_store::helper_is_live_without_record(interface)
+        });
+    }
+    Ok(())
 }
 
 fn conflict() -> AppError {
@@ -89,6 +114,15 @@ pub(super) fn connect(
 
     let socket = socket_path(&stored.interface);
 
+    // A helper that died without teardown (SIGKILL, panic) leaves its socket
+    // behind, which would otherwise fail this connect with `conflict()` below
+    // or make the idempotency check treat a dead tunnel as up. Remove the
+    // leftovers once the helper is confirmed dead; a socket that still accepts
+    // connections is untouched and keeps yielding `conflict()`.
+    if socket.try_exists()? {
+        clear_dead_helper_leftovers(id, &stored.interface)?;
+    }
+
     // Anti-adoption/idempotency check, ported from `tunnel_state::connect`
     // (Finding 5): identity is now the stored fingerprint rather than a raw
     // config-content string, but the actual race guard is unchanged -- it is
@@ -123,9 +157,38 @@ pub(super) fn connect(
     run_hooks(&reparsed.pre_up, &stored.interface, "PreUp")?;
     {
         let _network_lock = lock_system_network_mutation()?;
+        // The directory is created at daemon start; re-ensure it here in case
+        // someone removed it while the daemon was running, because the helper
+        // never creates it (see `userspace_helper::persist_dns_custody`).
+        crate::config::ensure_dns_custody_dir()?;
+        // A crashed predecessor on this interface may have left DNS behind.
+        // The daemon's startup sweep normally resolved that already; doing it
+        // here too means the helper below can never capture a stray as the
+        // user's original. Best-effort: a failing sweep must not block connect.
+        if let Err(error) =
+            super::dns_sweep::sweep_locked(super::dns_sweep::Scope::Interface(&stored.interface))
+        {
+            warn!(id = %id, error = %error, "connection_connect_dns_sweep_failed");
+        }
+        // From here a crash can leave DNS behind. launchd keeps the daemon
+        // alive while this sentinel exists, so someone is always around to
+        // notice (see `dns_watch`).
+        if !reparsed.dns_servers.is_empty() {
+            super::dns_watch::create_sentinel_locked();
+        }
         // PreUp already ran; nothing to roll back here if this fails, since
         // the tunnel itself never came up.
-        super::commands::run_gotatun_up(&stored.interface, &stored.raw_conf, None, debug_enabled)?;
+        let up = super::commands::run_gotatun_up(
+            id,
+            &stored.interface,
+            &stored.raw_conf,
+            None,
+            debug_enabled,
+        );
+        // Success or not: watch the helper's record if it wrote one, and drop
+        // the sentinel again if nothing needs it.
+        super::dns_watch::settle_locked();
+        up?;
     }
     if let Err(error) = run_hooks(&reparsed.post_up, &stored.interface, "PostUp") {
         // Mirror `configure_network_macos`'s rollback-on-setup-failure

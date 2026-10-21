@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::privileged_api::{
     ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
-    DisconnectReason, PeerSummary, PrivilegedRequest, PrivilegedResponse,
+    DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest, PrivilegedResponse,
 };
 
 use super::authz;
@@ -188,6 +188,10 @@ pub(super) fn dispatch(
 
         PrivilegedRequest::GetConnection { id } => {
             DispatchOutcome::Immediate(handle_get_connection(origin, id))
+        }
+
+        PrivilegedRequest::ListDnsCustody => {
+            DispatchOutcome::Immediate(handle_list_dns_custody(origin))
         }
     }
 }
@@ -663,6 +667,28 @@ fn handle_list_connections(origin: PeerOrigin, scope: ConnectionScope) -> Privil
         })
         .collect();
     PrivilegedResponse::ConnectionList(summaries)
+}
+
+fn handle_list_dns_custody(origin: PeerOrigin) -> PrivilegedResponse {
+    // Entries of a removed connection have no owner left to match: root only.
+    let visible = |entry: &DnsCustodyEntry| {
+        origin.is_root()
+            || entry
+                .id
+                .and_then(|id| connection_store::load(id).ok().flatten())
+                .is_some_and(|stored| stored.global || Some(origin.uid()) == stored.owner_uid)
+    };
+    let mut status = super::dns_sweep::custody_status();
+    status.pending.retain(&visible);
+    status.deferred.retain(&visible);
+    if status
+        .last_restore
+        .as_ref()
+        .is_some_and(|e| !visible(&e.entry))
+    {
+        status.last_restore = None;
+    }
+    PrivilegedResponse::DnsCustody(status)
 }
 
 fn handle_get_connection(origin: PeerOrigin, id: ConnectionId) -> PrivilegedResponse {

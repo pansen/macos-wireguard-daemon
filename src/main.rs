@@ -2,10 +2,12 @@ mod cli;
 mod color;
 mod config;
 mod connection_cli;
+mod dns_custody;
 mod error;
 mod launchctl;
 mod launchd;
 mod logging;
+mod macos_dns;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
@@ -43,11 +45,20 @@ fn main() {
         // Privileged control server.
         TopCommand::Privileged {
             serve,
+            sweep_dns,
             stdio,
             authorized_group,
             idle_timeout_ms,
             autostarted,
         } => {
+            if sweep_dns {
+                init_logging(cli.verbose);
+                if let Err(e) = privileged::sweep_dns_once() {
+                    error!(command = ?"privileged --sweep-dns", error = %format!("{e:#}"), "command_failed");
+                    std::process::exit(1);
+                }
+                return;
+            }
             logging::init_service(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
@@ -112,6 +123,7 @@ fn cmd_status() -> anyhow::Result<()> {
 
     if connections.is_empty() {
         println!("No stored connections. Add one with: wgd connection add --file <path>");
+        print_dns_custody_notes(&client);
         return Ok(());
     }
 
@@ -196,7 +208,26 @@ fn cmd_status() -> anyhow::Result<()> {
         }
     }
 
+    print_dns_custody_notes(&client);
     Ok(())
+}
+
+/// Print DNS custody state that is not normal; a healthy system prints
+/// nothing. Best-effort like the per-interface detail above: an older daemon
+/// that does not know the request, or a failed call, only costs these lines.
+fn print_dns_custody_notes(client: &privileged_client::PrivilegedClient) {
+    match client.list_dns_custody() {
+        Ok(status) => {
+            let lines = connection_cli::format_dns_custody_notes(&status);
+            if !lines.is_empty() {
+                println!();
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "dns_custody_status_unavailable"),
+    }
 }
 
 #[cfg(test)]

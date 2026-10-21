@@ -17,7 +17,10 @@ mod connection_store;
 pub(crate) use connection_store::known_addresses;
 mod daemon;
 mod dispatch;
-mod managed_pids;
+mod dns_sweep;
+mod dns_watch;
+pub(crate) mod managed_pids;
+mod runtime_files;
 mod socket;
 
 use std::collections::HashSet;
@@ -171,6 +174,8 @@ pub fn serve(
     };
 
     let mut control_state = ControlState::new(cli_autostarted);
+    dns_watch::init();
+    let resident = dns_watch::resident_count();
     // Phase 3: bring up global `Automatic` connections in the background,
     // only once the listener above is already bound and accepting -- doing
     // this serially beforehand would delay every client behind N
@@ -184,11 +189,50 @@ pub fn serve(
     {
         let background_work = background_work.clone();
         std::thread::spawn(move || {
+            // Restore DNS a dead helper left behind before reconciling, so an
+            // automatic reconnect cannot capture a stray as the original.
+            if let Err(error) = dns_sweep::sweep_dead_dns_custody() {
+                tracing::warn!(error = %error, "privileged_dns_sweep_failed");
+            }
             connection_store::reconcile_boot();
             background_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
-    socket::serve(listener, &mut control_state, idle_timeout, &background_work)
+    socket::serve(
+        listener,
+        &mut control_state,
+        idle_timeout,
+        &background_work,
+        &resident,
+    )
+}
+
+/// `wgd privileged --sweep-dns`: restore DNS left by dead helpers once, without
+/// a daemon, then remove `dns-custody/` if no record is left. Used by
+/// `make uninstall.dns`.
+pub fn sweep_dns_once() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        nix::unistd::geteuid().is_root(),
+        "this command must run as root"
+    );
+    if !config::dns_custody_dir().exists() {
+        println!("No DNS custody records.");
+        return Ok(());
+    }
+    let outcome = dns_sweep::sweep_once_and_clean().map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "DNS sweep: restored {}, cleared {}, skipped {} (helper still running).",
+        outcome.summary.restored, outcome.summary.cleared, outcome.summary.skipped_live
+    );
+    for kept in &outcome.kept {
+        println!(
+            "Kept the DNS record of {}: {} not in the current network location. \
+             Switch location and rerun this command, or use `make purge` to drop it.",
+            kept.interface,
+            kept.services.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
@@ -397,6 +441,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
         PrivilegedRequest::ListConnections { .. } => "ListConnections",
         PrivilegedRequest::GetConnection { .. } => "GetConnection",
+        PrivilegedRequest::ListDnsCustody => "ListDnsCustody",
     }
 }
 

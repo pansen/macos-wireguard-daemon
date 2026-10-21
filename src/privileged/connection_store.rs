@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use super::managed_pids::{self, ProcessStart};
 use crate::config;
 use crate::error::{AppError, Result};
 pub use crate::privileged_api::{ConnectionId, ConnectionStartMode};
@@ -765,6 +766,118 @@ pub fn is_active(id: ConnectionId) -> Result<bool> {
     }
 }
 
+/// Directory of the helpers' UAPI sockets.
+const HELPER_SOCK_DIR: &str = "/var/run/wireguard";
+
+/// Whether the userspace helper for `interface` is alive. Never trusts the
+/// socket file's existence: SIGKILL leaves it behind, and a reboot wipes
+/// `/var/run`.
+///
+/// 1. A successful `connect()` to `<interface>.sock` means a helper is
+///    listening. A helper that has touched DNS always has a bound socket until
+///    it exits (it binds before `configure_network`).
+/// 2. `ECONNREFUSED`/`ENOENT` mean nobody listens. When the caller knows the
+///    helper's `pid` and `start` (from a custody record) the process still
+///    counts as alive if the pid exists, runs this daemon's own executable and
+///    has exactly that start time. The start time is what rules out pid reuse
+///    by another process, including another wgd helper: the interface name is
+///    derived from `connection_id`, so the id alone says nothing about which
+///    process holds a pid.
+/// 3. Without a pid (or any mismatch) the helper is dead.
+///
+/// Any other `connect()` error (backlog full, out of descriptors) is not
+/// evidence of death; it counts as alive so nothing a live helper owns is
+/// touched.
+pub fn helper_is_live(
+    connection_id: ConnectionId,
+    interface: &str,
+    pid: Option<u32>,
+    start: Option<ProcessStart>,
+) -> bool {
+    let socket = Path::new(HELPER_SOCK_DIR).join(format!("{interface}.sock"));
+    let live = helper_is_live_at(&socket, pid, start);
+    tracing::trace!(id = %connection_id, interface, live, "helper_liveness_checked");
+    live
+}
+
+/// What connecting to a helper's UAPI socket told us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketProbe {
+    /// Somebody accepted the connection.
+    Accepts,
+    /// `ECONNREFUSED`/`ENOENT`: nobody listens.
+    Dead,
+    /// Any other error: not evidence of death.
+    Inconclusive,
+}
+
+fn probe_socket(socket: &Path) -> SocketProbe {
+    use std::io::ErrorKind;
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => SocketProbe::Accepts,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            SocketProbe::Dead
+        }
+        Err(error) => {
+            tracing::debug!(socket = %socket.display(), %error, "helper_liveness_probe_inconclusive");
+            SocketProbe::Inconclusive
+        }
+    }
+}
+
+/// The decision behind [`helper_is_live`]: an accepting or unprobeable socket
+/// means live; only a dead socket falls back to `pid_is_helper`.
+fn liveness_verdict(probe: SocketProbe, pid_is_helper: impl FnOnce() -> bool) -> bool {
+    match probe {
+        SocketProbe::Accepts | SocketProbe::Inconclusive => true,
+        SocketProbe::Dead => pid_is_helper(),
+    }
+}
+
+/// Whether `pid` exists and runs this daemon's own executable.
+fn pid_runs_this_binary(pid: u32) -> bool {
+    if !managed_pids::pid_is_alive(pid) {
+        return false;
+    }
+    let Some(actual) = managed_pids::process_executable(pid) else {
+        return false;
+    };
+    let Ok(own) = std::env::current_exe() else {
+        return false;
+    };
+    let canonical = |path: PathBuf| fs::canonicalize(&path).unwrap_or(path);
+    canonical(actual) == canonical(own)
+}
+
+fn helper_is_live_at(socket: &Path, pid: Option<u32>, start: Option<ProcessStart>) -> bool {
+    liveness_verdict(probe_socket(socket), || {
+        let (Some(pid), Some(start)) = (pid, start) else {
+            return false;
+        };
+        pid_runs_this_binary(pid) && managed_pids::process_start_ticks(pid) == Some(start)
+    })
+}
+
+/// [`helper_is_live`] for a helper with no custody record (a connection
+/// without DNS, or one started before records existed). There is no start time
+/// to pin the pid, so the helper's pid file stands in: a socket that refuses
+/// plus a pid file naming a dead process, or a process that is not this binary,
+/// means dead. A pid file that cannot be read counts as no pid.
+pub(super) fn helper_is_live_without_record(interface: &str) -> bool {
+    let socket = Path::new(HELPER_SOCK_DIR).join(format!("{interface}.sock"));
+    liveness_verdict(probe_socket(&socket), || {
+        super::commands::read_gotatun_pid(&super::commands::gotatun_pid_path(interface))
+            .ok()
+            .flatten()
+            .is_some_and(pid_runs_this_binary)
+    })
+}
+
 // ---- boot reconciliation (Phase 3) -----------------------------------------
 
 /// Boot-time reconciliation for global `Automatic` connections. Called on a
@@ -853,7 +966,7 @@ fn mark_reconciled_this_boot_in(root: &Path, boot_id: &str) {
 /// across reboots (`sysctl kern.boottime`, the same mechanism `uptime` uses),
 /// used to gate [`reconcile_boot`] to run at most once per boot. `None` if
 /// the sysctl call fails for any reason.
-fn boot_id() -> Option<String> {
+pub(super) fn boot_id() -> Option<String> {
     use nix::libc;
     use std::mem;
     let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
@@ -1410,5 +1523,122 @@ mod tests {
             assert!(loaded.iter().any(|c| c.id == id));
         }
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod liveness_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A socket path with a file on disk and nobody listening, like the one a
+    /// SIGKILLed helper leaves behind.
+    fn dead_socket(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wgd-live-{label}-{}-{:08x}.sock",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        drop(UnixListener::bind(&path).unwrap());
+        // macOS can keep accepting connects for a moment after the listener
+        // closed; wait until the kernel reports the socket dead.
+        for _ in 0..200 {
+            if std::os::unix::net::UnixStream::connect(&path).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        path
+    }
+
+    fn own_start() -> ProcessStart {
+        managed_pids::process_start_ticks(std::process::id()).unwrap()
+    }
+
+    #[test]
+    fn liveness_verdict_only_consults_the_pid_when_the_socket_is_dead() {
+        let boom = || -> bool { panic!("pid must not be consulted") };
+        assert!(liveness_verdict(SocketProbe::Accepts, boom));
+        assert!(liveness_verdict(SocketProbe::Inconclusive, boom));
+        assert!(liveness_verdict(SocketProbe::Dead, || true));
+        assert!(!liveness_verdict(SocketProbe::Dead, || false));
+    }
+
+    #[test]
+    fn listening_socket_means_live() {
+        let path = std::env::temp_dir().join(format!(
+            "wgd-live-listen-{}-{:08x}.sock",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(helper_is_live_at(&path, None, None));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refused_socket_and_dead_pid_is_dead() {
+        let path = dead_socket("deadpid");
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!helper_is_live_at(&path, Some(pid), Some(own_start())));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refused_socket_and_live_wgd_pid_with_matching_start_is_live() {
+        let path = dead_socket("match");
+        // This test process is a "wgd" for the executable check: it runs the
+        // same binary `current_exe()` names.
+        assert!(helper_is_live_at(
+            &path,
+            Some(std::process::id()),
+            Some(own_start())
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_wgd_pid_with_different_start_is_dead() {
+        let path = dead_socket("reuse");
+        let other = ProcessStart {
+            sec: own_start().sec.saturating_sub(1000),
+            usec: 0,
+        };
+        assert!(!helper_is_live_at(
+            &path,
+            Some(std::process::id()),
+            Some(other)
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_foreign_executable_is_dead_even_with_its_start_time() {
+        let path = dead_socket("foreign");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = managed_pids::process_start_ticks(child.id()).unwrap();
+        assert!(!helper_is_live_at(&path, Some(child.id()), Some(start)));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refused_socket_without_pid_is_dead() {
+        let path = dead_socket("nopid");
+        assert!(!helper_is_live_at(&path, None, None));
+        assert!(!helper_is_live_at(&path, None, Some(own_start())));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_socket_without_pid_is_dead() {
+        let path = std::env::temp_dir().join("wgd-live-does-not-exist.sock");
+        assert!(!helper_is_live_at(&path, None, None));
     }
 }

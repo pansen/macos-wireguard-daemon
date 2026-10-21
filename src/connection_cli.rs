@@ -419,3 +419,96 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     println!("updated_at:  {}", conn.updated_at);
     Ok(())
 }
+
+/// Lines `wgd status` prints about DNS custody. Empty on a healthy system:
+/// records whose helper is live are normal and never reach this function.
+#[must_use]
+pub fn format_dns_custody_notes(status: &crate::privileged_api::DnsCustodyStatus) -> Vec<String> {
+    use crate::privileged_api::DnsCustodyEntry;
+
+    let label = |entry: &DnsCustodyEntry| match &entry.name {
+        Some(name) => format!("{} ({name})", entry.interface),
+        None => entry.interface.clone(),
+    };
+    let services = |entry: &DnsCustodyEntry| entry.services.join(", ");
+
+    let mut lines = Vec::new();
+    for entry in &status.pending {
+        lines.push(format!(
+            "DNS left by {} on {} is not restored yet; wgd keeps retrying.",
+            label(entry),
+            services(entry)
+        ));
+    }
+    for entry in &status.deferred {
+        lines.push(format!(
+            "DNS left by {} on {} cannot be restored from this network location; \
+             switch back to that location to restore it.",
+            label(entry),
+            services(entry)
+        ));
+    }
+    if let Some(last) = &status.last_restore {
+        let seconds = last.at % 86_400;
+        lines.push(format!(
+            "DNS restored on {} after {} exited without cleanup, {:02}:{:02} UTC",
+            services(&last.entry),
+            label(&last.entry),
+            seconds / 3600,
+            seconds % 3600 / 60
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod dns_custody_note_tests {
+    use super::*;
+    use crate::privileged_api::{DnsCustodyEntry, DnsCustodyStatus, DnsRestoreEvent};
+
+    fn entry(name: Option<&str>) -> DnsCustodyEntry {
+        DnsCustodyEntry {
+            id: None,
+            interface: "wg-1ce3a4a1".into(),
+            name: name.map(str::to_string),
+            services: vec!["Wi-Fi".into()],
+        }
+    }
+
+    #[test]
+    fn healthy_system_prints_nothing() {
+        assert!(format_dns_custody_notes(&DnsCustodyStatus::default()).is_empty());
+    }
+
+    #[test]
+    fn last_restore_names_service_connection_and_time() {
+        let status = DnsCustodyStatus {
+            last_restore: Some(DnsRestoreEvent {
+                entry: entry(Some("office")),
+                at: 13 * 3600 + 49 * 60 + 7,
+            }),
+            ..DnsCustodyStatus::default()
+        };
+        assert_eq!(
+            format_dns_custody_notes(&status),
+            vec![
+                "DNS restored on Wi-Fi after wg-1ce3a4a1 (office) exited without cleanup, 13:49 UTC"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_and_deferred_records_are_reported() {
+        let status = DnsCustodyStatus {
+            pending: vec![entry(None)],
+            deferred: vec![entry(Some("office"))],
+            last_restore: None,
+        };
+        let lines = format_dns_custody_notes(&status);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("not restored yet"));
+        assert!(lines[1].contains("wg-1ce3a4a1 (office)"));
+        assert!(lines[1].contains("network location"));
+    }
+}

@@ -7,8 +7,10 @@ use nix::unistd::Pid;
 use tracing::debug;
 
 use crate::error::{AppError, Result};
+use crate::privileged_api::ConnectionId;
 
 use super::daemon::self_executable_for_spawn;
+use super::managed_pids::{pid_is_alive, process_executable};
 
 /// Fetch the live network overview from a userspace helper's query socket.
 /// Returns `Ok(None)` when there is no such socket (kernel backend, or
@@ -258,6 +260,7 @@ pub(super) fn wg_format_bytes(bytes: u64) -> String {
 }
 
 pub(super) fn run_gotatun_up(
+    connection_id: ConnectionId,
     interface: &str,
     config_content: &str,
     mtu_override: Option<u16>,
@@ -295,6 +298,7 @@ pub(super) fn run_gotatun_up(
     command
         .env("WGD_GOTATUN_HELPER", "1")
         .env("WGD_GOTATUN_CONFIG_B64", config_b64)
+        .env("WGD_CONNECTION_ID", connection_id.to_string())
         .arg(interface);
     if let Some(mtu) = mtu_override {
         command.env("WGD_GOTATUN_MTU_OVERRIDE", mtu.to_string());
@@ -471,7 +475,7 @@ fn macos_interface_exists(interface: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn read_gotatun_pid(path: &std::path::Path) -> Result<Option<u32>> {
+pub(super) fn read_gotatun_pid(path: &std::path::Path) -> Result<Option<u32>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -492,14 +496,6 @@ fn read_gotatun_pid(path: &std::path::Path) -> Result<Option<u32>> {
         )));
     }
     Ok(Some(pid))
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    let result = unsafe { nix::libc::kill(pid as nix::libc::pid_t, 0) };
-    if result == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM)
 }
 
 fn ensure_gotatun_process_identity(pid: u32) -> Result<()> {
@@ -525,30 +521,11 @@ fn ensure_gotatun_process_identity(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut buffer = vec![0u8; nix::libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let length = unsafe {
-        nix::libc::proc_pidpath(
-            pid as nix::libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
-    if length <= 0 {
-        return None;
-    }
-    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
-        &buffer[..length as usize],
-    )))
-}
-
-fn gotatun_pid_path(interface: &str) -> std::path::PathBuf {
+pub(super) fn gotatun_pid_path(interface: &str) -> std::path::PathBuf {
     gotatun_runtime_path(interface, "pid")
 }
 
-fn gotatun_name_path(interface: &str) -> std::path::PathBuf {
+pub(super) fn gotatun_name_path(interface: &str) -> std::path::PathBuf {
     gotatun_runtime_path(interface, "name")
 }
 
@@ -564,6 +541,16 @@ fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
 /// `config::gotatun_helper_log_path`).
 pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
     crate::config::gotatun_helper_log_path(interface)
+}
+
+/// Control socket of the helper's UAPI server.
+pub(super) fn gotatun_socket_path(interface: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"))
+}
+
+/// Socket the helper serves its live network overview on.
+pub(super) fn gotatun_query_socket_path(interface: &str) -> std::path::PathBuf {
+    gotatun_runtime_path(interface, "query.sock")
 }
 
 fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {

@@ -63,12 +63,35 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
             .open(&temp)?;
         file.write_all(contents)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        fs::rename(&temp, path)?;
+        // The rename is only durable once the directory entry is: without
+        // this, power loss can bring back the old file (or none).
+        sync_parent_dir(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+/// `fsync` the directory holding `path`, so a rename or unlink of `path`
+/// survives power loss.
+pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()
+}
+
+/// Delete `path` (already gone counts as success) and make the removal durable.
+pub fn remove_durable(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    sync_parent_dir(path)
 }
 
 #[cfg(test)]
@@ -88,6 +111,18 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(held);
         lock_with_timeout(&path, Duration::from_millis(80)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remove_durable_tolerates_missing_files() {
+        let dir = std::env::temp_dir().join(format!("wgd-remove-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.json");
+        write_atomic(&path, b"{}").unwrap();
+        remove_durable(&path).unwrap();
+        assert!(!path.exists());
+        remove_durable(&path).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 

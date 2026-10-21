@@ -161,6 +161,44 @@ pub fn gotatun_helper_log_path(interface: &str) -> PathBuf {
     root_log_dir().join(format!("{interface}.log"))
 }
 
+/// Per-connection DNS custody records plus the `watch` sentinel (see
+/// `issues/dns-crash-recovery.md`). Lives under the runtime dir so it survives
+/// reboot.
+#[must_use]
+pub fn dns_custody_dir() -> PathBuf {
+    privileged_runtime_dir().join("dns-custody")
+}
+
+/// Sentinel inside `dns-custody/`: while it exists launchd keeps the
+/// privileged daemon running (`KeepAlive`/`PathState` in the daemon plist), so
+/// a helper crash or a power loss is always noticed by someone.
+#[must_use]
+pub fn dns_custody_watch_path() -> PathBuf {
+    dns_custody_dir().join("watch")
+}
+
+/// Create `dns-custody/` as `root:wheel 0700` if missing and validate it like
+/// the runtime dir. Only the privileged daemon calls this; the helper never
+/// creates or repairs the directory.
+pub fn ensure_dns_custody_dir() -> Result<()> {
+    let dir = dns_custody_dir();
+    if !dir.exists() {
+        fs::create_dir(&dir)?;
+        nix::unistd::chown(
+            &dir,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(nix::unistd::Gid::from_raw(0)),
+        )
+        .map_err(std::io::Error::from)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    crate::trusted_exec::validate_root_owned_path(
+        &dir,
+        crate::trusted_exec::TrustedPath::Directory,
+    )?;
+    Ok(())
+}
+
 pub fn ensure_privileged_runtime_dir() -> Result<()> {
     let dir = privileged_runtime_dir();
     if !dir.exists() {
@@ -173,7 +211,7 @@ pub fn ensure_privileged_runtime_dir() -> Result<()> {
         &dir,
         crate::trusted_exec::TrustedPath::Directory,
     )?;
-    Ok(())
+    ensure_dns_custody_dir()
 }
 
 fn xdg_config_home() -> PathBuf {

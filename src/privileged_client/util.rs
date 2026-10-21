@@ -35,6 +35,7 @@ pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
         PrivilegedRequest::ListConnections { .. } => "ListConnections",
         PrivilegedRequest::GetConnection { .. } => "GetConnection",
+        PrivilegedRequest::ListDnsCustody => "ListDnsCustody",
     }
 }
 

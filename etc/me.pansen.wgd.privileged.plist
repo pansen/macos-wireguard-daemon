@@ -47,6 +47,19 @@
     <key>RunAtLoad</key>
     <false/>
 
+    <!-- DNS crash recovery: while a tunnel that promotes DNS is up (or a
+         restore is pending) the daemon creates this sentinel, and launchd keeps
+         the daemon running, including at boot, until it removes it again. See
+         issues/dns-crash-recovery.md. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>PathState</key>
+        <dict>
+            <key>/Library/Application Support/wgd/dns-custody/watch</key>
+            <true/>
+        </dict>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/var/log/wgd/privileged.out.log</string>
     <key>StandardErrorPath</key>

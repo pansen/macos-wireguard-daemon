@@ -75,6 +75,11 @@ original-DNS custody out of helper memory into an on-disk ledger (e.g.
   bottom — the real original — regardless of disconnect order.
 - File locking (flock) serializes the reconcilers' read-modify-write.
 
+Starting point: `DnsCustodyRecord` (`src/dns_custody.rs`, versioned,
+`dns-custody/<interface>.json`) is the schema to extend into the per-service
+stack; it already holds the true pre-VPN original per service for one
+connection.
+
 The ledger fixes A2/A3 exactly, and because it survives process death it is
 also the foundation for Finding B (crash adoption) and Finding C (parked
 locations). Cost: schema + locking + lifecycle (when is the ledger considered
@@ -115,7 +120,12 @@ Two gaps:
 
 ### Solution paths
 
-**B1 — remember what we ever applied.** Persist every DNS list wgd applies
+**B1 — remember what we ever applied.** *(Current-config part done, see
+`issues/dns-crash-recovery.md`: each helper persists a `DnsCustodyRecord` with the
+exact tunnel DNS and the per-service originals before touching a service, and
+the daemon sweeps strays on every service against all stored connections' DNS
+lists. Still open: strays from a since-removed connection that left no record.)*
+Persist every DNS list wgd applies
 (the ledger from A2 covers this; a minimal standalone version is a small
 append-only file of applied server lists). Adoption then matches the live DNS
 against *any previously applied list*, not just the current config's, and
@@ -124,7 +134,9 @@ heuristic. This directly fixes both gaps: recognition no longer depends on the
 current config, and a startup sweep can check **all** services against the
 recorded set, not just the targeted ones.
 
-**B2 — sweep at privileged-service start.** The privileged daemon starts at
+**B2 — sweep at privileged-service start.** *(Done: `dns_sweep` runs on daemon
+start, on helper exit via a kqueue watch, and once at uninstall via
+`wgd privileged --sweep-dns`; see `issues/dns-crash-recovery.md`.)* The privileged daemon starts at
 boot; have it (or the first `connect`) run a one-shot reconciliation of every
 service against the ledger and heal strays before any tunnel work. Also the
 natural home for a future `wgd doctor`-style command (none exists today).

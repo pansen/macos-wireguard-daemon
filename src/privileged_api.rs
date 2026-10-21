@@ -305,6 +305,12 @@ pub enum PrivilegedRequest {
     GetConnection {
         id: ConnectionId,
     },
+
+    /// Read-only: DNS custody state that is not normal (see
+    /// `issues/dns-crash-recovery.md`, section 5). Authorized like
+    /// `ListConnections`: a non-root caller only sees entries of its own and
+    /// of global connections.
+    ListDnsCustody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +324,35 @@ pub enum PrivilegedResponse {
     ConnectionId(ConnectionId),
     Connection(ConnectionSummary),
     ConnectionList(Vec<ConnectionSummary>),
+    DnsCustody(DnsCustodyStatus),
+}
+
+/// A custody record for `wgd status`. Records whose helper is live are normal
+/// and never listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsCustodyEntry {
+    pub id: Option<ConnectionId>,
+    pub interface: String,
+    /// Name of the stored connection, if it still exists and has one.
+    pub name: Option<String>,
+    pub services: Vec<String>,
+}
+
+/// The most recent automatic DNS restore since boot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRestoreEvent {
+    pub entry: DnsCustodyEntry,
+    /// Unix seconds.
+    pub at: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsCustodyStatus {
+    /// Dead helper, restore not done yet (the daemon keeps retrying).
+    pub pending: Vec<DnsCustodyEntry>,
+    /// Dead helper, but its services are not in the current network location.
+    pub deferred: Vec<DnsCustodyEntry>,
+    pub last_restore: Option<DnsRestoreEvent>,
 }
 
 /// Upper bound on the size of a submitted `.conf`. Generous for any real
@@ -394,6 +429,7 @@ impl PrivilegedRequest {
             Self::SetConnectionMode { .. } => Ok(()),
             Self::ListConnections { .. } => Ok(()),
             Self::GetConnection { .. } => Ok(()),
+            Self::ListDnsCustody => Ok(()),
         }
     }
 }

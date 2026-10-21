@@ -367,6 +367,15 @@ impl PrivilegedClient {
         }
     }
 
+    pub fn list_dns_custody(&self) -> Result<crate::privileged_api::DnsCustodyStatus> {
+        match self.send(PrivilegedRequest::ListDnsCustody)? {
+            PrivilegedResponse::DnsCustody(status) => Ok(status),
+            _ => Err(AppError::Other(
+                "invalid privileged response for ListDnsCustody".into(),
+            )),
+        }
+    }
+
     pub fn get_connection(&self, id: ConnectionId) -> Result<ConnectionSummary> {
         match self.send(PrivilegedRequest::GetConnection { id })? {
             PrivilegedResponse::Connection(summary) => Ok(summary),

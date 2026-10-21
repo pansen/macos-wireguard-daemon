@@ -42,6 +42,11 @@ pub enum TopCommand {
         #[arg(long)]
         serve: bool,
 
+        /// Restore DNS left behind by dead helpers once and exit (root; used
+        /// by `make uninstall.dns`).
+        #[arg(long, hide = true, conflicts_with = "serve")]
+        sweep_dns: bool,
+
         /// Use stdin/stdout request transport instead of Unix socket.
         #[arg(long, hide = true)]
         stdio: bool,

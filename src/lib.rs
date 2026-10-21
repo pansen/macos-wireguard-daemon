@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod color;
 pub mod config;
+pub mod dns_custody;
 // Also home to the `<ID>` completer `cli` attaches to its connection
 // positionals, so `cli` cannot compile without it.
 pub mod connection_cli;
@@ -14,6 +15,7 @@ pub mod error;
 pub mod launchctl;
 pub mod launchd;
 pub mod logging;
+pub mod macos_dns;
 pub mod reload;
 pub mod session_agent;
 pub mod state_file;

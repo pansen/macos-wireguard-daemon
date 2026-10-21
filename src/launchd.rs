@@ -353,6 +353,10 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     // as root -- while the daemon can still hear us.
     disconnect_all_connections();
 
+    // The plist keeps the daemon alive while this sentinel exists (DNS crash
+    // recovery); drop it first so launchd does not race the bootout below.
+    // Pending records stay for `wgd privileged --sweep-dns`.
+    remove_file_ignore_missing(&config::dns_custody_watch_path())?;
     run_ignore_failure("/bin/launchctl", &["bootout", &format!("system/{LABEL}")]);
     // Parity with the old Makefile-based uninstall: leave the label
     // disabled. `cmd_install`'s `launchctl enable` clears this again on

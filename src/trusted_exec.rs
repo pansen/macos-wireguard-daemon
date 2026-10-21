@@ -68,6 +68,8 @@ pub fn command(name: &str) -> io::Result<Command> {
         #[cfg(target_os = "macos")]
         "netstat" | "ipconfig" => PathBuf::from("/usr/sbin").join(name),
         "id" => PathBuf::from("/usr/bin/id"),
+        // Resolver cache flush after DNS is restored (`macos_dns::flush_resolver_cache`).
+        "dscacheutil" | "killall" => PathBuf::from("/usr/bin").join(name),
         // Interpreter for a connection's PreUp/PostUp/PreDown/PostDown hook
         // lines (see `privileged::connection_ops::run_hook`). The hook
         // *content* is arbitrary and root-executed by design, but it can

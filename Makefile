@@ -127,18 +127,17 @@ uninstall.autostart:
 
 .PHONY: uninstall.dns
 uninstall.dns:
-	@# Clear any tunnel DNS override back to DHCP. A graceful daemon teardown
-	@# already restores DNS; this is the fallback for a force-killed daemon
-	@# (bootout/pkill above) that skipped cleanup. wgd only ever writes the
-	@# primary service's DNS, so clear that one — resolved dynamically instead
-	@# of assuming Wi-Fi. Falls back to Wi-Fi if the primary can't be determined.
-	@svc=$$(echo 'show State:/Network/Global/IPv4' | scutil | awk -F': ' '/PrimaryService/{print $$2; exit}'); \
-	name=$$(echo "show Setup:/Network/Service/$$svc" | scutil | awk -F': ' '/UserDefinedName/{print $$2; exit}'); \
-	name=$${name:-Wi-Fi}; \
-	echo "==> clearing DNS override on primary service: $$name"; \
-	networksetup -setdnsservers "$$name" Empty
-	dscacheutil -flushcache
-	sudo killall -HUP mDNSResponder
+	@# Restore DNS a force-killed helper left behind. The daemon records the
+	@# exact pre-tunnel DNS and search domains of every service it changed
+	@# (dns-custody/), so this restores them exactly, on every service, not
+	@# just the primary one. Needs the installed binary, so it runs after the
+	@# helpers are stopped (uninstall.privileged) but before purge removes it.
+	@# Falls back to the freshly compiled binary like uninstall.privileged.
+	@# The sweep also removes dns-custody/ (and its `watch` sentinel) once no
+	@# record is left; records that belong to another network location are
+	@# kept with a hint to switch location and rerun.
+	bin=$(WGD_BIN); [ -x "$$bin" ] || bin=target/release/wgd; \
+	sudo "$$bin" privileged --sweep-dns
 
 .PHONY: uninstall.privileged
 uninstall.privileged: build.release
@@ -150,7 +149,7 @@ uninstall.privileged: build.release
 	sudo "$$bin" launchd uninstall || true
 
 .PHONY: purge.privileged
-purge.privileged: uninstall.privileged
+purge.privileged: uninstall.privileged uninstall.dns
 	@# Destructive: after unregistering the daemon, remove the binary, all data,
 	@# logs, and the wgd group.
 	sudo pkill -f '$(WGD_BIN) launchd agent run' 2>/dev/null || true
@@ -160,6 +159,8 @@ purge.privileged: uninstall.privileged
 	sudo dseditgroup -o delete wgd 2>/dev/null || true
 
 .PHONY: uninstall
+# Order matters: uninstall.dns needs the helpers stopped (uninstall.privileged
+# disconnects everything) and the binary still installed. Run serially.
 uninstall: uninstall.autostart uninstall.privileged uninstall.dns
 
 .PHONY: purge
@@ -172,7 +173,7 @@ logs.privileged:
 
 .PHONY: check.privileged
 check.privileged:
-	@echo "==> daemon (expect: state = not running, sockets registered)"
+	@echo "==> daemon (expect: state = not running unless a DNS tunnel is up, sockets registered)"
 	sudo launchctl print system/me.pansen.wgd.privileged | grep -E 'state =|Listeners'
 	@echo "==> socket (expect: srw-rw---- root:wgd)"
 	stat -f '  %Sp  %Su:%Sg  %N' "/Library/Application Support/wgd/run/ctl.sock"
@@ -182,9 +183,14 @@ check.privileged:
 	id | tr ',' '\n' | grep wgd || echo "  not in wgd group — re-login required"
 	sudo log show --predicate 'sender == "launchd"' --last 10m --info | grep wgd | tail -n30
 	ps axu | grep wgd
-	ping -c1 -m1 1.1.1.1 || true
-	ping -c1 -m1 100.64.1.1 || true
-	ping -c1 -m1 10.66.77.2 || true
+	@echo "==> DNS (expect: no tunnel DNS unless a tunnel is up)"
+	networksetup -listallnetworkservices | tail -n +2 | while read -r s; do \
+	  printf '  %-24s %s\n' "$$s" "$$(networksetup -getdnsservers "$$s" | tr '\n' ' ')"; done
+	$(WGD_BIN) status || true
+	@# -t2 is the timeout in seconds; -m1 would set TTL=1, which fails for any off-link host.
+	ping -c1 -t2 1.1.1.1 || true
+	ping -c1 -t2 100.64.1.1 || true
+	ping -c1 -t2 10.66.77.2 || true
 
 .PHONY: check
 check:

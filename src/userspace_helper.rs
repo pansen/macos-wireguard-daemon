@@ -47,6 +47,8 @@ const HELPER_ENV: &str = "WGD_GOTATUN_HELPER";
 #[cfg(unix)]
 const CONFIG_B64_ENV: &str = "WGD_GOTATUN_CONFIG_B64";
 #[cfg(unix)]
+const CONNECTION_ID_ENV: &str = "WGD_CONNECTION_ID";
+#[cfg(unix)]
 const MTU_OVERRIDE_ENV: &str = "WGD_GOTATUN_MTU_OVERRIDE";
 
 /// How often the macOS shutdown loop reconciles routes against the current LAN.
@@ -153,6 +155,10 @@ struct MacosReconcileInputs {
     dns_servers: Vec<String>,
     has_ipv4_address: bool,
     has_ipv6_address: bool,
+    /// Identity for the persistent DNS custody record. `None` disables the
+    /// record (no `WGD_CONNECTION_ID`, or the helper's own start time was
+    /// unreadable); connect still works, only crash recovery is lost.
+    custody: Option<crate::dns_custody::DnsCustodyIdentity>,
 }
 
 /// A snapshot of the host network environment relevant to tunnel routing.
@@ -181,6 +187,19 @@ struct MacosDnsServiceState {
     service: String,
     dns_servers: Option<Vec<String>>,
     search_domains: Option<Vec<String>>,
+}
+
+/// The persisted form of an owned service is the same "original" the helper
+/// holds in memory, not a second notion of it.
+#[cfg(target_os = "macos")]
+impl From<&MacosDnsServiceState> for crate::dns_custody::DnsCustodyService {
+    fn from(state: &MacosDnsServiceState) -> Self {
+        Self {
+            service: state.service.clone(),
+            original_dns_servers: state.dns_servers.clone(),
+            original_search_domains: state.search_domains.clone(),
+        }
+    }
 }
 
 /// A snapshot of the host DNS-relevant environment. Equality drives the DNS
@@ -476,7 +495,7 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
     }
 
     let cleanup = if let Some(config) = parsed_config.as_ref() {
-        match configure_network(&interface_name, config) {
+        match configure_network(&interface_name, config, custody_identity(interface)) {
             Ok(cleanup) => cleanup,
             Err(e) => {
                 device.stop().await;
@@ -822,12 +841,43 @@ fn helper_tun_name(interface: &str) -> String {
     "utun".to_string()
 }
 
+/// Identity for the DNS custody record: the connection id the daemon passed
+/// in, this process's pid and its start time. `None` (with a WARN) when any
+/// part is missing, which only disables crash recovery for this session.
+#[cfg(unix)]
+fn custody_identity(interface: &str) -> Option<crate::dns_custody::DnsCustodyIdentity> {
+    let raw = std::env::var(CONNECTION_ID_ENV).ok()?;
+    let connection_id = match raw.parse::<crate::privileged_api::ConnectionId>() {
+        Ok(id) => id,
+        Err(error) => {
+            warn!(error = %error, "userspace_helper_dns_custody_unavailable");
+            return None;
+        }
+    };
+    let helper_pid = std::process::id();
+    let Some(helper_start) = crate::privileged::managed_pids::process_start_ticks(helper_pid)
+    else {
+        warn!(
+            error = "own start time unreadable",
+            "userspace_helper_dns_custody_unavailable"
+        );
+        return None;
+    };
+    Some(crate::dns_custody::DnsCustodyIdentity {
+        connection_id,
+        interface: interface.to_string(),
+        helper_pid,
+        helper_start,
+    })
+}
+
 #[cfg(unix)]
 fn configure_network(
     interface: &str,
     config: &ParsedUserspaceConfig,
+    custody: Option<crate::dns_custody::DnsCustodyIdentity>,
 ) -> anyhow::Result<CleanupState> {
-    let cleanup = configure_network_macos(interface, config)?;
+    let cleanup = configure_network_macos(interface, config, custody)?;
     Ok(CleanupState::Macos(std::sync::Arc::new(cleanup)))
 }
 
@@ -935,6 +985,7 @@ fn format_command_for_log(name: &str, args: &[&str]) -> String {
 fn configure_network_macos(
     interface: &str,
     config: &ParsedUserspaceConfig,
+    custody: Option<crate::dns_custody::DnsCustodyIdentity>,
 ) -> anyhow::Result<MacosCleanupState> {
     let has_ipv4_address = config
         .addresses
@@ -959,6 +1010,7 @@ fn configure_network_macos(
         dns_servers: config.dns_servers.clone(),
         has_ipv4_address,
         has_ipv6_address,
+        custody,
     };
     log_macos_network_diagnostics("before_connect", &inputs);
 
@@ -1025,7 +1077,7 @@ fn configure_network_macos(
         }
         // Apply DNS the same way the reconciler will, then seed the DNS
         // fingerprint so the first reconcile tick is a no-op.
-        dns_fingerprint = configure_macos_dns(config, &mut dns_services)?;
+        dns_fingerprint = configure_macos_dns(&inputs, &mut dns_services)?;
         Ok(())
     })();
 
@@ -1039,14 +1091,7 @@ fn configure_network_macos(
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        for service in dns_services.iter().rev() {
-            if let Err(error) = restore_macos_dns_service(service) {
-                errors.push(format!(
-                    "restore DNS for {:?} failed: {error}",
-                    service.service
-                ));
-            }
-        }
+        errors.extend(restore_macos_dns_services(&dns_services, &inputs));
         return if errors.is_empty() {
             Err(setup_error)
         } else {
@@ -1109,14 +1154,7 @@ fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
             dns_services = dns.services.len(),
             "userspace_helper_network_cleanup_dns"
         );
-        for service in dns.services.iter().rev() {
-            if let Err(error) = restore_macos_dns_service(service) {
-                errors.push(format!(
-                    "restore DNS for {:?} failed: {error}",
-                    service.service
-                ));
-            }
-        }
+        errors.extend(restore_macos_dns_services(&dns.services, &state.reconcile));
     }
     finish_cleanup(errors)
 }
@@ -1136,18 +1174,20 @@ fn finish_cleanup(errors: Vec<String>) -> anyhow::Result<()> {
 /// no-op. Shares its per-service capture+apply path with the reconciler.
 #[cfg(target_os = "macos")]
 fn configure_macos_dns(
-    config: &ParsedUserspaceConfig,
+    inputs: &MacosReconcileInputs,
     saved: &mut Vec<MacosDnsServiceState>,
 ) -> anyhow::Result<MacosDnsFingerprint> {
-    if config.dns_servers.is_empty() {
+    if inputs.dns_servers.is_empty() {
         return Ok(MacosDnsFingerprint::default());
     }
 
     let fingerprint = macos_current_dns_fingerprint()?;
     for service in dns_target_services(DNS_POLICY, &fingerprint) {
-        saved.push(capture_macos_dns_service(&service, &config.dns_servers)?);
-        set_macos_dns_servers(&service, &config.dns_servers)?;
-        set_macos_search_domains_empty(&service)?;
+        saved.push(capture_macos_dns_service(&service, &inputs.dns_servers)?);
+        // Write-ahead: the record must list the service before its DNS changes.
+        persist_dns_custody(saved, inputs);
+        crate::macos_dns::set_dns_servers(&service, &inputs.dns_servers)?;
+        crate::macos_dns::set_search_domains_empty(&service)?;
     }
 
     // Re-snapshot post-apply: the stored fingerprint must reflect the DNS we
@@ -1161,111 +1201,71 @@ fn configure_macos_dns(
     }))
 }
 
+/// Write the custody record for the services this helper currently owns, or
+/// delete it when none are left. Best-effort: losing crash recovery must not
+/// break connect, so a failure only logs. One function for the connect path,
+/// the reconciler and teardown, so they cannot diverge.
+#[cfg(target_os = "macos")]
+fn persist_dns_custody(services: &[MacosDnsServiceState], inputs: &MacosReconcileInputs) {
+    let Some(identity) = &inputs.custody else {
+        return;
+    };
+    if inputs.dns_servers.is_empty() {
+        return;
+    }
+    let result = if services.is_empty() {
+        crate::dns_custody::remove_record(&identity.interface)
+    } else {
+        let owned = services
+            .iter()
+            .map(crate::dns_custody::DnsCustodyService::from)
+            .collect();
+        crate::dns_custody::write_record(&identity.record(&inputs.dns_servers, owned))
+    };
+    if let Err(error) = result {
+        warn!(
+            interface = identity.interface,
+            error = %error,
+            "userspace_helper_dns_custody_write_failed"
+        );
+    }
+}
+
+/// Restore every service in reverse order, then settle the custody record:
+/// deleted when all restores worked, otherwise rewritten with only the
+/// services that failed so the daemon's sweep retries them. Returns one
+/// message per failure.
+#[cfg(target_os = "macos")]
+fn restore_macos_dns_services(
+    services: &[MacosDnsServiceState],
+    inputs: &MacosReconcileInputs,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut failed = Vec::new();
+    for service in services.iter().rev() {
+        if let Err(error) = restore_macos_dns_service(service) {
+            errors.push(format!(
+                "restore DNS for {:?} failed: {error}",
+                service.service
+            ));
+            failed.push(service.clone());
+        }
+    }
+    persist_dns_custody(&failed, inputs);
+    if failed.len() < services.len() {
+        // At least one service is back on its original DNS; make it effective.
+        crate::macos_dns::flush_resolver_cache();
+    }
+    errors
+}
+
 #[cfg(target_os = "macos")]
 fn restore_macos_dns_service(state: &MacosDnsServiceState) -> anyhow::Result<()> {
-    match &state.dns_servers {
-        Some(servers) => set_macos_dns_servers(&state.service, servers)?,
-        None => set_macos_dns_servers_empty(&state.service)?,
-    }
-
-    match &state.search_domains {
-        Some(domains) => set_macos_search_domains(&state.service, domains)?,
-        None => set_macos_search_domains_empty(&state.service)?,
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn list_macos_network_services() -> anyhow::Result<Vec<String>> {
-    let output = run_command_capture_output("networksetup", &["-listallnetworkservices"])?;
-    if !output.status.success() {
-        anyhow::bail!("networksetup -listallnetworkservices failed");
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut services = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("An asterisk") {
-            continue;
-        }
-        let service = trimmed.strip_prefix('*').map(str::trim).unwrap_or(trimmed);
-        if !service.is_empty() {
-            services.push(service.to_string());
-        }
-    }
-
-    Ok(services)
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_dns_servers(service: &str) -> anyhow::Result<Option<Vec<String>>> {
-    get_macos_networksetup_values(service, "-getdnsservers", "DNS Servers")
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_search_domains(service: &str) -> anyhow::Result<Option<Vec<String>>> {
-    get_macos_networksetup_values(service, "-getsearchdomains", "Search Domains")
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_networksetup_values(
-    service: &str,
-    flag: &str,
-    value_label: &str,
-) -> anyhow::Result<Option<Vec<String>>> {
-    let output = run_command_capture_output("networksetup", &[flag, service])?;
-    if !output.status.success() {
-        anyhow::bail!("networksetup {} {} failed", flag, service);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let marker = format!("There aren't any {} set", value_label);
-    if stdout.lines().any(|line| line.contains(&marker)) {
-        return Ok(None);
-    }
-
-    let values: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    if values.is_empty() || values == ["Empty".to_string()] {
-        Ok(None)
-    } else {
-        Ok(Some(values))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_dns_servers(service: &str, dns_servers: &[String]) -> anyhow::Result<()> {
-    let mut args: Vec<&str> = Vec::with_capacity(2 + dns_servers.len());
-    args.push("-setdnsservers");
-    args.push(service);
-    args.extend(dns_servers.iter().map(String::as_str));
-    run_command("networksetup", &args)
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_dns_servers_empty(service: &str) -> anyhow::Result<()> {
-    run_command("networksetup", &["-setdnsservers", service, "Empty"])
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_search_domains(service: &str, domains: &[String]) -> anyhow::Result<()> {
-    let mut args: Vec<&str> = Vec::with_capacity(2 + domains.len());
-    args.push("-setsearchdomains");
-    args.push(service);
-    args.extend(domains.iter().map(String::as_str));
-    run_command("networksetup", &args)
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_search_domains_empty(service: &str) -> anyhow::Result<()> {
-    run_command("networksetup", &["-setsearchdomains", service, "Empty"])
+    crate::macos_dns::restore_service(
+        &state.service,
+        state.dns_servers.as_deref(),
+        state.search_domains.as_deref(),
+    )
 }
 
 /// Whether the tunnel ends up owning a route it tried to install.
@@ -2127,7 +2127,8 @@ fn plan_dns_actions(
 /// to empty/`None` rather than aborting, mirroring `macos_local_connected_subnets`.
 #[cfg(target_os = "macos")]
 fn macos_current_dns_fingerprint() -> anyhow::Result<MacosDnsFingerprint> {
-    let mut services = list_macos_network_services().context("listing macOS network services")?;
+    let mut services =
+        crate::macos_dns::list_network_services().context("listing macOS network services")?;
     if services.is_empty() {
         anyhow::bail!("networksetup -listallnetworkservices returned no services");
     }
@@ -2137,7 +2138,7 @@ fn macos_current_dns_fingerprint() -> anyhow::Result<MacosDnsFingerprint> {
     let mut observed = Vec::with_capacity(services.len());
     for svc in &services {
         // None on error → treat as "unknown/unset"; never panic the tick.
-        let dns = get_macos_dns_servers(svc).unwrap_or_else(|error| {
+        let dns = crate::macos_dns::get_dns_servers(svc).unwrap_or_else(|error| {
             debug!(service = svc, error = %error, "userspace_helper_dns_read_failed");
             None
         });
@@ -2166,7 +2167,7 @@ fn capture_macos_dns_service(
     service: &str,
     tunnel_dns: &[String],
 ) -> anyhow::Result<MacosDnsServiceState> {
-    let dns = get_macos_dns_servers(service)?;
+    let dns = crate::macos_dns::get_dns_servers(service)?;
     if dns.as_deref() == Some(tunnel_dns) {
         return Ok(MacosDnsServiceState {
             service: service.to_string(),
@@ -2174,7 +2175,7 @@ fn capture_macos_dns_service(
             search_domains: None,
         });
     }
-    let search = get_macos_search_domains(service)?;
+    let search = crate::macos_dns::get_search_domains(service)?;
     Ok(MacosDnsServiceState {
         service: service.to_string(),
         dns_servers: dns,
@@ -2334,14 +2335,21 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         dns.services.retain(|s| &s.service != svc);
     }
 
+    // Persist the owned set before any DNS is written: a newly captured service
+    // must be on disk before (c) touches it, and a released one must leave the
+    // record once its restore has succeeded.
+    if captured + restored + dropped > 0 {
+        persist_dns_custody(&dns.services, inputs);
+    }
+
     // (c) (Re-)assert tunnel DNS on every target whose observed DNS has drifted,
     // except services whose original we failed to capture this tick.
     for svc in &actions.apply {
         if capture_failed.contains(&svc.as_str()) {
             continue; // never overwrite DNS we couldn't back up
         }
-        if set_macos_dns_servers(svc, &inputs.dns_servers).is_ok()
-            && set_macos_search_domains_empty(svc).is_ok()
+        if crate::macos_dns::set_dns_servers(svc, &inputs.dns_servers).is_ok()
+            && crate::macos_dns::set_search_domains_empty(svc).is_ok()
         {
             applied += 1;
         } else {
@@ -3906,6 +3914,7 @@ mod tests {
             dns_servers: vec!["100.64.1.1".to_string()],
             has_ipv4_address: true,
             has_ipv6_address: false,
+            custody: None,
         }
     }
 
@@ -4232,6 +4241,32 @@ resolver #1
             services,
             observed,
         }
+    }
+
+    #[test]
+    fn custody_service_keeps_empty_originals_as_none() {
+        let adopted = MacosDnsServiceState {
+            service: "Wi-Fi".into(),
+            dns_servers: None,
+            search_domains: None,
+        };
+        let captured = MacosDnsServiceState {
+            service: "Ethernet".into(),
+            dns_servers: Some(vec!["192.168.1.1".into()]),
+            search_domains: Some(vec!["lan".into()]),
+        };
+        let adopted = crate::dns_custody::DnsCustodyService::from(&adopted);
+        let captured = crate::dns_custody::DnsCustodyService::from(&captured);
+        assert_eq!(adopted.original_dns_servers, None);
+        assert_eq!(adopted.original_search_domains, None);
+        assert_eq!(
+            captured.original_dns_servers,
+            Some(vec!["192.168.1.1".to_string()])
+        );
+        assert_eq!(
+            captured.original_search_domains,
+            Some(vec!["lan".to_string()])
+        );
     }
 
     #[test]
