@@ -19,7 +19,37 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum TopCommand {
     /// Show active VPN connections, including WireGuard tunnel state
-    Status,
+    Status {
+        /// Also show live DNS servers configured on each macOS network service
+        #[arg(long)]
+        dns: bool,
+    },
+
+    /// Run system and connection diagnostics (and optionally write a redacted report file)
+    Doctor {
+        /// Write a redacted diagnostic report to this file in addition to terminal output
+        #[arg(long, value_name = "FILE")]
+        report: Option<PathBuf>,
+
+        /// Internal: whether the invoking user's shell had the wgd group active before sudo
+        #[arg(long, hide = true)]
+        caller_in_wgd_group: Option<bool>,
+    },
+
+    /// Show or follow wgd daemon, helper, and launchd logs
+    Logs(LogsArgs),
+
+    /// Inspect or repair macOS DNS state managed by wgd
+    Dns {
+        #[command(subcommand)]
+        command: DnsCommand,
+    },
+
+    /// Install shell tab-completion into the user's shell rc file
+    Completion {
+        #[command(subcommand)]
+        command: CompletionCommand,
+    },
 
     /// Manage the privileged launchd daemon, the per-user session-
     /// reconciliation agent (`launchd agent ...`), and reload both launchd
@@ -42,8 +72,8 @@ pub enum TopCommand {
         #[arg(long)]
         serve: bool,
 
-        /// Restore DNS left behind by dead helpers once and exit (root; used
-        /// by `make uninstall.dns`).
+        /// Restore DNS left behind by dead helpers once and exit (root; alias
+        /// for `wgd dns repair`).
         #[arg(long, hide = true, conflicts_with = "serve")]
         sweep_dns: bool,
 
@@ -63,6 +93,56 @@ pub enum TopCommand {
         #[arg(long, hide = true)]
         autostarted: bool,
     },
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
+pub struct LogsArgs {
+    /// Follow log output as new lines are written (like `tail -f`)
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Number of trailing lines to show per log file
+    #[arg(short = 'n', long, default_value_t = 150)]
+    pub lines: usize,
+
+    /// Show recent launchd unified-log entries for wgd instead of `/var/log/wgd/*.log`
+    #[arg(long)]
+    pub launchd: bool,
+
+    /// Also show connection logs not written to in the last 24 hours
+    /// (removed or long idle connections)
+    #[arg(long, conflicts_with = "launchd")]
+    pub all: bool,
+
+    /// Optional connection id, connection name, or log stem (`wg-...`, `privileged`) to filter to
+    #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+        crate::connection_cli::complete_connection_id
+    ))]
+    pub connection: Option<String>,
+}
+
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsCommand {
+    /// Restore DNS left behind on network services by a crashed or force-killed helper
+    Repair,
+}
+
+#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionCommand {
+    /// Write or update the managed completion block in the shell's rc file
+    Install {
+        /// Target shell
+        #[arg(long, value_enum, default_value_t = CompletionShell::Bash)]
+        shell: CompletionShell,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompletionShell {
+    #[default]
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +195,16 @@ pub enum LaunchdCommand {
     Reload(ReloadArgs),
     /// Stop and unregister the privileged daemon (keeps binary, group, logs)
     Uninstall,
+
+    /// Show privileged daemon state, socket/directory permissions, group membership, and helper pids
+    Status {
+        /// Internal: whether the invoking user's shell had the wgd group active before sudo
+        #[arg(long, hide = true)]
+        caller_in_wgd_group: Option<bool>,
+    },
+
+    /// Unregister services and remove all wgd runtime state, logs, and the wgd group (keeps the binary)
+    Purge,
 
     /// Manage the per-user session-reconciliation LaunchAgent
     ///
@@ -288,7 +378,10 @@ pub struct ReloadArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentCommand, Cli, ConnectionCommand, LaunchdCommand, StartModeArg, TopCommand};
+    use super::{
+        AgentCommand, Cli, CompletionCommand, CompletionShell, ConnectionCommand, DnsCommand,
+        LaunchdCommand, LogsArgs, StartModeArg, TopCommand,
+    };
     use clap::Parser;
 
     #[test]
@@ -300,6 +393,115 @@ mod tests {
         let after =
             Cli::try_parse_from(["wgd", "status", "--debug"]).expect("parse debug after command");
         assert!(after.verbose);
+    }
+
+    #[test]
+    fn parse_status_with_and_without_dns_flag() {
+        let bare = Cli::try_parse_from(["wgd", "status"]).expect("parse bare status");
+        assert!(matches!(bare.command, TopCommand::Status { dns: false }));
+
+        let with_dns = Cli::try_parse_from(["wgd", "status", "--dns"]).expect("parse status --dns");
+        assert!(matches!(with_dns.command, TopCommand::Status { dns: true }));
+    }
+
+    #[test]
+    fn parse_doctor_and_report_flag() {
+        use std::path::Path;
+
+        let bare = Cli::try_parse_from(["wgd", "doctor"]).expect("parse bare doctor");
+        match bare.command {
+            TopCommand::Doctor {
+                report,
+                caller_in_wgd_group,
+            } => {
+                assert!(report.is_none());
+                assert!(caller_in_wgd_group.is_none());
+            }
+            _ => panic!("expected doctor command"),
+        }
+
+        let with_report = Cli::try_parse_from(["wgd", "doctor", "--report", "/tmp/report.log"])
+            .expect("parse doctor --report");
+        match with_report.command {
+            TopCommand::Doctor {
+                report: Some(path), ..
+            } => assert_eq!(path, Path::new("/tmp/report.log")),
+            _ => panic!("expected doctor --report"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_subcommand_flags() {
+        let bare = Cli::try_parse_from(["wgd", "logs"]).expect("parse bare logs");
+        match bare.command {
+            TopCommand::Logs(args) => assert_eq!(
+                args,
+                LogsArgs {
+                    follow: false,
+                    lines: 150,
+                    launchd: false,
+                    all: false,
+                    connection: None,
+                }
+            ),
+            _ => panic!("expected logs command"),
+        }
+
+        let full = Cli::try_parse_from(["wgd", "logs", "-f", "-n", "50", "andi_split"])
+            .expect("parse logs -f -n 50 andi_split");
+        match full.command {
+            TopCommand::Logs(args) => assert_eq!(
+                args,
+                LogsArgs {
+                    follow: true,
+                    lines: 50,
+                    launchd: false,
+                    all: false,
+                    connection: Some("andi_split".to_string()),
+                }
+            ),
+            _ => panic!("expected logs command"),
+        }
+
+        let launchd =
+            Cli::try_parse_from(["wgd", "logs", "--launchd"]).expect("parse logs --launchd");
+        match launchd.command {
+            TopCommand::Logs(args) => assert!(args.launchd),
+            _ => panic!("expected logs --launchd"),
+        }
+    }
+
+    #[test]
+    fn parse_dns_repair_and_completion_install() {
+        let dns = Cli::try_parse_from(["wgd", "dns", "repair"]).expect("parse dns repair");
+        assert!(matches!(
+            dns.command,
+            TopCommand::Dns {
+                command: DnsCommand::Repair
+            }
+        ));
+
+        let comp_default = Cli::try_parse_from(["wgd", "completion", "install"])
+            .expect("parse completion install");
+        assert!(matches!(
+            comp_default.command,
+            TopCommand::Completion {
+                command: CompletionCommand::Install {
+                    shell: CompletionShell::Bash
+                }
+            }
+        ));
+
+        let comp_zsh = Cli::try_parse_from(["wgd", "completion", "install", "--shell", "zsh"])
+            .expect("parse completion install --shell zsh");
+        assert!(matches!(
+            comp_zsh.command,
+            TopCommand::Completion {
+                command: CompletionCommand::Install {
+                    shell: CompletionShell::Zsh
+                }
+            }
+        ));
     }
 
     #[test]
@@ -316,6 +518,13 @@ mod tests {
                 "uninstall",
                 std::mem::discriminant(&LaunchdCommand::Uninstall),
             ),
+            (
+                "status",
+                std::mem::discriminant(&LaunchdCommand::Status {
+                    caller_in_wgd_group: None,
+                }),
+            ),
+            ("purge", std::mem::discriminant(&LaunchdCommand::Purge)),
         ] {
             let cli = Cli::try_parse_from(["wgd", "launchd", arg]).expect("parse launchd");
             match cli.command {

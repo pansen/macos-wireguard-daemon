@@ -71,6 +71,25 @@ fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<Con
             .collect())
     };
     let mut matches = by_name(ConnectionScope::Mine)?;
+    if matches.is_empty() && nix::unistd::geteuid().is_root() {
+        // Under `sudo`, `Mine` only matches `owner_uid == Some(0)`. Check the
+        // invoking user's connections (`SUDO_UID`) and then all connections so
+        // `sudo wgd ... <name>` works for per-user connections too.
+        let all = by_name(ConnectionScope::All)?;
+        let sudo_uid = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        if let Some(uid) = sudo_uid {
+            matches = all
+                .iter()
+                .filter(|conn| conn.owner_uid == Some(uid))
+                .cloned()
+                .collect();
+        }
+        if matches.is_empty() {
+            matches = all;
+        }
+    }
     if matches.is_empty() {
         matches = by_name(ConnectionScope::Global)?;
     }
@@ -83,6 +102,17 @@ fn resolve_id(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<Con
             "connection name {id_or_name:?} is ambiguous ({} matches); use the connection id instead",
             matches.len()
         ),
+    }
+}
+
+/// Resolve a connection id or `--name` to its interface name (`wg-xxxxxxxx`).
+/// Used by `wgd logs <connection>` to map a user-facing connection identifier
+/// to `/var/log/wgd/<interface>.log`.
+pub fn resolve_interface(client: &PrivilegedClient, id_or_name: &str) -> anyhow::Result<String> {
+    let id = resolve_id(client, id_or_name)?;
+    match client.get_connection(id) {
+        Ok(conn) => Ok(conn.interface),
+        Err(_) => Ok(id.interface_name()),
     }
 }
 

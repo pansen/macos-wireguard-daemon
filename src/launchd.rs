@@ -269,6 +269,10 @@ pub fn dispatch(command: LaunchdCommand) -> anyhow::Result<()> {
             rt.block_on(crate::reload::run(args, &config))
         }
         LaunchdCommand::Uninstall => cmd_uninstall(),
+        LaunchdCommand::Status {
+            caller_in_wgd_group,
+        } => cmd_status(caller_in_wgd_group),
+        LaunchdCommand::Purge => cmd_purge(),
         LaunchdCommand::Agent { command } => crate::session_agent::dispatch(command),
     }
 }
@@ -347,27 +351,7 @@ fn cmd_restart() -> anyhow::Result<()> {
 fn cmd_uninstall() -> anyhow::Result<()> {
     require_root("uninstall")?;
 
-    // Bootout has no graceful shutdown path of its own (unlike the session
-    // agent, the privileged daemon installs no SIGTERM handler), so any
-    // tunnel still up at this point would be orphaned: its userspace helper,
-    // routes, and DNS override left running with no socket left to reach
-    // them through. Disconnect everything -- `Global` too, since this runs
-    // as root -- while the daemon can still hear us.
-    disconnect_all_connections();
-
-    // The plist keeps the daemon alive while this sentinel exists (DNS crash
-    // recovery); drop it first so launchd does not race the bootout below.
-    // Pending records stay for `wgd privileged --sweep-dns`.
-    remove_file_ignore_missing(&config::dns_custody_watch_path())?;
-    run_ignore_failure("/bin/launchctl", &["bootout", &format!("system/{LABEL}")]);
-    // Parity with the old Makefile-based uninstall: leave the label
-    // disabled. `cmd_install`'s `launchctl enable` clears this again on
-    // reinstall.
-    run_ignore_failure("/bin/launchctl", &["disable", &format!("system/{LABEL}")]);
-    reap_stray_privileged_daemons();
-
-    remove_file_ignore_missing(Path::new(PLIST_PATH))?;
-    remove_file_ignore_missing(&config::privileged_socket_path())?;
+    uninstall_daemon_core()?;
 
     println!("wgd privileged daemon uninstalled.");
     println!("Intentionally kept (this only unregisters the daemon):");
@@ -380,9 +364,608 @@ fn cmd_uninstall() -> anyhow::Result<()> {
     );
     println!(
         "For a full removal: `brew uninstall --zap macos-wireguard-daemon` (Homebrew installs) \
-         or `make purge/privileged` (installs from source)."
+         or `wgd launchd purge` (installs from source)."
     );
     Ok(())
+}
+
+/// Core teardown shared by `wgd launchd uninstall` and `wgd launchd purge`:
+/// disconnect active tunnels, drop the DNS custody watch sentinel, bootout and
+/// disable the launchd job, reap any stray daemon processes, and unlink the
+/// plist and control socket.
+fn uninstall_daemon_core() -> anyhow::Result<()> {
+    // Bootout has no graceful shutdown path of its own (unlike the session
+    // agent, the privileged daemon installs no SIGTERM handler), so any
+    // tunnel still up at this point would be orphaned: its userspace helper,
+    // routes, and DNS override left running with no socket left to reach
+    // them through. Disconnect everything -- `Global` too, since this runs
+    // as root -- while the daemon can still hear us.
+    disconnect_all_connections();
+
+    // The plist keeps the daemon alive while this sentinel exists (DNS crash
+    // recovery); drop it first so launchd does not race the bootout below.
+    // Pending records stay for `wgd dns repair`.
+    remove_file_ignore_missing(&config::dns_custody_watch_path())?;
+    run_ignore_failure("/bin/launchctl", &["bootout", &format!("system/{LABEL}")]);
+    // Parity with the old Makefile-based uninstall: leave the label
+    // disabled. `cmd_install`'s `launchctl enable` clears this again on
+    // reinstall.
+    run_ignore_failure("/bin/launchctl", &["disable", &format!("system/{LABEL}")]);
+    reap_stray_privileged_daemons();
+
+    remove_file_ignore_missing(Path::new(PLIST_PATH))?;
+    remove_file_ignore_missing(&config::privileged_socket_path())?;
+    Ok(())
+}
+
+fn cmd_status(caller_in_wgd_group: Option<bool>) -> anyhow::Result<()> {
+    if !geteuid().is_root() {
+        let in_group = caller_has_wgd_gid_in_process();
+        if let Err(e) = escalate_launchd_status(in_group) {
+            tracing::warn!(error = %format!("{e:#}"), "launchd_status_escalation_failed");
+            eprintln!("sudo unavailable or declined; running the unprivileged checks only");
+            let report = collect_status_report(Some(in_group));
+            print!("{report}");
+        }
+        return Ok(());
+    }
+
+    let report = collect_status_report(caller_in_wgd_group);
+    print!("{report}");
+    Ok(())
+}
+
+fn cmd_purge() -> anyhow::Result<()> {
+    if !geteuid().is_root() {
+        return escalate_launchd_purge();
+    }
+
+    // 1. Unload and remove the invoking user's session agent plist if known,
+    //    then terminate any remaining `wgd launchd agent run` processes.
+    purge_invoking_user_session_agent();
+    reap_session_agent_processes();
+
+    // 2. Disconnect all connections and unregister the privileged daemon.
+    uninstall_daemon_core()?;
+
+    // 3. Restore any DNS left behind by dead helpers before deleting the
+    //    runtime directory that holds `dns-custody/`.
+    crate::privileged::sweep_dns_for_purge();
+
+    // 4. Remove runtime state, logs, authorization rule, and the `wgd` group.
+    remove_dir_all_ignore_missing(&config::privileged_runtime_dir())?;
+    remove_dir_all_ignore_missing(&config::root_log_dir())?;
+    run_ignore_failure(
+        "/usr/bin/security",
+        &[
+            "authorizationdb",
+            "remove",
+            crate::privileged::authz::RIGHT_NAME,
+        ],
+    );
+    run_ignore_failure("/usr/sbin/dseditgroup", &["-o", "delete", GROUP_NAME]);
+
+    println!("wgd purged:");
+    println!("  unregistered daemon and session agent");
+    println!("  removed {}", config::privileged_runtime_dir().display());
+    println!("  removed {}", config::root_log_dir().display());
+    println!("  deleted group {GROUP_NAME}");
+    println!("  kept the wgd binary (use `brew uninstall --zap` or remove the binary manually if desired)");
+    let invoking_home = resolve_target_user().map(|(_, _, home)| home);
+    let leftovers = other_users_session_agent_plists(Path::new("/Users"), invoking_home.as_deref());
+    if !leftovers.is_empty() {
+        println!("Session agents of other users are still registered and start again at their next login:");
+        for plist in leftovers {
+            println!("  {}", plist.display());
+        }
+        println!(
+            "  each user can remove theirs with: launchctl bootout gui/$(id -u)/{}; rm <plist>",
+            crate::session_agent::LABEL
+        );
+    }
+    Ok(())
+}
+
+/// Session-agent plists under `users_dir/*/Library/LaunchAgents` except the
+/// invoking user's, which `purge` already removed. Only the invoking user's
+/// agent can be booted out from here (`gui/<uid>` of a user without a GUI
+/// session may not exist), so the rest are reported rather than deleted.
+fn other_users_session_agent_plists(users_dir: &Path, skip_home: Option<&Path>) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(users_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|home| Some(home.as_path()) != skip_home)
+        .map(|home| {
+            home.join("Library/LaunchAgents")
+                .join(format!("{}.plist", crate::session_agent::LABEL))
+        })
+        .filter(|plist| plist.exists())
+        .collect();
+    out.sort();
+    out
+}
+
+fn remove_dir_all_ignore_missing(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn purge_invoking_user_session_agent() {
+    if let Some((_user, uid, home)) = resolve_target_user() {
+        if uid != 0 {
+            run_ignore_failure(
+                "/bin/launchctl",
+                &[
+                    "bootout",
+                    &format!("gui/{uid}/{}", crate::session_agent::LABEL),
+                ],
+            );
+            let plist = home
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", crate::session_agent::LABEL));
+            let _ = remove_file_ignore_missing(&plist);
+        }
+    }
+}
+
+fn reap_session_agent_processes() {
+    for pid in find_session_agent_pids() {
+        debug!(pid, "reaping_session_agent_process");
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+}
+
+fn escalate_launchd_status(caller_in_wgd_group: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("failed to determine the running wgd binary path")?;
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg(&exe);
+    if crate::logging::debug_enabled() {
+        cmd.arg("--debug");
+    }
+    cmd.args([
+        "launchd",
+        "status",
+        &format!("--caller-in-wgd-group={caller_in_wgd_group}"),
+    ]);
+    tracing::warn!(
+        action = "launchd_status",
+        method = "sudo",
+        cause = "inspecting system launchd state and root-owned runtime paths requires root",
+        "admin_authentication_requested"
+    );
+    let status = cmd
+        .status()
+        .context("failed to run sudo for wgd launchd status")?;
+    anyhow::ensure!(
+        status.success(),
+        "sudo wgd launchd status failed ({status})"
+    );
+    Ok(())
+}
+
+fn escalate_launchd_purge() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("failed to determine the running wgd binary path")?;
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg(&exe);
+    if crate::logging::debug_enabled() {
+        cmd.arg("--debug");
+    }
+    cmd.args(["launchd", "purge"]);
+    tracing::warn!(
+        action = "launchd_purge",
+        method = "sudo",
+        cause = "purging the system launchd daemon, runtime directories, logs, and wgd group requires root",
+        "admin_authentication_requested"
+    );
+    let status = cmd
+        .status()
+        .context("failed to run sudo for wgd launchd purge")?;
+    anyhow::ensure!(status.success(), "sudo wgd launchd purge failed ({status})");
+    Ok(())
+}
+
+/// Whether the current (unprivileged) process has the `wgd` group's GID active
+/// in its supplementary or effective group list. Captured before escalating
+/// via `sudo` so `launchd status` and `doctor` can tell a user whether their
+/// current login session already picked up `wgd` membership.
+pub(crate) fn caller_has_wgd_gid_in_process() -> bool {
+    let Some(wgd_gid) = Group::from_name(GROUP_NAME).ok().flatten().map(|g| g.gid) else {
+        return false;
+    };
+    if nix::unistd::getegid() == wgd_gid {
+        return true;
+    }
+    process_groups().contains(&wgd_gid.as_raw())
+}
+
+/// The process's credential groups. `nix::unistd::getgroups` is configured
+/// out on Apple targets, so this calls libc directly. On macOS this is the
+/// group list the login session was started with (at most `NGROUPS_MAX`,
+/// 16), which is exactly what tells whether a re-login is still pending.
+fn process_groups() -> Vec<nix::libc::gid_t> {
+    // SAFETY: a zero-sized call only returns the count; the second call
+    // writes at most `buf.len()` entries into `buf`.
+    unsafe {
+        let count = nix::libc::getgroups(0, std::ptr::null_mut());
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0 as nix::libc::gid_t; count as usize];
+        let written = nix::libc::getgroups(count, buf.as_mut_ptr());
+        if written < 0 {
+            return Vec::new();
+        }
+        buf.truncate(written as usize);
+        buf
+    }
+}
+
+/// Build the full human-readable `wgd launchd status` report. Shared by
+/// `wgd launchd status` and `wgd doctor`.
+pub(crate) fn collect_status_report(caller_in_wgd_group: Option<bool>) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+
+    // 1. Privileged daemon state in launchd.
+    let _ = writeln!(
+        out,
+        "==> daemon (expect: state = not running unless a DNS tunnel is up, sockets registered)"
+    );
+    // `launchctl print system/...` works without root; only the custody
+    // watch note does not, because `dns-custody/` is 0700 root and
+    // `exists()` would just report false there.
+    match std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("system/{LABEL}")])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in extract_launchd_daemon_lines(&stdout) {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let _ = writeln!(
+                out,
+                "  not loaded ({}; run: wgd launchd reload)",
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            );
+        }
+        Err(err) => {
+            let _ = writeln!(out, "  failed to run /bin/launchctl: {err}");
+        }
+    }
+    if !geteuid().is_root() {
+        let _ = writeln!(out, "  DNS custody watch: skipped (needs sudo)");
+    } else if config::dns_custody_watch_path().exists() {
+        let _ = writeln!(
+            out,
+            "  note: {} is present (DNS custody KeepAlive active)",
+            config::dns_custody_watch_path().display()
+        );
+    }
+
+    // 2. Control socket & socket directory expected-vs-actual permission checks.
+    let wgd_group = Group::from_name(GROUP_NAME).ok().flatten();
+    let wgd_gid = wgd_group.as_ref().map(|g| g.gid.as_raw());
+
+    let _ = writeln!(out, "==> socket (expect: srw-rw---- root:{GROUP_NAME})");
+    let _ = writeln!(
+        out,
+        "  {}",
+        check_path_permissions(
+            &config::privileged_socket_path(),
+            ExpectedFileType::Socket,
+            0o660,
+            wgd_gid,
+        )
+    );
+
+    let _ = writeln!(out, "==> socket dir (expect: drwxr-x--- root:{GROUP_NAME})");
+    let _ = writeln!(
+        out,
+        "  {}",
+        check_path_permissions(
+            &config::privileged_socket_dir(),
+            ExpectedFileType::Directory,
+            0o750,
+            wgd_gid,
+        )
+    );
+
+    // 3. `wgd` group membership for the invoking user.
+    let _ = writeln!(out, "==> group membership (expect: {GROUP_NAME} listed)");
+    let _ = writeln!(
+        out,
+        "  {}",
+        check_group_membership(wgd_gid, caller_in_wgd_group)
+    );
+
+    // 4. Session agent status for the invoking user.
+    let _ = writeln!(out, "==> session agent");
+    let _ = writeln!(out, "  {}", check_session_agent_status());
+
+    // 5. Running wgd processes (daemon, userspace helpers, session agent).
+    let _ = writeln!(out, "==> processes");
+    for line in collect_wgd_process_lines() {
+        let _ = writeln!(out, "  {line}");
+    }
+
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedFileType {
+    Socket,
+    Directory,
+}
+
+impl ExpectedFileType {
+    fn type_char(self) -> char {
+        match self {
+            Self::Socket => 's',
+            Self::Directory => 'd',
+        }
+    }
+}
+
+fn check_path_permissions(
+    path: &Path,
+    expected_kind: ExpectedFileType,
+    expected_mode: u32,
+    expected_gid: Option<u32>,
+) -> String {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let expected_symbolic = format_symbolic_mode(expected_kind.type_char(), expected_mode);
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return format!(
+                "MISSING  {} (expected {expected_symbolic} root:{GROUP_NAME})",
+                path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && !geteuid().is_root() => {
+            return format!("skipped (needs sudo)  {}", path.display());
+        }
+        Err(err) => {
+            return format!("ERROR  {}: {err}", path.display());
+        }
+    };
+
+    let ft = meta.file_type();
+    let actual_type_char = if ft.is_socket() {
+        's'
+    } else if ft.is_dir() {
+        'd'
+    } else if ft.is_symlink() {
+        'l'
+    } else if ft.is_file() {
+        '-'
+    } else {
+        '?'
+    };
+    let actual_mode = meta.mode() & 0o7777;
+    let actual_symbolic = format_symbolic_mode(actual_type_char, actual_mode);
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let owner_name = User::from_uid(Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| uid.to_string());
+    let group_name = Group::from_gid(Gid::from_raw(gid))
+        .ok()
+        .flatten()
+        .map(|g| g.name)
+        .unwrap_or_else(|| gid.to_string());
+
+    let matches_expected = actual_type_char == expected_kind.type_char()
+        && actual_mode == expected_mode
+        && uid == 0
+        && expected_gid.is_some_and(|want_gid| gid == want_gid);
+
+    if matches_expected {
+        format!(
+            "ok  {actual_symbolic}  {owner_name}:{group_name}  {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "MISMATCH  {actual_symbolic}  {owner_name}:{group_name}  {} (expected {expected_symbolic} root:{GROUP_NAME})",
+            path.display()
+        )
+    }
+}
+
+fn format_symbolic_mode(type_char: char, mode: u32) -> String {
+    let mut s = String::with_capacity(10);
+    s.push(type_char);
+    for (shift, set_bit, set_char, set_upper) in [
+        (6, 0o4000, 's', 'S'),
+        (3, 0o2000, 's', 'S'),
+        (0, 0o1000, 't', 'T'),
+    ] {
+        let triad = (mode >> shift) & 0o7;
+        s.push(if triad & 0o4 != 0 { 'r' } else { '-' });
+        s.push(if triad & 0o2 != 0 { 'w' } else { '-' });
+        let exec = triad & 0o1 != 0;
+        let special = mode & set_bit != 0;
+        s.push(match (exec, special) {
+            (true, true) => set_char,
+            (false, true) => set_upper,
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
+}
+
+/// Pick the service's own fields out of `launchctl print`. Only top-level
+/// keys (one tab deep) count: nested blocks such as the resource and jetsam
+/// coalitions carry their own `state = active` lines that say nothing about
+/// the daemon.
+fn extract_launchd_daemon_lines(print_output: &str) -> Vec<String> {
+    const TOP_LEVEL_KEYS: &[&str] = &[
+        "state =",
+        "pid =",
+        "runs =",
+        "last exit code =",
+        "immediate reason =",
+    ];
+    let mut out = Vec::new();
+    for line in print_output.lines() {
+        let trimmed = line.trim();
+        let top_level = line.starts_with('\t') && !line.starts_with("\t\t");
+        if (top_level && TOP_LEVEL_KEYS.iter().any(|key| trimmed.starts_with(key)))
+            || trimmed.starts_with("\"Listeners\"")
+            || trimmed.contains("ctl.sock")
+        {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// Resolve the invoking user `(username, uid, home_dir)`: prefers `SUDO_USER`
+/// when running under `sudo`, falling back to the current process's real UID.
+pub(crate) fn resolve_target_user() -> Option<(String, u32, PathBuf)> {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !sudo_user.is_empty() && sudo_user != "root" {
+            if let Ok(Some(u)) = User::from_name(&sudo_user) {
+                return Some((u.name, u.uid.as_raw(), u.dir));
+            }
+        }
+    }
+    let uid = nix::unistd::getuid();
+    User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map(|u| (u.name, u.uid.as_raw(), u.dir))
+}
+
+fn check_group_membership(wgd_gid: Option<u32>, caller_in_wgd_group: Option<bool>) -> String {
+    let Some(gid) = wgd_gid else {
+        return format!("MISSING  group '{GROUP_NAME}' does not exist (run: wgd launchd reload)");
+    };
+    let Some((user, _uid, _home)) = resolve_target_user() else {
+        return "unable to determine invoking user".to_string();
+    };
+
+    let in_ds = std::process::Command::new("/usr/sbin/dseditgroup")
+        .args(["-o", "checkmember", "-m", &user, GROUP_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    // A direct `sudo wgd launchd status` has no `--caller-in-wgd-group`, and
+    // root's own groups say nothing about the caller's shell, so whether a
+    // re-login is still pending cannot be told here.
+    let Some(in_session) = caller_in_wgd_group else {
+        return if in_ds {
+            format!(
+                "ok  {user} is in {GROUP_NAME} group (gid {gid}); whether the current shell has it active is unknown under sudo (run without sudo to check)"
+            )
+        } else {
+            format!("not in {GROUP_NAME} group — run `wgd launchd reload` and re-login")
+        };
+    };
+    match (in_session, in_ds) {
+        (true, _) => format!("ok  {user} is in {GROUP_NAME} group (gid {gid})"),
+        (false, true) => format!(
+            "WARN  {user} is in {GROUP_NAME} group (gid {gid}), but not active in current shell — re-login required"
+        ),
+        (false, false) => format!(
+            "not in {GROUP_NAME} group — run `wgd launchd reload` and re-login"
+        ),
+    }
+}
+
+fn check_session_agent_status() -> String {
+    let Some((user, uid, home)) = resolve_target_user() else {
+        return "unable to determine invoking user".to_string();
+    };
+    let plist = home
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", crate::session_agent::LABEL));
+    if !plist.exists() {
+        return format!("not installed for {user} ({} missing)", plist.display());
+    }
+    let loaded = crate::session_agent::is_loaded(uid);
+    if loaded {
+        format!(
+            "loaded (gui/{uid}/{})  {}",
+            crate::session_agent::LABEL,
+            plist.display()
+        )
+    } else {
+        format!(
+            "not loaded (gui/{uid}/{})  {} (run: wgd launchd reload)",
+            crate::session_agent::LABEL,
+            plist.display()
+        )
+    }
+}
+
+fn collect_wgd_process_lines() -> Vec<String> {
+    let output = match std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,uid=,user=,args="])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return vec!["failed to run /bin/ps".to_string()],
+    };
+    let lines =
+        filter_wgd_process_lines(&String::from_utf8_lossy(&output.stdout), std::process::id());
+    if lines.is_empty() {
+        vec!["none running".to_string()]
+    } else {
+        lines
+    }
+}
+
+fn filter_wgd_process_lines(ps_output: &str, self_pid: u32) -> Vec<String> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let (pid_str, rest) = trimmed.split_once(char::is_whitespace)?;
+            let pid = pid_str.parse::<u32>().ok()?;
+            if pid == self_pid {
+                return None;
+            }
+            let (_uid_str, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+            let (user, args) = rest.trim_start().split_once(char::is_whitespace)?;
+            let args = args.trim_start();
+            let argv0 = args.split_whitespace().next()?;
+            let is_wgd = Path::new(argv0).file_name() == Some("wgd".as_ref());
+            if !is_wgd {
+                return None;
+            }
+            // Skip transient diagnostic invocations (`wgd doctor`, `wgd launchd status`).
+            let tokens: Vec<&str> = args.split_whitespace().collect();
+            if tokens.contains(&"doctor")
+                || (tokens.contains(&"launchd") && tokens.contains(&"status"))
+            {
+                return None;
+            }
+            Some(format!("pid={pid:<6} user={user:<10} {args}"))
+        })
+        .collect()
 }
 
 /// Disconnect every currently-connected stored connection, `Mine` and
@@ -1015,6 +1598,34 @@ fn parse_privileged_daemon_pids(ps_output: &str) -> Vec<u32> {
         .collect()
 }
 
+fn find_session_agent_pids() -> Vec<u32> {
+    let output = match std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_session_agent_pids(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_session_agent_pids(ps_output: &str) -> Vec<u32> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid_str, args) = line.split_once(char::is_whitespace)?;
+            let pid = pid_str.parse::<u32>().ok()?;
+            let mut tokens = args.split_whitespace();
+            let is_wgd = tokens
+                .next()
+                .is_some_and(|argv0| Path::new(argv0).file_name() == Some("wgd".as_ref()));
+            let rest: Vec<&str> = tokens.collect();
+            (is_wgd && rest == ["launchd", "agent", "run"]).then_some(pid)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,5 +2034,97 @@ mod tests {
             reject_unsafe_relocation_source(Path::new("/System/Volumes/Data/tmp/wgd"), None,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn finds_other_users_session_agent_plists_but_not_the_invoking_users() {
+        let root = std::env::temp_dir().join(format!("wgd-purge-test-{}", std::process::id()));
+        let plist_name = format!("{}.plist", crate::session_agent::LABEL);
+        for user in ["alice", "bob", "carol"] {
+            fs::create_dir_all(root.join(user).join("Library/LaunchAgents")).unwrap();
+        }
+        fs::write(
+            root.join("alice/Library/LaunchAgents").join(&plist_name),
+            "",
+        )
+        .unwrap();
+        fs::write(root.join("bob/Library/LaunchAgents").join(&plist_name), "").unwrap();
+        let found = other_users_session_agent_plists(&root, Some(&root.join("alice")));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            found,
+            vec![root.join("bob/Library/LaunchAgents").join(&plist_name)]
+        );
+    }
+
+    #[test]
+    fn symbolic_mode_renders_socket_and_directory_modes() {
+        assert_eq!(format_symbolic_mode('s', 0o660), "srw-rw----");
+        assert_eq!(format_symbolic_mode('d', 0o750), "drwxr-x---");
+        assert_eq!(format_symbolic_mode('-', 0o755), "-rwxr-xr-x");
+    }
+
+    #[test]
+    fn extracts_launchd_state_pid_and_listeners() {
+        let sample = "\
+system/me.pansen.wgd.privileged = {
+\tactive count = 1
+\tstate = running
+\truns = 3
+\tpid = 70043
+\timmediate reason = ipc (socket)
+\tlast exit code = 0
+\tsockets = {
+\t\t\"Listeners\" = {
+\t\t\ttype = stream
+\t\t\tpath = /Library/Application Support/wgd/run/ctl.sock
+\t\t}
+\t}
+\tresource coalition = {
+\t\tstate = active
+\t}
+\tjetsam coalition = {
+\t\tstate = active
+\t}
+\tjob state = running
+}";
+        assert_eq!(
+            extract_launchd_daemon_lines(sample),
+            vec![
+                "state = running".to_string(),
+                "runs = 3".to_string(),
+                "pid = 70043".to_string(),
+                "immediate reason = ipc (socket)".to_string(),
+                "last exit code = 0".to_string(),
+                "\"Listeners\" = {".to_string(),
+                "path = /Library/Application Support/wgd/run/ctl.sock".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_wgd_processes_and_skips_self_and_diagnostics() {
+        let ps = "\
+  100     0 root       /usr/local/bin/wgd --debug privileged --serve --authorized-group wgd\n\
+  200     0 root       /usr/local/bin/wgd wg-1ce3a4a1\n\
+  300   501 andi       /usr/local/bin/wgd launchd agent run\n\
+  400   501 andi       /usr/local/bin/wgd doctor --report /tmp/r.log\n\
+  500     0 root       /usr/local/bin/wgd launchd status --caller-in-wgd-group=true\n\
+  600   501 andi       /bin/zsh\n";
+        let lines = filter_wgd_process_lines(ps, 999);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("privileged --serve"));
+        assert!(lines[1].contains("wg-1ce3a4a1"));
+        assert!(lines[2].contains("launchd agent run"));
+    }
+
+    #[test]
+    fn parses_session_agent_pids_only() {
+        let ps = "\
+  100 /usr/local/bin/wgd privileged --serve\n\
+  300 /usr/local/bin/wgd launchd agent run\n\
+  301 /opt/homebrew/bin/wgd launchd agent run\n\
+  400 /usr/local/bin/wgd launchd agent status\n";
+        assert_eq!(parse_session_agent_pids(ps), vec![300, 301]);
     }
 }

@@ -23,9 +23,13 @@ cask "macos-wireguard-daemon" do
     must_succeed: false,
   }
 
+  # `launchd purge` also restores DNS a crashed helper left behind and
+  # removes the authorization right and the session agent, which a plain
+  # delete list cannot do. The directories stay listed as a fallback in case
+  # purge fails.
   zap script: {
-        executable:   "/usr/sbin/dseditgroup",
-        args:         ["-o", "delete", "wgd"],
+        executable:   "/usr/local/bin/wgd",
+        args:         ["launchd", "purge"],
         must_succeed: false,
         sudo:         true,
       },
