@@ -129,8 +129,25 @@ jobs:
             --key "${key_file}" --key-id "${ASC_KEY_ID}" \
             --issuer "${ASC_ISSUER_ID}" --wait
           rm "${key_file}"
-          xcrun stapler staple "${dmg[0]}"
-          xcrun stapler validate "${dmg[0]}"
+          # stapler fetches the ticket from api.apple-cloudkit.com over HTTP/3
+          # (QUIC, UDP 443), and that path drops on GitHub-hosted macOS runners
+          # (NSURLError -1005, stapler error 68; actions/runner-images#14924).
+          # Blocking outbound UDP 443 makes it fall back to HTTPS over TCP,
+          # which works. The runner VM is discarded after the job.
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
+          # Keep a retry for the remaining transient CloudKit failures.
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "::warning::'$*' failed (attempt ${attempt}/5), retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+            done
+            "$@"
+          }
+          retry xcrun stapler staple "${dmg[0]}"
+          retry xcrun stapler validate "${dmg[0]}"
 
       - name: Generate checksums
         shell: bash
