@@ -385,7 +385,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
 
             let shutdown_started = std::time::Instant::now();
             let wait_result = rt.block_on(wait_for_shutdown(&running));
-            debug!(
+            info!(
                 interface = running.control_interface_name,
                 elapsed_ms = shutdown_started.elapsed().as_millis(),
                 result = ?wait_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
@@ -394,7 +394,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
 
             let cleanup_started = std::time::Instant::now();
             let cleanup_result = cleanup_network(&running);
-            debug!(
+            info!(
                 interface = running.control_interface_name,
                 elapsed_ms = cleanup_started.elapsed().as_millis(),
                 result = ?cleanup_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
@@ -535,16 +535,16 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = sigint.recv() => {
-                debug!(interface = running.control_interface_name, trigger = "sigint", "userspace_helper_shutdown_requested");
+                info!(interface = running.control_interface_name, trigger = "sigint", "userspace_helper_shutdown_requested");
                 break;
             },
             _ = sigterm.recv() => {
-                debug!(interface = running.control_interface_name, trigger = "sigterm", "userspace_helper_shutdown_requested");
+                info!(interface = running.control_interface_name, trigger = "sigterm", "userspace_helper_shutdown_requested");
                 break;
             },
             _ = ticker.tick() => {
                 if !running.control_socket_path.exists() {
-                    debug!(interface = running.control_interface_name, trigger = "control_socket_removed", "userspace_helper_shutdown_requested");
+                    info!(interface = running.control_interface_name, trigger = "control_socket_removed", "userspace_helper_shutdown_requested");
                     break;
                 }
 
@@ -1122,9 +1122,21 @@ fn configure_network_macos(
 #[cfg(target_os = "macos")]
 fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
     let mut errors = Vec::new();
-    // Restore routes then DNS, taking the `routing` and `dns` locks
-    // independently (never both at once) to avoid any ordering hazard with the
-    // reconciler.
+    // Restore persistent DNS before spending the shutdown window on routes.
+    // Keep route cleanup (including shadowed LAN-route restoration) intact.
+    // Take the `dns` and `routing` locks independently (never both at once)
+    // to avoid any ordering hazard with the reconciler.
+    {
+        let dns = state
+            .dns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        info!(
+            dns_services = dns.services.len(),
+            "userspace_helper_network_cleanup_dns"
+        );
+        errors.extend(restore_macos_dns_services(&dns.services, &state.reconcile));
+    }
     {
         let routing = state
             .routing
@@ -1145,17 +1157,6 @@ fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
                 Err(error) => errors.push(error.to_string()),
             }
         }
-    }
-    {
-        let dns = state
-            .dns
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug!(
-            dns_services = dns.services.len(),
-            "userspace_helper_network_cleanup_dns"
-        );
-        errors.extend(restore_macos_dns_services(&dns.services, &state.reconcile));
     }
     finish_cleanup(errors)
 }

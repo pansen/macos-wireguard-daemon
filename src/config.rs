@@ -152,10 +152,11 @@ pub fn ensure_root_log_dir() -> Result<()> {
 
 /// Log file the gotatun userspace helper writes and the privileged service tails.
 /// Single source of truth shared by the helper (writer) and the service
-/// (clear-at-connect + tail), which must agree on the path.
+/// (rotate-at-connect + tail), which must agree on the path.
 ///
 /// The helper runs as root (the privileged daemon spawns it), so its log lives
-/// under `/var/log/wgd/<interface>.log`.
+/// under `/var/log/wgd/<interface>.log`; the previous session is kept as
+/// `<interface>.1.log`.
 #[must_use]
 pub fn gotatun_helper_log_path(interface: &str) -> PathBuf {
     root_log_dir().join(format!("{interface}.log"))

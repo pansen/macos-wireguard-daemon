@@ -438,11 +438,14 @@ mod tests {
         fs::write(dir.join("privileged.err.log"), "err\n").unwrap();
         fs::write(dir.join("privileged.out.log"), "out\n").unwrap();
         fs::write(dir.join("wg-1ce3a4a1.log"), "helper\n").unwrap();
+        fs::write(dir.join("wg-1ce3a4a1.1.log"), "previous helper session\n").unwrap();
         fs::write(dir.join("ignore.txt"), "ignore\n").unwrap();
 
         let all = matching_log_files_in(&dir, None).unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
+        assert!(all.contains(&dir.join("wg-1ce3a4a1.1.log")));
 
+        // An explicit connection filter still selects just its current log.
         let helper = matching_log_files_in(&dir, Some("wg-1ce3a4a1")).unwrap();
         assert_eq!(helper, vec![dir.join("wg-1ce3a4a1.log")]);
 

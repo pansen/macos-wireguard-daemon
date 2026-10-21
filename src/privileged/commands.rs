@@ -279,12 +279,15 @@ pub(super) fn run_gotatun_up(
 
     let exe = self_executable_for_spawn()?;
     let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_content);
+    rotate_helper_log(&gotatun_log_path(interface)).map_err(|error| {
+        AppError::Other(format!(
+            "failed to rotate helper log for {interface}: {error}"
+        ))
+    })?;
     for path in [
         gotatun_pid_path(interface),
         gotatun_name_path(interface),
         gotatun_cleanup_status_path(interface),
-        // Start a fresh session log so the streamed connect output is just this session's.
-        gotatun_log_path(interface),
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -331,6 +334,18 @@ pub(super) fn run_gotatun_up(
     }
     ensure_gotatun_process_identity(pid)?;
     Ok(())
+}
+
+/// Keep one previous session as `<interface>.1.log`, leaving the current path
+/// free for a fresh log. Do not start a helper if rotation fails: appending to
+/// the old log would mix sessions and hide the failure. A missing current log
+/// leaves any previous session intact.
+fn rotate_helper_log(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(path, path.with_extension("1.log")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
@@ -560,7 +575,7 @@ fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_gotatun_process_identity, gotatun_runtime_path, read_gotatun_pid,
+        ensure_gotatun_process_identity, gotatun_runtime_path, read_gotatun_pid, rotate_helper_log,
         wait_for_cleanup_status,
     };
 
@@ -573,6 +588,66 @@ mod tests {
             "wgd-gotatun-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn helper_log_rotation_keeps_only_the_previous_session() {
+        let dir = temp_path("log-rotation");
+        std::fs::create_dir(&dir).unwrap();
+        let current = dir.join("wg-aaaaaaaa.log");
+        let previous = dir.join("wg-aaaaaaaa.1.log");
+        std::fs::write(&current, "first session\n").unwrap();
+
+        rotate_helper_log(&current).unwrap();
+        assert!(!current.exists());
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "first session\n"
+        );
+
+        std::fs::write(&current, "second session\n").unwrap();
+        rotate_helper_log(&current).unwrap();
+        assert!(!current.exists());
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "second session\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_current_helper_log_preserves_the_previous_session() {
+        let dir = temp_path("missing-log");
+        std::fs::create_dir(&dir).unwrap();
+        let current = dir.join("wg-aaaaaaaa.log");
+        let previous = dir.join("wg-aaaaaaaa.1.log");
+
+        rotate_helper_log(&current).unwrap();
+        assert!(!previous.exists());
+        std::fs::write(&previous, "previous session\n").unwrap();
+        rotate_helper_log(&current).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "previous session\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn helper_log_rotation_reports_errors_without_discarding_the_current_log() {
+        let dir = temp_path("failed-log-rotation");
+        std::fs::create_dir(&dir).unwrap();
+        let current = dir.join("wg-aaaaaaaa.log");
+        let previous = dir.join("wg-aaaaaaaa.1.log");
+        std::fs::write(&current, "current session\n").unwrap();
+        std::fs::create_dir(&previous).unwrap();
+
+        assert!(rotate_helper_log(&current).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "current session\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

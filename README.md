@@ -183,7 +183,9 @@ and hide the very state you want to see.
 
 `wgd logs` prints the last 150 lines (`-n`) of `/var/log/wgd/*.log`: the
 daemon's `privileged.{out,err}.log` and one `<interface>.log` per connection
-helper. Pass a connection name, id or interface (`wg-1ce3a4a1`) to filter.
+helper, plus its previous session in `<interface>.1.log`. Each helper start
+rotates the current log, replacing the previous session. Pass a connection
+name, id or interface (`wg-1ce3a4a1`) to filter to its current log.
 Logs of connections untouched for 24 hours are skipped unless you pass
 `--all`. `--launchd` shows what launchd logged about wgd in the last 10
 minutes, which is where a daemon that fails to start shows up. `-f` follows.
