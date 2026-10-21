@@ -288,7 +288,7 @@ fn wait_for_pending_sigterm() -> anyhow::Result<()> {
 }
 
 /// Whether launchd currently has the agent bootstrapped in the user's GUI domain.
-fn is_loaded(uid: u32) -> bool {
+pub(crate) fn is_loaded(uid: u32) -> bool {
     std::process::Command::new("/bin/launchctl")
         .args(["print", &domain_target(uid)])
         .stdout(Stdio::null())

@@ -18,7 +18,7 @@ use tracing::debug;
 use crate::cli::LaunchdCommand;
 use crate::config;
 use crate::launchctl::{remove_file_ignore_missing, run_checked, run_ignore_failure, xml_escape};
-use crate::privileged_api::ConnectionScope;
+use crate::privileged_api::{ConnectionScope, ConnectionStartMode, ConnectionSummary};
 use crate::privileged_client::PrivilegedClient;
 
 pub(crate) const LABEL: &str = "me.pansen.wgd.privileged";
@@ -310,6 +310,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     bootstrap()?;
     reap_stray_privileged_daemons();
     wait_for_launchd_socket();
+    reconnect_automatic_connections();
 
     println!("wgd privileged daemon installed.");
     println!("  binary: {}", bin.display());
@@ -430,6 +431,56 @@ fn disconnect_all_connections_once() {
             Err(error) => eprintln!("Warning: failed to disconnect {}: {error:#}", conn.label()),
         }
     }
+}
+
+/// Bring `Automatic` connections back up after the daemon was (re)registered.
+///
+/// An upgrade runs the old version's `launchd uninstall` first, which tears
+/// every tunnel down (`disconnect_all_connections`) without marking it
+/// `user_disconnected`. Nothing else would reconnect them afterwards: the
+/// session agent only reconciles when it starts (it keeps running across the
+/// upgrade), and the daemon's own `reconcile_boot` runs once per boot.
+/// Restarting the agent instead would make its SIGTERM teardown drop any
+/// tunnel that is still up, so this connects the candidates directly, as
+/// reconciliation (an explicit disconnect still wins).
+///
+/// Best-effort per connection, like the uninstall sweep. No autostart: the
+/// socket was just confirmed reachable, and a missing daemon here must not
+/// leave an ad hoc one behind.
+fn reconnect_automatic_connections() {
+    let client = PrivilegedClient::new().without_autostart();
+    let connections = match client.list_connections(ConnectionScope::All) {
+        Ok(connections) => connections,
+        Err(error) => {
+            eprintln!("Warning: failed to list connections after install: {error:#}");
+            return;
+        }
+    };
+    // Per-user connections belong to a GUI session: only bring them up for
+    // the user running the install, and only while their session agent is
+    // loaded (it tears them down again at logout).
+    let session_owner = invoking_user_uid()
+        .map(Uid::as_raw)
+        .filter(|&uid| crate::session_agent::is_loaded(uid));
+    for conn in connections
+        .iter()
+        .filter(|conn| is_post_install_candidate(conn, session_owner))
+    {
+        match client.connect_connection_for_reconciliation(conn.id, false) {
+            Ok(()) => println!("Reconnected {}", conn.label()),
+            Err(error) => eprintln!("Warning: failed to reconnect {}: {error:#}", conn.label()),
+        }
+    }
+}
+
+/// Whether `reconnect_automatic_connections` should bring `conn` up:
+/// `Automatic`, currently down, not explicitly disconnected, and either
+/// global or owned by `session_owner`.
+fn is_post_install_candidate(conn: &ConnectionSummary, session_owner: Option<u32>) -> bool {
+    conn.start_mode == ConnectionStartMode::Automatic
+        && !conn.connected
+        && !conn.user_disconnected
+        && (conn.global || (session_owner.is_some() && conn.owner_uid == session_owner))
 }
 
 /// Bail unless running as root, with a hint on how to re-invoke this command.
@@ -915,7 +966,64 @@ fn parse_privileged_daemon_pids(ps_output: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privileged_api::ConnectionId;
     use std::path::Path;
+
+    fn summary(global: bool, owner_uid: Option<u32>) -> ConnectionSummary {
+        ConnectionSummary {
+            id: ConnectionId::new(),
+            global,
+            owner_uid,
+            start_mode: ConnectionStartMode::Automatic,
+            name: None,
+            interface: "wg-aaaaaaaa".to_string(),
+            connected: false,
+            user_disconnected: false,
+            addresses: Vec::new(),
+            dns_servers: Vec::new(),
+            mtu: None,
+            peers: Vec::new(),
+            fingerprint: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn post_install_reconnects_down_automatic_connections_of_the_session_owner_and_globals() {
+        assert!(is_post_install_candidate(
+            &summary(false, Some(501)),
+            Some(501)
+        ));
+        assert!(is_post_install_candidate(&summary(true, None), Some(501)));
+        assert!(is_post_install_candidate(&summary(true, None), None));
+    }
+
+    #[test]
+    fn post_install_skips_other_users_and_sessionless_installs() {
+        assert!(!is_post_install_candidate(
+            &summary(false, Some(502)),
+            Some(501)
+        ));
+        // No GUI session (e.g. an upgrade over ssh): per-user tunnels stay down
+        // until that user's session agent starts.
+        assert!(!is_post_install_candidate(&summary(false, Some(501)), None));
+        assert!(!is_post_install_candidate(&summary(false, None), None));
+    }
+
+    #[test]
+    fn post_install_respects_mode_state_and_explicit_disconnect() {
+        let mut manual = summary(false, Some(501));
+        manual.start_mode = ConnectionStartMode::Manual;
+        let mut up = summary(false, Some(501));
+        up.connected = true;
+        let mut user_disconnected = summary(true, None);
+        user_disconnected.user_disconnected = true;
+
+        assert!(!is_post_install_candidate(&manual, Some(501)));
+        assert!(!is_post_install_candidate(&up, Some(501)));
+        assert!(!is_post_install_candidate(&user_disconnected, Some(501)));
+    }
 
     #[test]
     fn require_root_errors_when_not_root() {

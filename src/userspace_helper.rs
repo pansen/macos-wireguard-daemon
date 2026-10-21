@@ -1077,7 +1077,8 @@ fn configure_network_macos(
         }
         // Apply DNS the same way the reconciler will, then seed the DNS
         // fingerprint so the first reconcile tick is a no-op.
-        dns_fingerprint = configure_macos_dns(&inputs, &mut dns_services)?;
+        dns_fingerprint =
+            configure_macos_dns(&inputs, &fingerprint.local_subnets, &mut dns_services)?;
         Ok(())
     })();
 
@@ -1171,10 +1172,13 @@ fn finish_cleanup(errors: Vec<String>) -> anyhow::Result<()> {
 /// Apply the tunnel's DNS to the services selected by `DNS_POLICY`, saving each
 /// touched service's original config into `saved` for later restore. Returns the
 /// DNS fingerprint observed *after* applying, so the reconciler's first tick is a
-/// no-op. Shares its per-service capture+apply path with the reconciler.
+/// no-op. Shares its decision (`dns_decision`, including the LAN-collision rule)
+/// and its per-service capture+apply path with the reconciler, so a colliding
+/// tunnel DNS is never written in the first place.
 #[cfg(target_os = "macos")]
 fn configure_macos_dns(
     inputs: &MacosReconcileInputs,
+    local_subnets: &[(IpAddr, u8)],
     saved: &mut Vec<MacosDnsServiceState>,
 ) -> anyhow::Result<MacosDnsFingerprint> {
     if inputs.dns_servers.is_empty() {
@@ -1182,12 +1186,19 @@ fn configure_macos_dns(
     }
 
     let fingerprint = macos_current_dns_fingerprint()?;
-    for service in dns_target_services(DNS_POLICY, &fingerprint) {
-        saved.push(capture_macos_dns_service(&service, &inputs.dns_servers)?);
+    let collision = macos_dns_server_in_local_subnet(&inputs.dns_servers, local_subnets);
+    if let Some(collision) = &collision {
+        log_dns_unreachable_local_lan(&inputs.interface, collision);
+    }
+    // Nothing is owned yet, so `Hold` and `RestoreAll` both mean "write nothing";
+    // with no primary the reconciler applies once one appears.
+    let decision = dns_decision(DNS_POLICY, &fingerprint, collision.is_some());
+    for service in decision.targets() {
+        saved.push(capture_macos_dns_service(service, &inputs.dns_servers)?);
         // Write-ahead: the record must list the service before its DNS changes.
         persist_dns_custody(saved, inputs);
-        crate::macos_dns::set_dns_servers(&service, &inputs.dns_servers)?;
-        crate::macos_dns::set_search_domains_empty(&service)?;
+        crate::macos_dns::set_dns_servers(service, &inputs.dns_servers)?;
+        crate::macos_dns::set_search_domains_empty(service)?;
     }
 
     // Re-snapshot post-apply: the stored fingerprint must reflect the DNS we
@@ -2017,19 +2028,64 @@ fn macos_reconcile_routes(state: &MacosCleanupState) -> bool {
     true
 }
 
-/// The services that should carry tunnel DNS under `policy`. `PrimaryOnly`
-/// targets just the service that owns global resolution; if that can't be
-/// determined (or isn't a current service) it falls back to `AllServices` so we
-/// never leave the primary resolver leaked (`transparent_dns.md` §6.3).
+/// What the DNS reconciler should do with tunnel DNS. An empty target list is
+/// ambiguous (`plan_dns_actions` reads it as "release everything owned"), so the
+/// two reasons for having no targets are kept apart.
 #[cfg(target_os = "macos")]
-fn dns_target_services(policy: DnsPolicy, fp: &MacosDnsFingerprint) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DnsDecision {
+    /// Own exactly these services.
+    Apply(Vec<String>),
+    /// A tunnel DNS server is unreachable (LAN collision): restore every owned
+    /// service and write nothing.
+    RestoreAll,
+    /// No settled primary service, typically a moment during a network switch.
+    /// Write nothing, and leave the services we already own untouched until a
+    /// primary shows up again; releasing them now would only flap their DNS.
+    Hold,
+}
+
+#[cfg(target_os = "macos")]
+impl DnsDecision {
+    /// The services to own after this decision. Empty for `RestoreAll` and `Hold`.
+    fn targets(&self) -> &[String] {
+        match self {
+            DnsDecision::Apply(targets) => targets,
+            DnsDecision::RestoreAll | DnsDecision::Hold => &[],
+        }
+    }
+}
+
+/// Decide what to do with tunnel DNS. A collision wins over everything else.
+/// `PrimaryOnly` targets just the service that owns global resolution; without
+/// one (or if it isn't a current service) it holds rather than fanning out to
+/// every service, which would overwrite unrelated VPN and tether services.
+/// Used by both the connect-time apply and the reconciler so they cannot drift.
+#[cfg(target_os = "macos")]
+fn dns_decision(policy: DnsPolicy, fp: &MacosDnsFingerprint, collision: bool) -> DnsDecision {
+    if collision {
+        return DnsDecision::RestoreAll;
+    }
     match policy {
-        DnsPolicy::AllServices => fp.services.clone(),
+        DnsPolicy::AllServices => DnsDecision::Apply(fp.services.clone()),
         DnsPolicy::PrimaryOnly => match &fp.primary_service {
-            Some(primary) if fp.services.iter().any(|s| s == primary) => vec![primary.clone()],
-            _ => fp.services.clone(),
+            Some(primary) if fp.services.iter().any(|s| s == primary) => {
+                DnsDecision::Apply(vec![primary.clone()])
+            }
+            _ => DnsDecision::Hold,
         },
     }
+}
+
+#[cfg(target_os = "macos")]
+fn log_dns_unreachable_local_lan(interface: &str, collision: &(IpAddr, (IpAddr, u8))) {
+    let (server, (subnet_ip, subnet_prefix)) = collision;
+    warn!(
+        interface,
+        dns_server = %server,
+        local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
+        "userspace_helper_dns_unreachable_local_lan"
+    );
 }
 
 /// A configured tunnel DNS server whose address falls inside a directly-connected
@@ -2243,10 +2299,13 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
     // original DNS rather than left pointing at an unreachable (or
     // LAN-impersonatable) address.
     let owned: Vec<String> = dns.services.iter().map(|s| s.service.clone()).collect();
-    let targets = match &collision {
-        Some(_) => Vec::new(),
-        None => dns_target_services(DNS_POLICY, &fingerprint),
-    };
+    let decision = dns_decision(DNS_POLICY, &fingerprint, collision.is_some());
+    // No primary right now: change nothing. The stored fingerprint stays as it
+    // was, so the tick where a primary reappears sees the difference and acts.
+    if decision == DnsDecision::Hold {
+        return false;
+    }
+    let targets = decision.targets().to_vec();
 
     // Normally skip when the DNS environment is unchanged, but still act when a
     // collision transition changed required ownership without moving the
@@ -2267,22 +2326,15 @@ fn macos_reconcile_dns(state: &MacosCleanupState) -> bool {
         "userspace_helper_dns_change_detected"
     );
 
-    if let Some((server, (subnet_ip, subnet_prefix))) = &collision {
-        warn!(
-            interface = inputs.interface,
-            dns_server = %server,
-            local_subnet = %format!("{subnet_ip}/{subnet_prefix}"),
-            "userspace_helper_dns_unreachable_local_lan"
-        );
+    if let Some(collision) = &collision {
+        log_dns_unreachable_local_lan(&inputs.interface, collision);
     }
 
     let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
     debug!(
         interface = inputs.interface,
         primary_service = ?fingerprint.primary_service,
-        fallback_to_all_services = collision.is_none()
-            && DNS_POLICY == DnsPolicy::PrimaryOnly
-            && !fingerprint.primary_service.as_ref().is_some_and(|primary| fingerprint.services.contains(primary)),
+        decision = ?decision,
         tunnel_dns = ?inputs.dns_servers,
         previous_observed_dns = ?previous.observed,
         observed_dns = ?fingerprint.observed,
@@ -3203,17 +3255,13 @@ fn macos_dns_overview_rows(
         )];
     }
 
-    // A collision pulls tunnel DNS back, so nothing is targeted; reflect that here
-    // too, otherwise the table contradicts the reconciler's actual decision.
-    let targets = if dns_unreachable {
-        Vec::new()
-    } else {
-        dns_target_services(DNS_POLICY, dns_fingerprint)
-    };
-    // No settled primary (a transient between networks) means the PrimaryOnly
-    // fallback targets every service, so there is no single active resolver to
-    // highlight — grey the whole block as unsettled, like the pull-back case.
-    let dormant = dns_unreachable || dns_fingerprint.primary_service.is_none();
+    // Use the reconciler's own decision, otherwise the table contradicts it.
+    let decision = dns_decision(DNS_POLICY, dns_fingerprint, dns_unreachable);
+    let targets = decision.targets();
+    let held = decision == DnsDecision::Hold;
+    // A pull-back or a missing primary (a transient between networks) leaves no
+    // single active resolver to highlight, so grey the whole block.
+    let dormant = dns_unreachable || held;
     dns_fingerprint
         .services
         .iter()
@@ -3232,6 +3280,7 @@ fn macos_dns_overview_rows(
                 (true, true, false) => "owned; pending reapply",
                 (true, false, true) => "already tunnel DNS",
                 (true, false, false) => "target; not owned",
+                (false, true, _) if held => "owned; held, no primary",
                 (false, true, _) => "owned; pending restore",
                 // Live DNS still shows the tunnel server, but it now sits on the
                 // local LAN — that address is no longer the VPN resolver.
@@ -4054,8 +4103,8 @@ mod tests {
             ("stale tunnel DNS on LAN".into(), true)
         );
 
-        // Transient with no settled primary: PrimaryOnly falls back to all
-        // services, but with no active resolver the whole block is greyed.
+        // Transient with no settled primary: nothing is targeted and the whole
+        // block is greyed.
         let no_primary = dns_fp(
             None,
             &[
@@ -4064,13 +4113,10 @@ mod tests {
             ],
         );
         let unsettled = macos_dns_overview_rows(&inputs, &[], &no_primary, false);
-        assert_eq!(
-            status(&unsettled, "Wi-Fi"),
-            ("already tunnel DNS".into(), true)
-        );
+        assert_eq!(status(&unsettled, "Wi-Fi"), ("not targeted".into(), true));
         assert_eq!(
             status(&unsettled, "Thunderbolt Bridge"),
-            ("already tunnel DNS".into(), true)
+            ("not targeted".into(), true)
         );
     }
 
@@ -4270,7 +4316,7 @@ resolver #1
     }
 
     #[test]
-    fn dns_target_services_honours_policy_and_falls_back() {
+    fn dns_decision_honours_policy_and_holds_without_primary() {
         let fp = dns_fp(
             Some("Wi-Fi"),
             &[
@@ -4281,29 +4327,103 @@ resolver #1
 
         // AllServices targets every service.
         assert_eq!(
-            dns_target_services(DnsPolicy::AllServices, &fp),
-            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+            dns_decision(DnsPolicy::AllServices, &fp, false),
+            DnsDecision::Apply(vec!["Ethernet".to_string(), "Wi-Fi".to_string()])
         );
 
         // PrimaryOnly targets just the primary.
         assert_eq!(
-            dns_target_services(DnsPolicy::PrimaryOnly, &fp),
-            vec!["Wi-Fi".to_string()]
+            dns_decision(DnsPolicy::PrimaryOnly, &fp, false),
+            DnsDecision::Apply(vec!["Wi-Fi".to_string()])
         );
 
-        // PrimaryOnly with no detectable primary falls back to all services.
+        // PrimaryOnly with no detectable primary holds instead of fanning out.
         let no_primary = dns_fp(None, &[("Wi-Fi", None), ("Ethernet", None)]);
         assert_eq!(
-            dns_target_services(DnsPolicy::PrimaryOnly, &no_primary),
-            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+            dns_decision(DnsPolicy::PrimaryOnly, &no_primary, false),
+            DnsDecision::Hold
         );
 
-        // PrimaryOnly whose primary isn't a current service also falls back.
+        // So does a primary that isn't a current service.
         let stale_primary = dns_fp(Some("Bogus"), &[("Wi-Fi", None)]);
         assert_eq!(
-            dns_target_services(DnsPolicy::PrimaryOnly, &stale_primary),
-            vec!["Wi-Fi".to_string()]
+            dns_decision(DnsPolicy::PrimaryOnly, &stale_primary, false),
+            DnsDecision::Hold
         );
+    }
+
+    #[test]
+    fn dns_decision_collision_restores_all_even_without_primary() {
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["10.66.77.2"]))]);
+        let no_primary = dns_fp(None, &[("Wi-Fi", None)]);
+        for fp in [&fp, &no_primary] {
+            let decision = dns_decision(DnsPolicy::PrimaryOnly, fp, true);
+            assert_eq!(decision, DnsDecision::RestoreAll);
+            assert!(decision.targets().is_empty());
+        }
+    }
+
+    #[test]
+    fn initial_apply_with_tunnel_dns_in_local_subnet_targets_nothing() {
+        // Same inputs the connect path feeds `configure_macos_dns`: tunnel DNS
+        // 10.66.77.2 sits inside the home LAN, so nothing may be written.
+        let tunnel_dns = vec!["10.66.77.2".to_string(), "100.64.1.1".to_string()];
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        let collision = macos_dns_server_in_local_subnet(&tunnel_dns, &[subnet("10.66.77.0/24")]);
+        assert!(collision.is_some());
+
+        let decision = dns_decision(DnsPolicy::PrimaryOnly, &fp, collision.is_some());
+        let actions = plan_dns_actions(&tunnel_dns, &fp, &[], decision.targets());
+        assert_eq!(actions, DnsActions::default());
+        // Nothing owned and nothing to assert: the next tick must not be forced.
+        assert!(!dns_reconcile_forced(true, &[], decision.targets()));
+    }
+
+    #[test]
+    fn hold_without_primary_keeps_owned_services() {
+        // Primary vanished mid network switch while we own Wi-Fi: the decision
+        // targets nothing, and the reconciler returns before planning, so the
+        // owned service is neither restored nor re-captured.
+        let fp = dns_fp(None, &[("Wi-Fi", Some(&["100.64.0.1"])), ("Vpn", None)]);
+        let decision = dns_decision(DnsPolicy::PrimaryOnly, &fp, false);
+        assert_eq!(decision, DnsDecision::Hold);
+        assert!(decision.targets().is_empty());
+
+        // Contrast: planning with the empty target list would release it.
+        let released = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &[]);
+        assert_eq!(released.restore, vec!["Wi-Fi".to_string()]);
+    }
+
+    #[test]
+    fn collision_restores_owned_services() {
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
+        let decision = dns_decision(DnsPolicy::PrimaryOnly, &fp, true);
+        let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], decision.targets());
+        assert_eq!(actions.restore, vec!["Wi-Fi".to_string()]);
+        assert!(actions.capture.is_empty());
+        assert!(actions.apply.is_empty());
+        assert!(dns_reconcile_forced(
+            true,
+            &["Wi-Fi".to_string()],
+            decision.targets()
+        ));
+    }
+
+    #[test]
+    fn primary_returning_after_hold_targets_the_primary() {
+        let held = dns_fp(None, &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        assert_eq!(
+            dns_decision(DnsPolicy::PrimaryOnly, &held, false),
+            DnsDecision::Hold
+        );
+
+        let back = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        let decision = dns_decision(DnsPolicy::PrimaryOnly, &back, false);
+        assert_eq!(decision, DnsDecision::Apply(vec!["Wi-Fi".to_string()]));
+        assert!(dns_reconcile_forced(false, &[], decision.targets()));
+        let actions = plan_dns_actions(&tunnel(), &back, &[], decision.targets());
+        assert_eq!(actions.capture, vec!["Wi-Fi".to_string()]);
+        assert_eq!(actions.apply, vec!["Wi-Fi".to_string()]);
     }
 
     fn tunnel() -> Vec<String> {
@@ -4320,7 +4440,9 @@ resolver #1
                 ("Wi-Fi", Some(&["100.64.0.1"])),     // still has our tunnel DNS
             ],
         );
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
 
         assert_eq!(actions.capture, vec!["Ethernet".to_string()]);
@@ -4333,7 +4455,9 @@ resolver #1
     fn plan_dns_clobber_reapplies_without_recapturing() {
         // configd reverted our DNS on an owned, still-targeted service.
         let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["192.168.1.1"]))]);
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
 
         assert!(actions.capture.is_empty()); // already owned → keep original
@@ -4351,7 +4475,9 @@ resolver #1
                 ("Tether", Some(&["10.0.0.1"])),  // new service with native DNS
             ],
         );
-        let targets = dns_target_services(DnsPolicy::AllServices, &fp);
+        let targets = dns_decision(DnsPolicy::AllServices, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
 
         assert_eq!(actions.capture, vec!["Tether".to_string()]);
@@ -4364,7 +4490,9 @@ resolver #1
     fn plan_dns_vanished_service_is_dropped_not_restored() {
         // We owned "Tether" but it's gone from the current services.
         let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(
             &tunnel(),
             &fp,
@@ -4382,7 +4510,9 @@ resolver #1
     fn plan_dns_steady_state_is_a_no_op() {
         // Primary already shows tunnel DNS and is owned → nothing to do.
         let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
         assert_eq!(actions, DnsActions::default());
     }
@@ -4420,7 +4550,9 @@ resolver #1
         // resolver is stranded forever. Differs from the owned steady state:
         // here `owned` is empty.
         let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel(), &fp, &[], &targets);
 
         assert_eq!(actions.capture, vec!["Wi-Fi".to_string()]); // adopt the leak
@@ -4434,7 +4566,9 @@ resolver #1
         // VPN [100.64.0.1, 8.8.8.8] vs observed [100.64.0.1] is not equal → apply.
         let tunnel = vec!["100.64.0.1".to_string(), "8.8.8.8".to_string()];
         let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
-        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let targets = dns_decision(DnsPolicy::PrimaryOnly, &fp, false)
+            .targets()
+            .to_vec();
         let actions = plan_dns_actions(&tunnel, &fp, &[], &targets);
         assert_eq!(actions.apply, vec!["Wi-Fi".to_string()]);
         assert_eq!(actions.capture, vec!["Wi-Fi".to_string()]);
