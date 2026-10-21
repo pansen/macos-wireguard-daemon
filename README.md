@@ -265,7 +265,9 @@ Enable them once per clone:
 make hooks
 ```
 
-The Makefile is for development only and just calls `wgd`; diagnostics and
+Run `make fmt` to apply the Rust formatting required by the pre-commit hook.
+
+The Makefile is for development only; diagnostics and
 cleanup live in the binary so Homebrew installs have them too. `make check`
 writes a `wgd doctor` report to `target/`.
 

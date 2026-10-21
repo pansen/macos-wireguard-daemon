@@ -12,8 +12,12 @@ WGD ?= $(or $(wildcard $(WGD_BIN)),target/release/wgd)
 hooks:
 	git config core.hooksPath scripts/hooks
 
+.PHONY: fmt
+fmt:
+	cargo fmt --all
+
 .PHONY: build.release
-build.release:
+build.release: fmt
 	cargo build --release
 
 .PHONY: install.binary
