@@ -4,8 +4,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "wgd",
-    about = "WireGuard config-file VPN CLI",
-    version = env!("WGD_BUILD_VERSION")
+    about = concat!("WireGuard config-file VPN CLI ", env!("WGD_BUILD_LABEL")),
+    version = env!("WGD_BUILD_LABEL")
 )]
 pub struct Cli {
     #[command(subcommand)]

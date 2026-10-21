@@ -55,9 +55,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build native target
+        shell: bash
         env:
           WGD_GIT_TAG: ${{ inputs.version }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # github.sha is the triggering commit, not necessarily inputs.ref,
+          # so read the hash from the checked-out tree.
+          WGD_GIT_COMMIT="$(git rev-parse --short=8 HEAD)"
+          export WGD_GIT_COMMIT
+          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Import signing certificate into temporary keychain
         shell: bash

@@ -188,7 +188,7 @@ fn run_capture(program: &str, args: &[&str]) -> String {
 
 fn header_section() -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "wgd {}", env!("WGD_BUILD_VERSION"));
+    let _ = writeln!(out, "wgd {}", env!("WGD_BUILD_LABEL"));
     let _ = writeln!(
         out,
         "date: {}",
