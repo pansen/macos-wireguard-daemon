@@ -73,7 +73,7 @@ classDiagram
     }
     class ConnectionCommand {
         <<enum>>
-        Add · List · Remove
+        Add · List · Remove · Refresh
         Connect · Disconnect · Mode
         Get · Agent
     }
@@ -93,6 +93,8 @@ classDiagram
         +String interface
         +u64 created_at
         +u64 updated_at
+        +Option~String~ source_path
+        +Option~u16~ mtu_override
     }
     class ActiveConnectionState {
         +String fingerprint
@@ -106,6 +108,7 @@ classDiagram
     }
     class PrivilegedClient {
         +add_connection()
+        +refresh_connection()
         +remove_connection()
         +connect_connection()
         +disconnect_connection()
@@ -115,7 +118,7 @@ classDiagram
     }
     class PrivilegedRequest {
         <<enum>>
-        AddConnection · RemoveConnection
+        AddConnection · RefreshConnection · RemoveConnection
         ConnectConnection · DisconnectConnection
         SetConnectionMode · ListConnections · GetConnection
         LeaseAcquire · LeaseRelease · ShutdownIfIdle
@@ -124,7 +127,7 @@ classDiagram
     class PrivilegedResponse {
         <<enum>>
         Unit · Bool · Pid · Text · Error
-        ConnectionId · Connection · ConnectionList
+        ConnectionId · Connection · ConnectionList · Refreshed
     }
 
     Cli *-- TopCommand
@@ -207,9 +210,9 @@ against the one recorded at add time before doing anything else. A mismatch
 connection is stale, remove and re-add it" rather than running with drifted
 semantics.
 
-`ConnectConnection`/`DisconnectConnection` run on a spawned worker thread, not
-on the accept loop itself, so a slow tunnel bring-up cannot freeze other
-clients. `Add`/`Remove`/`SetConnectionMode` still run synchronously on the
+`ConnectConnection`/`DisconnectConnection`/`RefreshConnection` run on a spawned
+worker thread, not on the accept loop itself, so a slow tunnel bring-up cannot
+freeze other clients. `Add`/`Remove`/`SetConnectionMode` still run synchronously on the
 accept thread, under a 2-second bound, since they are expected to be fast.
 
 Two separate locks are involved: `lock_connection_patient` (30s, per
@@ -236,7 +239,7 @@ flowchart LR
     LAUNCHD --> RELOAD["Reload<br/>tokio runtime + CommandScopeGuard<br/>reload::run"]
 
     CONN --> AGENT["Agent subcommand<br/>session_agent::dispatch"]
-    CONN --> RPC["Add / List / Remove / Connect /<br/>Disconnect / Mode / Get<br/>-> PrivilegedClient"]
+    CONN --> RPC["Add / Refresh / List / Remove / Connect /<br/>Disconnect / Mode / Get<br/>-> PrivilegedClient"]
 
     RELOAD -.->|"sudo self"| LAUNCHD
     RELOAD --> DISCALL["disconnect_all_mine()"]
@@ -270,6 +273,10 @@ flowchart TB
 
     ADD["AddConnection"] --> IDX
     ADD --> CONND
+    REFRESH["RefreshConnection"] --> IDX
+    REFRESH --> LOCKD
+    REFRESH --> CONND
+    REFRESH --> NETLK
     REMOVE["RemoveConnection"] --> IDX
     REMOVE --> LOCKD
     REMOVE -->|"delete"| CONND
@@ -289,6 +296,19 @@ that order, so it can never deadlock against a concurrent connect on the
 same id. `ConnectConnection`/`DisconnectConnection`/`SetConnectionMode` only
 ever take the per-id lock.
 
+`RefreshConnection` takes the index lock, then the per-id lock (bounded to 2
+seconds, so a held index lock never waits long behind a running connect). The
+index lock makes the "no other record has this fingerprint" check atomic with
+writing the new record. For a connection that is up, the sequence is: check
+for duplicates, require admin authentication, disconnect using the old record
+(its `PreDown`/`PostDown` hooks live there), write the new record, release the
+index lock, then reconnect. The per-id lock is held throughout, so nothing
+else can connect or disconnect that id in between, but `Add` and `Remove` are
+not blocked during the reconnect. Reconnecting calls `connect` directly rather
+than going through a `ConnectConnection` request, so `user_disconnected` is
+left as it was. If the reconnect fails, the new record is already stored and
+the error says so.
+
 Interface names are derived deterministically from the id
 (`wg-<8 hex chars>`), not caller-supplied, and their uniqueness is checked
 under the index lock at add time. `tunnel-operation.lock` is the one lock
@@ -299,8 +319,8 @@ otherwise has its own lock.
 
 ## Admin authentication
 
-Adding, removing, or elevating a global connection from manual to automatic
-each require real macOS admin authentication, not just `wgd`-group
+Adding, removing, refreshing a connection to a changed config, or elevating a
+global connection from manual to automatic each require real macOS admin authentication, not just `wgd`-group
 membership, since those are the only operations that let new
 root-executed config content (including `PreUp`/`PostUp`/`PreDown`/
 `PostDown` hooks) into the store or make it run unattended at boot.
@@ -317,6 +337,14 @@ sequenceDiagram
     D->>D: authz::verify_external_form(bytes)<br/>(AuthorizationCreateFromExternalForm,<br/>re-check the right was actually granted)
     D-->>CLI: ConnectionId
 ```
+
+`RefreshConnection` follows the same two-phase protocol, but the daemon only
+asks for authentication when the new text fingerprints differently from the
+stored record, and it asks before disconnecting anything. A refresh whose
+fingerprint is unchanged needs no prompt; it only updates the recorded
+`source_path`. The CLI reads the source file as the invoking user and sends
+the text, and the daemon treats `source_path` purely as metadata, never
+opening it.
 
 An identical resubmission (same fingerprint, same `global`) never creates a
 new record. If it also carries a different `name` or `start_mode`, those
@@ -414,7 +442,7 @@ flowchart TB
     PRP --> VAL["PrivilegedRequest::validate"]
     VAL --> DISP["dispatch(peer origin, request)"]
 
-    DISP --> IMM{"Connect /<br/>Disconnect?"}
+    DISP --> IMM{"Connect / Disconnect /<br/>Refresh?"}
     IMM -->|yes| WORK["spawn worker thread<br/>lock_connection_patient (30s)<br/>connection_ops::connect/disconnect"]
     WORK -.->|"mpsc channel"| LOOP
     IMM -->|no| SYNC["handled inline on accept thread<br/>(Add/Remove/Mode: lock_connection, 2s bound)"]

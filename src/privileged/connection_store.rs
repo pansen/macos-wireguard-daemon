@@ -46,6 +46,14 @@ pub struct StoredConnection {
     /// stays down across an agent restart instead of being silently undone
     /// -- see `issues/session-agent-overrides-disconnect.md`.
     pub user_disconnected: bool,
+    /// Absolute path (symlinks preserved) of the `.conf` the CLI last added/refreshed this
+    /// connection from. Metadata only, never opened by the daemon (see
+    /// `PrivilegedRequest::RefreshConnection`). `None` for records added
+    /// before this was tracked.
+    pub source_path: Option<String>,
+    /// `--mtu` given at add time, kept so a refresh can re-apply it to the
+    /// new source text. Already baked into `raw_conf`/`config`.
+    pub mtu_override: Option<u16>,
 }
 
 /// Connection lifecycle state that exists only while the connection is up.
@@ -100,6 +108,12 @@ struct StoredConnectionDisk {
     /// is the correct default rather than a placeholder.
     #[serde(default)]
     user_disconnected: bool,
+    /// Absent in records written before refresh existed.
+    #[serde(default)]
+    source_path: Option<String>,
+    /// Absent in records written before refresh existed.
+    #[serde(default)]
+    mtu_override: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,6 +244,8 @@ fn to_disk(conn: &StoredConnection) -> StoredConnectionDisk {
         created_at: conn.created_at,
         updated_at: conn.updated_at,
         user_disconnected: conn.user_disconnected,
+        source_path: conn.source_path.clone(),
+        mtu_override: conn.mtu_override,
     }
 }
 
@@ -247,6 +263,8 @@ fn from_disk(disk: StoredConnectionDisk) -> Result<StoredConnection> {
         created_at: disk.created_at,
         updated_at: disk.updated_at,
         user_disconnected: disk.user_disconnected,
+        source_path: disk.source_path,
+        mtu_override: disk.mtu_override,
     })
 }
 
@@ -1056,6 +1074,8 @@ mod tests {
             created_at: now_unix(),
             updated_at: now_unix(),
             user_disconnected: false,
+            source_path: None,
+            mtu_override: None,
         }
     }
 

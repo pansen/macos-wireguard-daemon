@@ -134,11 +134,12 @@ wgd connection get <id-or-name>
 wgd connection connect <id-or-name> [--gotatun-debug]
 wgd connection disconnect <id-or-name> | -a/--all
 wgd connection mode <id-or-name> <manual|automatic>
+wgd connection refresh <id-or-name> [--file <path>]
 wgd connection remove <id-or-name>
 wgd launchd agent {install,status,uninstall}
 ```
 
-Adding or removing a connection, and elevating a global connection's mode
+Adding, removing, or refreshing a connection to a changed config, and elevating a global connection's mode
 from manual to automatic, each require real macOS admin authentication
 (password or Touch ID): those are the only operations that let new
 root-executed config content into the store, or make it run unattended at
@@ -149,9 +150,21 @@ already added only requires being its owner (or root for a global one), the
 same way the macOS Network pane asks for admin credentials to add a VPN
 profile but not to connect one that's already configured.
 
-`--mtu` only applies at `add` time; changing it means re-adding the
-connection (`--force` to replace a same-named record instead of creating a
-second one).
+`--mtu` only applies at `add` time; the value is remembered and applied again
+on `refresh`. Changing it means re-adding the connection (`--force` to replace
+a same-named record instead of creating a second one).
+
+`refresh` re-reads the `.conf` a connection was added from and applies the
+changes in place, keeping its id, name, and start mode. `add` records the
+file's absolute path (symlinks are kept, so a retargeted symlink is followed), and `connection get` shows it as `source:`; pass
+`--file` to refresh from a different file (which then becomes the recorded
+path), or if the connection was added by an older version that did not record
+one. `wgd` reads the file as you and sends the text to the daemon, which never
+opens the path itself. If the file's content is unchanged, nothing happens and
+no prompt appears. If it changed, you get the admin-authentication prompt, and
+a connection that is currently up is disconnected and reconnected on the new
+config. `refresh` refuses a config that is identical to another connection you
+already have.
 
 ## What it does while you forget about it
 

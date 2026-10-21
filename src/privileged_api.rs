@@ -193,6 +193,12 @@ pub struct ConnectionSummary {
     pub peers: Vec<PeerSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Absolute path (symlinks preserved) of the `.conf` this connection was added or last
+    /// refreshed from, as reported by the CLI. Metadata only: the daemon never
+    /// opens it. Like `fingerprint`, only populated for an authorized
+    /// `GetConnection`, never for `ListConnections`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -264,9 +270,33 @@ pub enum PrivilegedRequest {
         /// in a follow-up call, now that it knows this one's id.
         #[serde(default)]
         force: bool,
+        /// Absolute path (symlinks preserved) the CLI read `conf_text` from, kept so `wgd
+        /// connection refresh` can find the file again. Metadata only: the
+        /// daemon never opens it (see `RefreshConnection`).
+        #[serde(default)]
+        source_path: Option<String>,
         /// Present once the caller has completed the macOS admin-auth
         /// challenge for a genuinely new/changed configuration (see
         /// `privileged::authz`); absent on the first attempt.
+        #[serde(default)]
+        auth_external_form: Option<Vec<u8>>,
+    },
+
+    /// Replace a stored connection's configuration with a freshly read copy
+    /// of its source `.conf`, keeping its id, interface, name and start mode.
+    /// The CLI reads the file as the invoking user and sends the text; the
+    /// daemon never opens `source_path` itself (that would let a caller make
+    /// root read any file, and trip macOS TCC prompts), it only records it.
+    /// The stored `mtu_override` is re-applied to `conf_text`. An unchanged
+    /// fingerprint is a no-op for the config and needs no admin
+    /// authentication; a changed one does, checked before anything is torn
+    /// down. A connection that is up is disconnected with its old config and
+    /// reconnected with the new one.
+    RefreshConnection {
+        id: ConnectionId,
+        conf_text: String,
+        #[serde(default)]
+        source_path: Option<String>,
         #[serde(default)]
         auth_external_form: Option<Vec<u8>>,
     },
@@ -325,6 +355,16 @@ pub enum PrivilegedResponse {
     Connection(ConnectionSummary),
     ConnectionList(Vec<ConnectionSummary>),
     DnsCustody(DnsCustodyStatus),
+    Refreshed(RefreshOutcome),
+}
+
+/// Result of a `RefreshConnection` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshOutcome {
+    /// The configuration's fingerprint differed and the record was replaced.
+    pub changed: bool,
+    /// The connection was up and was brought back up on the new config.
+    pub reconnected: bool,
 }
 
 /// A custody record for `wgd status`. Records whose helper is live are normal
@@ -360,6 +400,39 @@ pub struct DnsCustodyStatus {
 /// peers) while keeping a malicious oversized submission cheap to reject
 /// before it ever reaches the parser.
 pub const MAX_CONF_TEXT_BYTES: usize = 64 * 1024;
+
+/// Upper bound on a submitted `source_path`.
+const MAX_SOURCE_PATH_BYTES: usize = 4096;
+
+/// A `source_path` is display-only metadata that `wgd connection get` prints
+/// back to a terminal, so require an absolute path without control
+/// characters (no escape-sequence injection via a crafted file name).
+pub(crate) fn validate_source_path(path: &str) -> Result<(), String> {
+    if path.len() > MAX_SOURCE_PATH_BYTES {
+        return Err(format!(
+            "source_path exceeds the {MAX_SOURCE_PATH_BYTES}-byte limit"
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err("source_path must be an absolute path".into());
+    }
+    if path.chars().any(char::is_control) {
+        return Err("source_path contains control characters".into());
+    }
+    Ok(())
+}
+
+fn validate_conf_text(conf_text: &str) -> Result<(), String> {
+    if conf_text.trim().is_empty() {
+        return Err("conf_text cannot be empty".into());
+    }
+    if conf_text.len() > MAX_CONF_TEXT_BYTES {
+        return Err(format!(
+            "conf_text exceeds the {MAX_CONF_TEXT_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
 
 /// Charset/length rule shared by every user-supplied *name* this API
 /// accepts (a connection's `name` here).
@@ -405,23 +478,25 @@ impl PrivilegedRequest {
                 conf_text,
                 name,
                 mtu_override,
+                source_path,
                 ..
             } => {
-                if conf_text.trim().is_empty() {
-                    return Err("conf_text cannot be empty".into());
-                }
-                if conf_text.len() > MAX_CONF_TEXT_BYTES {
-                    return Err(format!(
-                        "conf_text exceeds the {MAX_CONF_TEXT_BYTES}-byte limit"
-                    ));
-                }
+                validate_conf_text(conf_text)?;
                 if let Some(name) = name {
                     validate_name_charset(name, 64)?;
                 }
                 if let Some(mtu) = mtu_override {
                     crate::wireguard::config::validate_mtu(*mtu).map_err(|e| e.to_string())?;
                 }
-                Ok(())
+                source_path.as_deref().map_or(Ok(()), validate_source_path)
+            }
+            Self::RefreshConnection {
+                conf_text,
+                source_path,
+                ..
+            } => {
+                validate_conf_text(conf_text)?;
+                source_path.as_deref().map_or(Ok(()), validate_source_path)
             }
             Self::RemoveConnection { .. } => Ok(()),
             Self::ConnectConnection { .. } => Ok(()),
@@ -527,6 +602,62 @@ mod tests {
                 assert_eq!(reason, ConnectReason::Reconciliation);
             }
             other => panic!("expected ConnectConnection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_request_without_optional_fields_deserializes() {
+        let json = serde_json::json!({
+            "kind": "refresh_connection",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "conf_text": "[Interface]\n",
+        });
+        let request: PrivilegedRequest = serde_json::from_value(json).unwrap();
+        match &request {
+            PrivilegedRequest::RefreshConnection {
+                source_path,
+                auth_external_form,
+                ..
+            } => {
+                assert!(source_path.is_none());
+                assert!(auth_external_form.is_none());
+            }
+            other => panic!("expected RefreshConnection, got {other:?}"),
+        }
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn refresh_request_validation_rejects_bad_input() {
+        let refresh =
+            |conf_text: &str, source_path: Option<&str>| PrivilegedRequest::RefreshConnection {
+                id: super::ConnectionId::new(),
+                conf_text: conf_text.to_string(),
+                source_path: source_path.map(str::to_string),
+                auth_external_form: None,
+            };
+        assert!(refresh("  \n", None).validate().is_err());
+        assert!(refresh(&"a".repeat(super::MAX_CONF_TEXT_BYTES + 1), None)
+            .validate()
+            .is_err());
+        assert!(refresh("x", Some("relative/path.conf")).validate().is_err());
+        assert!(refresh("x", Some("/tmp/a\u{1b}[31m.conf"))
+            .validate()
+            .is_err());
+        assert!(refresh("x", Some("/tmp/a.conf")).validate().is_ok());
+    }
+
+    #[test]
+    fn add_request_without_source_path_deserializes() {
+        let json = serde_json::json!({
+            "kind": "add_connection",
+            "conf_text": "[Interface]\n",
+            "global": false,
+        });
+        let request: PrivilegedRequest = serde_json::from_value(json).unwrap();
+        match request {
+            PrivilegedRequest::AddConnection { source_path, .. } => assert!(source_path.is_none()),
+            other => panic!("expected AddConnection, got {other:?}"),
         }
     }
 

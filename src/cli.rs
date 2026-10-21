@@ -285,6 +285,29 @@ pub enum ConnectionCommand {
         global: bool,
     },
 
+    /// Re-read a connection's source .conf and apply any changes
+    ///
+    /// Reads the file as you (the daemon never opens it), then replaces the
+    /// stored configuration while keeping the connection's id, name and
+    /// start mode. An unchanged file is a no-op. A changed one triggers an
+    /// admin-authentication prompt, and a connection that is up is
+    /// reconnected on the new configuration. Any --mtu given at `add` time is
+    /// applied again. Without --file, the path the connection was added or
+    /// last refreshed from is used.
+    #[command(verbatim_doc_comment)]
+    Refresh {
+        /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
+        id: String,
+
+        /// Read the new config from this file instead of the stored source
+        /// path, and remember it as the new source path
+        #[arg(long)]
+        file: Option<String>,
+    },
+
     /// Remove a stored connection by id (must not be currently connected)
     Remove {
         /// Connection id or name, as printed by `add` or `list`

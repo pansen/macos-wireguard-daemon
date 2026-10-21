@@ -13,7 +13,7 @@ use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
     ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
-    DisconnectReason, PrivilegedRequest, PrivilegedResponse,
+    DisconnectReason, PrivilegedRequest, PrivilegedResponse, RefreshOutcome,
 };
 
 use self::transport::{is_transport_error, StdioSession};
@@ -240,6 +240,7 @@ impl PrivilegedClient {
     /// change is real: the first attempt carries no token, and on
     /// `AuthRequired` this triggers the standard OS prompt and retries once
     /// with the resulting token attached.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_connection(
         &self,
         conf_text: &str,
@@ -248,6 +249,7 @@ impl PrivilegedClient {
         name: Option<String>,
         mtu_override: Option<u16>,
         force: bool,
+        source_path: Option<String>,
     ) -> Result<ConnectionId> {
         match self.send_with_admin_auth_retry(|auth_external_form| {
             PrivilegedRequest::AddConnection {
@@ -257,12 +259,39 @@ impl PrivilegedClient {
                 name: name.clone(),
                 mtu_override,
                 force,
+                source_path: source_path.clone(),
                 auth_external_form,
             }
         })? {
             PrivilegedResponse::ConnectionId(id) => Ok(id),
             _ => Err(AppError::Other(
                 "invalid privileged response for AddConnection".into(),
+            )),
+        }
+    }
+
+    /// Replace a stored connection's configuration with `conf_text`, which
+    /// the caller read from the connection's source file as the invoking
+    /// user. Same admin-authentication protocol as [`Self::add_connection`],
+    /// but only engaged when the configuration actually changed. A
+    /// connection that is up is reconnected by the daemon.
+    pub fn refresh_connection(
+        &self,
+        id: ConnectionId,
+        conf_text: &str,
+        source_path: Option<String>,
+    ) -> Result<RefreshOutcome> {
+        match self.send_with_admin_auth_retry(|auth_external_form| {
+            PrivilegedRequest::RefreshConnection {
+                id,
+                conf_text: conf_text.to_string(),
+                source_path: source_path.clone(),
+                auth_external_form,
+            }
+        })? {
+            PrivilegedResponse::Refreshed(outcome) => Ok(outcome),
+            _ => Err(AppError::Other(
+                "invalid privileged response for RefreshConnection".into(),
             )),
         }
     }

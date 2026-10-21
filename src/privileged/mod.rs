@@ -377,6 +377,11 @@ fn encode_response_frames(
 /// `dispatch::DispatchOutcome`); the stdio transport just blocks on it
 /// (stdio is inherently one-request-at-a-time), while the socket transport
 /// (`socket.rs`) keeps polling other clients while it waits.
+//
+// `Immediate` carries a whole `PrivilegedResponse` by value; one of these
+// exists per in-flight request and is consumed right away, so the size gap to
+// `Pending` costs nothing worth an indirection at every construction site.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum RequestOutcome {
     Immediate(Vec<String>, PrivilegedResponse),
     Pending(std::sync::mpsc::Receiver<PrivilegedResponse>),
@@ -464,6 +469,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::WgShow { .. } => "WgShow",
         PrivilegedRequest::NetworkOverview { .. } => "NetworkOverview",
         PrivilegedRequest::AddConnection { .. } => "AddConnection",
+        PrivilegedRequest::RefreshConnection { .. } => "RefreshConnection",
         PrivilegedRequest::RemoveConnection { .. } => "RemoveConnection",
         PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
         PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",

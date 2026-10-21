@@ -1647,6 +1647,7 @@ mod tests {
             mtu: None,
             peers: Vec::new(),
             fingerprint: None,
+            source_path: None,
             created_at: 0,
             updated_at: 0,
         }

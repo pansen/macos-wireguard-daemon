@@ -1,7 +1,7 @@
 //! `wgd connection ...`: the CLI surface over the privileged
 //! connection-store RPCs (`AddConnection`/`ListConnections`/
 //! `RemoveConnection`/`ConnectConnection`/`DisconnectConnection`/
-//! `SetConnectionMode`/`GetConnection`). This is the Phase 5 CLI: the legacy
+//! `SetConnectionMode`/`GetConnection`/`RefreshConnection`). This is the Phase 5 CLI: the legacy
 //! `wgconf`/`connect`/`disconnect`/`autoconnect` surface has been retired in
 //! favor of it (see `doc/connection-store-plan.md`'s Phase 5 addendum for the
 //! mapping). The per-user session-reconciliation LaunchAgent lives under
@@ -37,6 +37,7 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
             start_mode,
         } => cmd_add(&file, global, name, mtu, force, start_mode.into()),
         ConnectionCommand::List { all, global } => cmd_list(all, global),
+        ConnectionCommand::Refresh { id, file } => cmd_refresh(&id, file.as_deref()),
         ConnectionCommand::Remove { id } => cmd_remove(&id),
         ConnectionCommand::Connect { id, debug } => cmd_connect(&id, debug),
         ConnectionCommand::Disconnect { id, all } => cmd_disconnect(id.as_deref(), all),
@@ -135,7 +136,7 @@ fn label_for(client: &PrivilegedClient, id: ConnectionId) -> String {
 const COMPLETION_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Completion candidates for the `<ID>` positional of `remove`/`connect`/
-/// `disconnect`/`mode`/`get`: every connection the caller can name, offered
+/// `disconnect`/`mode`/`get`/`refresh`: every connection the caller can name, offered
 /// both by id and by `--name`, since `resolve_id` accepts either.
 ///
 /// This runs on every <TAB>, so it stays quiet and bounded. Every failure --
@@ -213,6 +214,22 @@ pub fn complete_connection_id(
     candidates
 }
 
+/// Read a `.conf` as the invoking user and return its text with its
+/// absolute path. Symlinks are deliberately not resolved, so `refresh`
+/// follows a symlink that is later retargeted. The daemon only ever receives
+/// the text; the path is recorded as metadata so `refresh` can find the file
+/// again.
+fn read_conf(file: &str) -> anyhow::Result<(String, String)> {
+    let path = std::path::absolute(file).with_context(|| format!("failed to resolve {file}"))?;
+    let conf_text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let source_path = path
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?
+        .to_string();
+    Ok((conf_text, source_path))
+}
+
 fn cmd_add(
     file: &str,
     global: bool,
@@ -221,10 +238,17 @@ fn cmd_add(
     force: bool,
     start_mode: ConnectionStartMode,
 ) -> anyhow::Result<()> {
-    let conf_text =
-        std::fs::read_to_string(file).with_context(|| format!("failed to read {file}"))?;
+    let (conf_text, source_path) = read_conf(file)?;
     let client = PrivilegedClient::new();
-    let id = client.add_connection(&conf_text, global, start_mode, name.clone(), mtu, force)?;
+    let id = client.add_connection(
+        &conf_text,
+        global,
+        start_mode,
+        name.clone(),
+        mtu,
+        force,
+        Some(source_path),
+    )?;
     println!("Connection id: {}", id.label(name.as_deref()));
     println!(
         "  (byte-for-byte-identical resubmissions of this file will return the same id \
@@ -343,6 +367,30 @@ fn print_connections(scope: ConnectionScope) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_refresh(id: &str, file: Option<&str>) -> anyhow::Result<()> {
+    let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
+    let file = match file {
+        Some(file) => file.to_string(),
+        None => client.get_connection(id)?.source_path.with_context(|| {
+            format!(
+                "{} has no recorded source file (it was added before refresh existed); \
+                 pass --file <path>",
+                label_for(&client, id)
+            )
+        })?,
+    };
+    let (conf_text, source_path) = read_conf(&file)?;
+    let outcome = client.refresh_connection(id, &conf_text, Some(source_path))?;
+    let label = label_for(&client, id);
+    match (outcome.changed, outcome.reconnected) {
+        (false, _) => println!("Unchanged {label}"),
+        (true, false) => println!("Updated {label}"),
+        (true, true) => println!("Updated and reconnected {label}"),
+    }
+    Ok(())
+}
+
 fn cmd_remove(id: &str) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
@@ -422,6 +470,9 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     );
     println!("start_mode:  {:?}", conn.start_mode);
     println!("interface:   {}", conn.interface);
+    if let Some(source_path) = &conn.source_path {
+        println!("source:      {source_path}");
+    }
     println!("connected:   {}", conn.connected);
     println!("user_disconnected: {}", conn.user_disconnected);
     println!("addresses:   {}", conn.addresses.join(", "));
@@ -540,5 +591,24 @@ mod dns_custody_note_tests {
         assert!(lines[0].contains("not restored yet"));
         assert!(lines[1].contains("wg-1ce3a4a1 (office)"));
         assert!(lines[1].contains("network location"));
+    }
+
+    #[test]
+    fn read_conf_keeps_symlink_path() {
+        let dir = std::env::temp_dir().join(format!("wgd-readconf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.conf");
+        let link = dir.join("link.conf");
+        std::fs::write(&target, "[Interface]\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (text, source) = read_conf(link.to_str().unwrap()).unwrap();
+        assert_eq!(text, "[Interface]\n");
+        assert_eq!(source, link.to_str().unwrap());
+
+        let missing = dir.join("missing.conf");
+        assert!(read_conf(missing.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

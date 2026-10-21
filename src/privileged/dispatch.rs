@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::privileged_api::{
     ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
     DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest, PrivilegedResponse,
+    RefreshOutcome,
 };
 
 use super::authz;
@@ -53,7 +54,7 @@ impl PeerOrigin {
 }
 
 /// Outcome of one dispatch call. `Pending` is used only by
-/// `ConnectConnection`/`DisconnectConnection`: the actual work runs on a
+/// `ConnectConnection`/`DisconnectConnection`/`RefreshConnection`: the actual work runs on a
 /// spawned worker thread (see the design plan's concurrency correction) so a
 /// slow connect/disconnect on one connection cannot freeze the single-threaded
 /// accept loop that also has to keep serving every other client.
@@ -146,6 +147,7 @@ pub(super) fn dispatch(
             name,
             mtu_override,
             force,
+            source_path,
             auth_external_form,
         } => DispatchOutcome::Immediate(handle_add_connection(
             origin,
@@ -155,8 +157,16 @@ pub(super) fn dispatch(
             name,
             mtu_override,
             force,
+            source_path,
             auth_external_form,
         )),
+
+        PrivilegedRequest::RefreshConnection {
+            id,
+            conf_text,
+            source_path,
+            auth_external_form,
+        } => handle_refresh_connection(origin, id, conf_text, source_path, auth_external_form),
 
         PrivilegedRequest::RemoveConnection {
             id,
@@ -207,6 +217,7 @@ fn handle_add_connection(
     name: Option<String>,
     mtu_override: Option<u16>,
     force: bool,
+    source_path: Option<String>,
     auth_external_form: Option<Vec<u8>>,
 ) -> PrivilegedResponse {
     if global && !origin.is_root() {
@@ -241,6 +252,7 @@ fn handle_add_connection(
                 name,
                 start_mode,
                 force,
+                source_path,
                 auth_external_form.as_deref(),
             );
         }
@@ -300,6 +312,8 @@ fn handle_add_connection(
         created_at: now,
         updated_at: now,
         user_disconnected: false,
+        source_path,
+        mtu_override,
     };
     match connection_store::create(&index_lock, &stored) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
@@ -318,19 +332,22 @@ fn handle_add_connection(
 /// the identity lookup that produced `existing` was either the caller's own
 /// attributed uid (per-user) or required root (global, checked before this
 /// is ever reached), so `existing` is already known to be this caller's own
-/// record -- no separate ownership check needed here.
+/// record -- no separate ownership check needed here. A changed `source_path`
+/// is plain metadata like `name`: it updates in place without auth.
 fn reconcile_existing_add(
     index_lock: &connection_store::IndexLock,
     mut existing: StoredConnection,
     name: Option<String>,
     start_mode: ConnectionStartMode,
     force: bool,
+    source_path: Option<String>,
     auth_external_form: Option<&[u8]>,
 ) -> PrivilegedResponse {
     let id = existing.id;
     let name_changed = name.is_some() && name != existing.name;
     let mode_changed = start_mode != existing.start_mode;
-    if !name_changed && !mode_changed {
+    let source_changed = source_path.is_some() && source_path != existing.source_path;
+    if !name_changed && !mode_changed && !source_changed {
         return PrivilegedResponse::ConnectionId(id);
     }
 
@@ -382,6 +399,9 @@ fn reconcile_existing_add(
     if name_changed {
         existing.name = name;
     }
+    if source_changed {
+        existing.source_path = source_path;
+    }
     if mode_changed {
         existing.start_mode = start_mode;
         // Same rule `SetConnectionMode` applies: a resubmission that lands
@@ -398,6 +418,178 @@ fn reconcile_existing_add(
         Ok(()) => PrivilegedResponse::ConnectionId(id),
         Err(error) => error_response(error),
     }
+}
+
+/// `RefreshConnection`: see the request's doc comment for the contract.
+///
+/// Authorization and the cheap pre-checks run on the accept thread; the rest
+/// runs on a worker thread because a connection that is up is torn down and
+/// brought back up, which can take as long as a `ConnectConnection`.
+fn handle_refresh_connection(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    conf_text: String,
+    source_path: Option<String>,
+    auth_external_form: Option<Vec<u8>>,
+) -> DispatchOutcome {
+    let stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return DispatchOutcome::Immediate(not_found()),
+        Err(error) => return DispatchOutcome::Immediate(error_response(error)),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return DispatchOutcome::Immediate(response);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // See `handle_connect_connection` for why the test root is carried over.
+    #[cfg(test)]
+    let test_root = connection_store::current_test_root();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(root) = test_root {
+            connection_store::set_test_root(root);
+        }
+        let _ = tx.send(refresh_connection(
+            id,
+            &conf_text,
+            source_path,
+            auth_external_form.as_deref(),
+        ));
+    });
+    DispatchOutcome::Pending(rx)
+}
+
+/// Worker-thread body of `RefreshConnection`.
+///
+/// Locking: index lock, then the connection's lock (the usual order, with the
+/// bounded `lock_connection` so a held index lock never waits long behind a
+/// running connect). The index lock is needed to make the "no other record
+/// has this fingerprint" check atomic with writing the new record, so it stays
+/// held through the disconnect and the write, but is released before the
+/// reconnect, the slowest step. The connection lock is held throughout, so
+/// nothing else can connect or disconnect this id in between.
+///
+/// Admin authentication is required before the first side effect, so an
+/// unauthenticated first attempt changes nothing and the client's
+/// `AuthRequired` retry sees the same state.
+fn refresh_connection(
+    id: ConnectionId,
+    conf_text: &str,
+    source_path: Option<String>,
+    auth_external_form: Option<&[u8]>,
+) -> PrivilegedResponse {
+    let index_lock = match connection_store::lock_index() {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    let conn_lock = match connection_store::lock_connection(id) {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    // Re-read under the lock: the pre-check on the accept thread may predate
+    // a concurrent change. Owner and scope never change, so the access check
+    // made there still holds.
+    let mut stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return not_found(),
+        Err(error) => return error_response(error),
+    };
+
+    let conf_text = match stored.mtu_override {
+        Some(mtu) => apply_mtu_override_to_conf_text(conf_text, mtu),
+        None => conf_text.to_string(),
+    };
+    let parsed = match connection_config::parse_connection_config(&conf_text) {
+        Ok(parsed) => parsed,
+        Err(error) => return error_response(error),
+    };
+    let fingerprint = connection_config::fingerprint(&parsed);
+
+    if fingerprint == stored.fingerprint {
+        drop(index_lock);
+        if source_path.is_some() && source_path != stored.source_path {
+            stored.source_path = source_path;
+            stored.updated_at = connection_store::now_unix();
+            if let Err(error) = connection_store::update(&conn_lock, &stored) {
+                return error_response(error);
+            }
+        }
+        return PrivilegedResponse::Refreshed(RefreshOutcome {
+            changed: false,
+            reconnected: false,
+        });
+    }
+
+    match connection_store::find_by_identity(
+        &index_lock,
+        &fingerprint,
+        stored.global,
+        stored.owner_uid,
+    ) {
+        Ok(Some(other)) if other.id != id => {
+            return PrivilegedResponse::Error {
+                code: "Duplicate".into(),
+                message: format!(
+                    "the refreshed configuration is identical to existing connection {}; refusing to create a duplicate",
+                    other.id.label(other.name.as_deref())
+                ),
+            };
+        }
+        Ok(_) => {}
+        Err(error) => return error_response(error),
+    }
+    if let Err(response) = require_admin_auth(
+        auth_external_form,
+        "replacing a stored connection configuration that may contain hooks executed as root",
+    ) {
+        return response;
+    }
+
+    let was_active = match connection_store::is_active(id) {
+        Ok(active) => active,
+        Err(error) => return error_response(error),
+    };
+    // Tear down with the old record still on disk: `disconnect` runs the old
+    // config's PreDown/PostDown hooks from it.
+    if was_active {
+        if let Err(error) = super::connection_ops::disconnect(&conn_lock, id) {
+            return PrivilegedResponse::Error {
+                code: "Other".into(),
+                message: format!(
+                    "could not disconnect before refreshing; the stored configuration is unchanged: {error}"
+                ),
+            };
+        }
+    }
+
+    stored.fingerprint = fingerprint;
+    stored.config = parsed;
+    stored.raw_conf = conf_text;
+    if source_path.is_some() {
+        stored.source_path = source_path;
+    }
+    stored.updated_at = connection_store::now_unix();
+    if let Err(error) = connection_store::update(&conn_lock, &stored) {
+        return error_response(error);
+    }
+    drop(index_lock);
+
+    // `connect` directly rather than through `resolve_connect_intent`: this
+    // is not a new connect request, so `user_disconnected` stays as it was.
+    if was_active {
+        if let Err(error) = super::connection_ops::connect(&conn_lock, id, false) {
+            return PrivilegedResponse::Error {
+                code: "Other".into(),
+                message: format!(
+                    "the connection record was updated, but reconnecting failed (the connection is down): {error}"
+                ),
+            };
+        }
+    }
+    PrivilegedResponse::Refreshed(RefreshOutcome {
+        changed: true,
+        reconnected: was_active,
+    })
 }
 
 fn handle_remove_connection(
@@ -768,6 +960,8 @@ fn summarize(
     connected: bool,
     include_fingerprint: bool,
 ) -> ConnectionSummary {
+    // `include_fingerprint` is the "authorized detail view" flag: it also
+    // gates `source_path`.
     ConnectionSummary {
         id: conn.id,
         global: conn.global,
@@ -803,6 +997,11 @@ fn summarize(
             .collect(),
         fingerprint: if include_fingerprint {
             Some(conn.fingerprint.clone())
+        } else {
+            None
+        },
+        source_path: if include_fingerprint {
+            conn.source_path.clone()
         } else {
             None
         },
@@ -956,6 +1155,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             auth,
         )
     }
@@ -976,6 +1176,400 @@ mod tests {
             PrivilegedResponse::Error { code, .. } => code.as_str(),
             other => panic!("expected an Error response, got {other:?}"),
         }
+    }
+
+    fn refresh(
+        origin: PeerOrigin,
+        id: ConnectionId,
+        conf: &str,
+        source_path: Option<&str>,
+        auth: Option<Vec<u8>>,
+    ) -> PrivilegedResponse {
+        match handle_refresh_connection(
+            origin,
+            id,
+            conf.to_string(),
+            source_path.map(str::to_string),
+            auth,
+        ) {
+            DispatchOutcome::Immediate(response) => response,
+            DispatchOutcome::Pending(rx) => rx.recv().expect("refresh worker replied"),
+        }
+    }
+
+    fn refreshed(response: PrivilegedResponse) -> RefreshOutcome {
+        match response {
+            PrivilegedResponse::Refreshed(outcome) => outcome,
+            other => panic!("expected Refreshed response, got {other:?}"),
+        }
+    }
+
+    fn add_with(
+        origin: PeerOrigin,
+        conf: &str,
+        name: Option<&str>,
+        mtu: Option<u16>,
+        source_path: Option<&str>,
+    ) -> ConnectionId {
+        connection_id(&handle_add_connection(
+            origin,
+            conf.to_string(),
+            false,
+            ConnectionStartMode::Automatic,
+            name.map(str::to_string),
+            mtu,
+            false,
+            source_path.map(str::to_string),
+            valid_auth(),
+        ))
+    }
+
+    fn changed_conf() -> String {
+        SAMPLE_CONF.replace("10.0.0.2/32", "10.0.0.9/32")
+    }
+
+    #[test]
+    fn refresh_unchanged_needs_no_auth_and_reports_unchanged() {
+        with_test_store("refresh-unchanged", || {
+            let id = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, Some("a"), None, None);
+            let before = connection_store::load(id).unwrap().unwrap();
+
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                SAMPLE_CONF,
+                None,
+                None,
+            ));
+            assert_eq!(
+                outcome,
+                RefreshOutcome {
+                    changed: false,
+                    reconnected: false
+                }
+            );
+            let after = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(after.fingerprint, before.fingerprint);
+            assert_eq!(after.source_path, None);
+        });
+    }
+
+    #[test]
+    fn refresh_changed_without_auth_requires_it_and_changes_nothing() {
+        with_test_store("refresh-needs-auth", || {
+            let id = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, None, None, None);
+            let before = connection_store::load(id).unwrap().unwrap();
+
+            let response = refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &changed_conf(),
+                Some("/tmp/new.conf"),
+                None,
+            );
+            assert_eq!(error_code(&response), "AuthRequired");
+
+            let after = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(after.fingerprint, before.fingerprint);
+            assert_eq!(after.raw_conf, before.raw_conf);
+            assert_eq!(after.updated_at, before.updated_at);
+            assert_eq!(after.source_path, None);
+        });
+    }
+
+    #[test]
+    fn refresh_changed_with_auth_updates_config_and_keeps_identity() {
+        with_test_store("refresh-changed", || {
+            let id = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, Some("a"), None, None);
+            let before = connection_store::load(id).unwrap().unwrap();
+            let new_conf = changed_conf();
+
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &new_conf,
+                None,
+                valid_auth(),
+            ));
+            assert_eq!(
+                outcome,
+                RefreshOutcome {
+                    changed: true,
+                    reconnected: false
+                }
+            );
+
+            let after = connection_store::load(id).unwrap().unwrap();
+            assert_ne!(after.fingerprint, before.fingerprint);
+            assert_eq!(
+                after.fingerprint,
+                connection_config::fingerprint(
+                    &connection_config::parse_connection_config(&new_conf).unwrap()
+                )
+            );
+            assert_eq!(after.raw_conf, new_conf);
+            assert_eq!(after.config.addresses[0].to_string(), "10.0.0.9/32");
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.interface, before.interface);
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.start_mode, ConnectionStartMode::Automatic);
+            assert_eq!(after.created_at, before.created_at);
+            assert_eq!(after.user_disconnected, before.user_disconnected);
+        });
+    }
+
+    #[test]
+    fn refresh_rejects_a_config_another_record_already_has() {
+        with_test_store("refresh-collision", || {
+            let first = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, Some("a"), None, None);
+            let other_conf = changed_conf();
+            add_with(PeerOrigin::Socket(501), &other_conf, Some("b"), None, None);
+
+            let response = refresh(
+                PeerOrigin::Socket(501),
+                first,
+                &other_conf,
+                None,
+                valid_auth(),
+            );
+            assert_eq!(error_code(&response), "Duplicate");
+            let stored = connection_store::load(first).unwrap().unwrap();
+            assert_eq!(stored.raw_conf, SAMPLE_CONF);
+
+            // The same config in another user's scope is not a collision.
+            let theirs = add_with(PeerOrigin::Socket(502), SAMPLE_CONF, None, None, None);
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(502),
+                theirs,
+                &other_conf,
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.changed);
+        });
+    }
+
+    #[test]
+    fn refresh_by_another_uid_is_denied() {
+        with_test_store("refresh-other-uid", || {
+            let id = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, None, None, None);
+            let response = refresh(
+                PeerOrigin::Socket(502),
+                id,
+                &changed_conf(),
+                None,
+                valid_auth(),
+            );
+            assert_eq!(error_code(&response), "Auth");
+            // Root may refresh anyone's connection.
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(0),
+                id,
+                &changed_conf(),
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.changed);
+        });
+    }
+
+    #[test]
+    fn refresh_of_a_global_connection_requires_root() {
+        with_test_store("refresh-global", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(0),
+                SAMPLE_CONF,
+                true,
+                valid_auth(),
+            ));
+            let response = refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &changed_conf(),
+                None,
+                valid_auth(),
+            );
+            assert_eq!(error_code(&response), "Auth");
+        });
+    }
+
+    #[test]
+    fn refresh_of_unknown_id_is_not_found() {
+        with_test_store("refresh-unknown", || {
+            let response = refresh(
+                PeerOrigin::Socket(501),
+                ConnectionId::new(),
+                SAMPLE_CONF,
+                None,
+                valid_auth(),
+            );
+            assert_eq!(error_code(&response), "NotFound");
+        });
+    }
+
+    #[test]
+    fn refresh_reapplies_the_stored_mtu_override() {
+        with_test_store("refresh-mtu", || {
+            let id = add_with(PeerOrigin::Socket(501), SAMPLE_CONF, None, Some(1280), None);
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().mtu_override,
+                Some(1280)
+            );
+
+            // The new source text carries no MTU; the stored override must be
+            // baked back in.
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &changed_conf(),
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.changed);
+            let after = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(after.config.mtu, Some(1280));
+            assert!(after.raw_conf.contains("MTU = 1280"));
+            assert_eq!(after.mtu_override, Some(1280));
+
+            // And an unchanged source is still unchanged despite the override.
+            let again = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &changed_conf(),
+                None,
+                None,
+            ));
+            assert!(!again.changed);
+        });
+    }
+
+    #[test]
+    fn source_path_is_stored_on_add_and_updated_on_refresh() {
+        with_test_store("source-path", || {
+            let id = add_with(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                None,
+                None,
+                Some("/tmp/a.conf"),
+            );
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path.as_deref(), Some("/tmp/a.conf"));
+
+            // Unchanged config, new path: metadata only, no auth.
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                SAMPLE_CONF,
+                Some("/tmp/b.conf"),
+                None,
+            ));
+            assert!(!outcome.changed);
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path.as_deref(), Some("/tmp/b.conf"));
+
+            // Changed config with a new path.
+            refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &changed_conf(),
+                Some("/tmp/c.conf"),
+                valid_auth(),
+            ));
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path.as_deref(), Some("/tmp/c.conf"));
+
+            // Changed config without a path keeps the recorded one.
+            refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                SAMPLE_CONF,
+                None,
+                valid_auth(),
+            ));
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path.as_deref(), Some("/tmp/c.conf"));
+        });
+    }
+
+    #[test]
+    fn add_resubmission_updates_a_changed_source_path_without_auth() {
+        with_test_store("dedup-source-path", || {
+            let id = add_with(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                None,
+                None,
+                Some("/tmp/a.conf"),
+            );
+            let response = handle_add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF.to_string(),
+                false,
+                ConnectionStartMode::Automatic,
+                None,
+                None,
+                false,
+                Some("/tmp/moved.conf".to_string()),
+                None,
+            );
+            assert_eq!(connection_id(&response), id);
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path.as_deref(), Some("/tmp/moved.conf"));
+        });
+    }
+
+    #[test]
+    fn get_connection_reports_source_path_but_list_does_not() {
+        with_test_store("summary-source-path", || {
+            let id = add_with(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                None,
+                None,
+                Some("/tmp/a.conf"),
+            );
+            match handle_get_connection(PeerOrigin::Socket(501), id) {
+                PrivilegedResponse::Connection(summary) => {
+                    assert_eq!(summary.source_path.as_deref(), Some("/tmp/a.conf"));
+                }
+                other => panic!("expected Connection, got {other:?}"),
+            }
+            match handle_list_connections(PeerOrigin::Socket(501), ConnectionScope::Mine) {
+                PrivilegedResponse::ConnectionList(list) => {
+                    assert_eq!(list.len(), 1);
+                    assert!(list[0].source_path.is_none());
+                }
+                other => panic!("expected ConnectionList, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn record_without_source_path_or_mtu_override_still_loads() {
+        with_test_store("old-record", || {
+            let id = add_with(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                None,
+                Some(1280),
+                Some("/tmp/a.conf"),
+            );
+            let path = connection_store::current_test_root()
+                .unwrap()
+                .join("connections")
+                .join(format!("{id}.json"));
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            assert!(object.remove("source_path").is_some());
+            assert!(object.remove("mtu_override").is_some());
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert_eq!(stored.source_path, None);
+            assert_eq!(stored.mtu_override, None);
+        });
     }
 
     #[test]
@@ -1030,6 +1624,7 @@ mod tests {
                 Some("old-name".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let id = connection_id(&first);
@@ -1044,6 +1639,7 @@ mod tests {
                 Some("new-name".to_string()),
                 None,
                 false,
+                None,
                 None,
             );
             assert_eq!(connection_id(&renamed), id);
@@ -1064,6 +1660,7 @@ mod tests {
                 Some("a".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let first_id = connection_id(&first);
@@ -1075,6 +1672,7 @@ mod tests {
                 Some("b".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let second_id = connection_id(&second);
@@ -1092,6 +1690,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             );
             assert_eq!(error_code(&collision), "NameInUse");
 
@@ -1104,6 +1703,7 @@ mod tests {
                 Some("a".to_string()),
                 None,
                 true,
+                None,
                 None,
             );
             assert_eq!(connection_id(&forced), second_id);
@@ -1135,6 +1735,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             );
             assert_eq!(error_code(&without_token), "AuthRequired");
             assert_eq!(
@@ -1151,6 +1752,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             assert_eq!(connection_id(&with_token), id);
@@ -1175,6 +1777,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let id = connection_id(&first);
@@ -1187,6 +1790,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
             );
             assert_eq!(connection_id(&updated), id);
@@ -1208,6 +1812,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 valid_auth(),
             ));
             let conn_lock = connection_store::lock_connection(id).unwrap();
@@ -1226,6 +1831,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
             );
             assert!(
@@ -1944,6 +2550,7 @@ mod tests {
                 None,
                 Some(1280),
                 false,
+                None,
                 valid_auth(),
             );
             let id = connection_id(&response);
@@ -1975,6 +2582,7 @@ mod tests {
                 Some("direct".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let first_id = connection_id(&first);
@@ -1987,6 +2595,7 @@ mod tests {
                 Some("direct".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             assert_eq!(error_code(&second), "NameInUse");
@@ -2006,6 +2615,7 @@ mod tests {
                 Some("direct".to_string()),
                 None,
                 false,
+                None,
                 valid_auth(),
             );
             let first_id = connection_id(&first);
@@ -2018,6 +2628,7 @@ mod tests {
                 Some("direct".to_string()),
                 None,
                 true,
+                None,
                 valid_auth(),
             );
             let second_id = connection_id(&second);
