@@ -14,16 +14,14 @@ once; from then on the tunnel comes up at login, survives network roaming and
 sleep/wake, and continuously reconciles routes and DNS against whatever
 network you are currently on.
 
-Because reconciliation is continuous, the tunnel does not need the conditional
-on/off triggers ("On-Demand" rules, location-based activation) that split
-tunnels usually require. It stays up everywhere and adapts instead of asking.
-It is meant as a frictionless, dependable alternative to `WireGuard.app` from
-the Apple App Store, for people who would rather manage the tunnel from the
-command line, or not manage it at all.
+Because reconciliation is continuous, the tunnel needs no On-Demand or
+location-based triggers. It stays up everywhere and adapts. It is meant as a
+dependable alternative to `WireGuard.app` from the App Store, for people who
+would rather manage the tunnel from the command line, or not manage it at all.
 
-Underneath that flagship case is a general privileged connection store: you
-can add any number of WireGuard configs, each independently connected,
-disconnected, and set to come up automatically or stay manual.
+Underneath is a general privileged connection store: you can add any number
+of WireGuard configs, each independently connected, disconnected, and set to
+come up automatically or stay manual.
 
 ## Origins
 
@@ -41,19 +39,15 @@ brew install --cask pansen/tap/macos-wireguard-daemon
 
 If you installed `wgd` before the tap switched from a Formula to a Cask, run
 `brew uninstall macos-wireguard-daemon` first: the old Formula's `bin/wgd`
-collides with the Cask's own binary symlink and the install above fails
-until it's gone.
+collides with the Cask's binary symlink and the install fails until it's gone.
 
 This installs `wgd` on your PATH and registers the privileged launchd
-daemon, prompting for your password once (via `sudo`) to do so. `brew
-upgrade` prompts again on every new release, to reinstall the daemon from
-the upgraded binary. `brew uninstall --zap macos-wireguard-daemon` removes
-the daemon, the `wgd` group, and its logs along with the package.
+daemon, prompting for your password once (via `sudo`). `brew upgrade` prompts
+again on every new release, to reinstall the daemon from the upgraded binary.
 
-The release DMG the cask installs from is signed with a Developer ID
-certificate, notarized by Apple, and stapled, so Gatekeeper accepts it
-without any quarantine workaround. Binaries you build from source are not
-signed or notarized.
+The release DMG is signed with a Developer ID certificate, notarized, and
+stapled, so Gatekeeper accepts it without a quarantine workaround. Binaries
+you build from source are not signed or notarized.
 
 From source:
 
@@ -61,55 +55,61 @@ From source:
 make install WGD_PROFILE=/path/to/your.conf CONNECTION_NAME=home
 ```
 
-This does, in order:
+This builds the release binary into `/usr/local/bin/wgd`, runs
+`wgd launchd reload` (see below), adds your config as a per-user connection
+named `CONNECTION_NAME` (`--force --start-mode automatic`), connects it, and
+installs bash completion. Re-running it after editing the config is safe: an
+unmodified file is a no-op, a changed one replaces the old record.
 
-- Builds the release binary and installs it to `/usr/local/bin/wgd`.
-- Runs `wgd launchd reload` (see below), which registers the privileged launchd
-  daemon, disconnects anything already connected under your account, and
-  installs the per-user session agent.
-- Adds your config as a per-user connection named `CONNECTION_NAME` with
-  `--force --start-mode automatic`, then connects it.
-
-Re-running `make install` after editing the config file is safe: an
-unmodified file is a silent no-op, and a changed one replaces the old
-`CONNECTION_NAME` record instead of piling up a duplicate.
-
-Access to the privileged daemon is limited to a dedicated `wgd` group,
-which the install creates and adds you to (a re-login may be needed for the
+Access to the privileged daemon is limited to a dedicated `wgd` group, which
+the install creates and adds you to (a re-login may be needed for the
 membership to take effect).
 
-`make uninstall` stops the daemon and session agent and clears any DNS
-override; it leaves stored connection records in place. `make purge` also
-removes the daemon's state directory (including the store), the binary, and
-the `wgd` group.
-
 Upgrading from a pre-connection-store install (the old `wgconf`/`autoconnect`
-design): there is no automatic migration of the old profile or state files;
-run `connection add` once per existing config after upgrading.
+design): there is no automatic migration; run `connection add` once per
+existing config.
 
-A macOS update can leave the launchd services booted out or disabled. To put
-both of them back and reconnect, run:
+### Shell completion
 
 ```bash
-wgd launchd reload
+wgd completion install [--shell bash|zsh|fish]   # default: bash
 ```
 
-It re-registers the privileged daemon (escalating via `sudo` for that one
-step), disconnects every one of your currently-connected connections, and
-reinstalls the session agent, which then reconnects whatever automatic
-connections are stored for you. `make reload` is the same command.
+Writes a block between `# begin: wgd managed` and `# end: wgd managed` markers
+into `~/.bashrc`, `~/.zshrc` or `~/.config/fish/config.fish`. Running it again
+updates the block in place, and symlinked dotfiles are kept.
 
-For a daemon-only restart using its existing launchd registration, run
-`sudo wgd launchd restart`. This leaves service registrations and the
-session agent unchanged and does not explicitly reconnect stored connections.
-Use `wgd launchd reload` for the full recovery sequence above; run it as
-your normal user, without sudo.
+### Reload and restart
 
-Unlike the rest of the CLI, `launchd reload` logs its own steps at debug level by
-default; `wgd launchd reload -s` keeps only the step headers. The daemon's own
-output goes to `/var/log/wgd/privileged.{out,err}.log`, and each
-connection's helper logs to `/var/log/wgd/<interface>.log` (`wgd
-connection get <id>` prints the interface name).
+A macOS update can leave the launchd services booted out or disabled. To put
+both back and reconnect, run as your normal user:
+
+```bash
+wgd launchd reload     # make reload does the same
+```
+
+It re-registers the privileged daemon (escalating via `sudo` for that step),
+disconnects your connected connections, and reinstalls the session agent,
+which then reconnects your automatic connections. It logs at debug level by
+default; `-s` keeps only the step headers.
+
+`sudo wgd launchd restart` only restarts the daemon with its existing
+registration. It leaves the session agent alone and does not reconnect
+anything.
+
+### Uninstall
+
+`make uninstall` (or `sudo /usr/local/bin/wgd launchd uninstall` plus
+`wgd launchd agent uninstall`) stops the daemon and session agent. Run
+`wgd dns repair` afterwards if a helper was killed and left tunnel DNS behind.
+Stored connections stay.
+
+`wgd launchd purge` removes everything else except the binary: it unregisters
+both services, restores DNS, and deletes the state directory (including the
+connection store), the logs, the authorization right, and the `wgd` group. It
+also lists session-agent plists that other users still have in their home
+directories. `brew uninstall --zap macos-wireguard-daemon` runs it and then
+removes the binary; `make purge` does the same for a source install.
 
 ## Connections
 
@@ -163,6 +163,51 @@ second one).
 - Reconciles **DNS** as well as it can, so lookups for your internal names
   keep resolving through the tunnel as the network underneath changes.
 
+## Troubleshooting
+
+```bash
+wgd status [--dns]                 # connections, wg show, routes, DNS custody notes
+wgd launchd status                 # daemon state, socket permissions, group, helper pids
+wgd logs [-f] [-n N] [--launchd] [--all] [<connection>]
+wgd doctor [--report <file>]       # status, launchd status and logs in one report
+wgd dns repair                     # restore DNS a killed helper left behind
+```
+
+`wgd status --dns` adds the live DNS servers of every network service. A
+healthy system shows no tunnel DNS unless a tunnel is up.
+
+`wgd launchd status`, `wgd logs`, `wgd doctor` and `wgd dns repair` need root
+and ask for your password through `sudo` themselves; run them as your normal
+user. They do not query the daemon: connecting to its socket would start it
+and hide the very state you want to see.
+
+`wgd logs` prints the last 150 lines (`-n`) of `/var/log/wgd/*.log`: the
+daemon's `privileged.{out,err}.log` and one `<interface>.log` per connection
+helper. Pass a connection name, id or interface (`wg-1ce3a4a1`) to filter.
+Logs of connections untouched for 24 hours are skipped unless you pass
+`--all`. `--launchd` shows what launchd logged about wgd in the last 10
+minutes, which is where a daemon that fails to start shows up. `-f` follows.
+
+`wgd doctor` runs the status, launchd status and log sections in a fixed order, then pings the DNS
+servers and endpoints of your connected connections and 1.1.1.1 as an
+internet control. A peer endpoint that does not answer ping is only
+informational, since many drop ICMP. If you decline `sudo`, the sections that
+need root say `skipped (needs sudo)` and the rest still runs.
+
+To file a bug report, attach the output of:
+
+```bash
+wgd doctor --report wgd-report.txt
+```
+
+The file is created with mode 0600 and refuses to overwrite an existing one.
+It is redacted: private and preshared keys are removed, public IPs keep only
+their first and last octet, public keys and hostnames keep only their ends.
+Private and tunnel address ranges stay readable so routes and DNS can still
+be debugged. The terminal output is not redacted. Read the report before you
+post it; hostnames on an uncommon TLD are only masked when they follow
+`endpoint`.
+
 ## How it works
 
 macOS has no in-kernel WireGuard. Every connection therefore runs on a
@@ -171,13 +216,11 @@ through a built-in helper, so there is nothing extra to install.
 
 `wgd` is split into two parts. The command you run as your normal user
 handles configuration and status. The privileged daemon, running as root,
-owns the connection store and performs the operations that need elevated
-permissions: bringing tunnels up and down, and talking to the WireGuard
-control interface. Running a root service is a real privilege boundary, so
-it is kept small and does only the operations that require it. Its
-subprocesses run under a restricted PATH and resolve to a fixed set of
-absolute system paths rather than searching for a tool by name; the daemon
-itself refuses to install from a symlinked or non-root-owned location.
+owns the connection store and does only what needs elevated permissions:
+bringing tunnels up and down and talking to the WireGuard control interface.
+Its subprocesses run under a restricted PATH and resolve to fixed absolute
+system paths, and the daemon refuses to install from a symlinked or
+non-root-owned location.
 
 For the level below this one, how the CLI, the daemon, and the per-tunnel
 helper actually talk to each other, see [doc/architecture.md](doc/architecture.md).
@@ -219,6 +262,10 @@ Enable them once per clone:
 ```bash
 make hooks
 ```
+
+The Makefile is for development only and just calls `wgd`; diagnostics and
+cleanup live in the binary so Homebrew installs have them too. `make check`
+writes a `wgd doctor` report to `target/`.
 
 ## License
 
