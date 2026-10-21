@@ -267,6 +267,16 @@ make hooks
 
 Run `make fmt` to apply the Rust formatting required by the pre-commit hook.
 
+For shutdown diagnostics, run `bash scripts/shutdown-before.sh` with the
+tunnel connected, reboot normally, then run `bash scripts/shutdown-after.sh`
+before manually reconnecting. Both scripts use `tee` to show and save stdout
+and stderr in unique, mode-0600 files under `target/shutdown-checks/` (ignored
+by Git). An optional argument selects a different output directory. Run as
+your normal user; wgd requests sudo where needed. Failed checks are recorded
+without stopping later checks, but make the script exit nonzero. The reports
+are not redacted; review them before sharing. The after script also includes
+existing session-agent logs and can be run on its own after a missed reconnect.
+
 The Makefile is for development only; diagnostics and
 cleanup live in the binary so Homebrew installs have them too. `make check`
 writes a `wgd doctor` report to `target/`.
