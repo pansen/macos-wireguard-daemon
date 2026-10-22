@@ -22,7 +22,35 @@ pub fn cmd_status() -> anyhow::Result<()> {
     let result = render_status(&mut out, &mut diag);
     print!("{out}");
     eprint!("{diag}");
+    // Stderr only, so stdout stays parseable. `doctor` reports the same
+    // condition in its own session agent section instead.
+    if let Ok(connections) = &result {
+        if let Some(warning) = session_agent_warning(connections) {
+            eprintln!("{}", color::warning(&warning));
+        }
+    }
     result.map(|_| ())
+}
+
+/// Warning for per-user `Automatic` connections of the caller (the `sudo`
+/// invoker under root) whose session agent is not loaded, `None` when all is
+/// well. Read-only: it never installs or enables anything.
+fn session_agent_warning(connections: &[ConnectionSummary]) -> Option<String> {
+    let (uid, home) = crate::session_agent::target_user()?;
+    let names: Vec<String> = crate::session_agent::agent_dependents(connections, uid)
+        .iter()
+        .map(|conn| conn.label())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let state = crate::session_agent::agent_state(uid, &home);
+    (state != crate::session_agent::AgentState::Loaded).then(|| {
+        format!(
+            "Warning: {}",
+            crate::session_agent::agent_problem_message(state, &names)
+        )
+    })
 }
 
 /// `wgd status --dns`: the live DNS servers of every macOS network service,

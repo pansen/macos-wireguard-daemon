@@ -283,6 +283,11 @@ fn cmd_add(
             disconnect_and_remove_stale(&client, conn.id)?;
         }
     }
+    // Last, after the stale-record cleanup: a freshly installed agent
+    // reconnects `Automatic` records right away and would race that cleanup.
+    if !global && start_mode == ConnectionStartMode::Automatic {
+        crate::session_agent::ensure_for_automatic(&client);
+    }
     Ok(())
 }
 
@@ -388,6 +393,9 @@ fn cmd_refresh(id: &str, file: Option<&str>) -> anyhow::Result<()> {
         (true, false) => println!("Updated {label}"),
         (true, true) => println!("Updated and reconnected {label}"),
     }
+    if needs_session_agent(&client, id) {
+        crate::session_agent::ensure_for_automatic(&client);
+    }
     Ok(())
 }
 
@@ -405,6 +413,10 @@ fn cmd_connect(id: &str, debug: bool) -> anyhow::Result<()> {
     let id = resolve_id(&client, id)?;
     client.connect_connection(id, debug)?;
     println!("Connected {}", label_for(&client, id));
+    // Already up, so an agent installed here skips it on its startup reconcile.
+    if needs_session_agent(&client, id) {
+        crate::session_agent::ensure_for_automatic(&client);
+    }
     Ok(())
 }
 
@@ -452,7 +464,18 @@ fn cmd_mode(id: &str, start_mode: ConnectionStartMode) -> anyhow::Result<()> {
         "Set {} start mode to {start_mode:?}",
         label_for(&client, id)
     );
+    if start_mode == ConnectionStartMode::Automatic && needs_session_agent(&client, id) {
+        crate::session_agent::ensure_for_automatic(&client);
+    }
     Ok(())
+}
+
+/// Whether `id` is a per-user `Automatic` connection, i.e. one that only
+/// comes up at login through the session agent. A failed lookup counts as no.
+fn needs_session_agent(client: &PrivilegedClient, id: ConnectionId) -> bool {
+    client
+        .get_connection(id)
+        .is_ok_and(|conn| !conn.global && conn.start_mode == ConnectionStartMode::Automatic)
 }
 
 fn cmd_get(id: &str) -> anyhow::Result<()> {

@@ -314,7 +314,7 @@ fn cmd_install(plist_template: Option<PathBuf>) -> anyhow::Result<()> {
     bootstrap()?;
     reap_stray_privileged_daemons();
     wait_for_launchd_socket();
-    reconnect_automatic_connections();
+    reconnect_automatic_connections(&bin);
 
     println!("wgd privileged daemon installed.");
     println!("  binary: {}", bin.display());
@@ -902,22 +902,55 @@ fn check_session_agent_status() -> String {
     let plist = home
         .join("Library/LaunchAgents")
         .join(format!("{}.plist", crate::session_agent::LABEL));
-    if !plist.exists() {
-        return format!("not installed for {user} ({} missing)", plist.display());
+    let state = crate::session_agent::agent_state(uid, &home);
+    // Which connections depend on the agent. If the daemon cannot be asked,
+    // the missing agent stays informational.
+    let dependents: Vec<String> = PrivilegedClient::new()
+        .without_autostart()
+        .list_connections(ConnectionScope::All)
+        .map(|all| {
+            crate::session_agent::agent_dependents(&all, uid)
+                .iter()
+                .map(|conn| conn.label())
+                .collect()
+        })
+        .unwrap_or_default();
+    format_session_agent_status(state, &user, uid, &plist, &dependents)
+}
+
+/// The doctor line for the session agent. With per-user `Automatic`
+/// connections (`dependents`) a state other than `Loaded` is a `FAIL`;
+/// without any it is just informational.
+fn format_session_agent_status(
+    state: crate::session_agent::AgentState,
+    user: &str,
+    uid: u32,
+    plist: &Path,
+    dependents: &[String],
+) -> String {
+    use crate::session_agent::AgentState;
+    let label = crate::session_agent::LABEL;
+    if state != AgentState::Loaded && !dependents.is_empty() {
+        return format!(
+            "FAIL  {}",
+            crate::session_agent::agent_problem_message(state, dependents)
+        );
     }
-    let loaded = crate::session_agent::is_loaded(uid);
-    if loaded {
-        format!(
-            "loaded (gui/{uid}/{})  {}",
-            crate::session_agent::LABEL,
-            plist.display()
-        )
-    } else {
-        format!(
-            "not loaded (gui/{uid}/{})  {} (run: wgd launchd reload)",
-            crate::session_agent::LABEL,
-            plist.display()
-        )
+    match state {
+        AgentState::Loaded => format!("loaded (gui/{uid}/{label})  {}", plist.display()),
+        AgentState::NotInstalled => {
+            format!("not installed for {user} ({} missing)", plist.display())
+        }
+        AgentState::Disabled => format!(
+            "disabled for {user} (gui/{uid}/{label})  {} ({})",
+            plist.display(),
+            state.fix()
+        ),
+        AgentState::NotLoaded => format!(
+            "not loaded (gui/{uid}/{label})  {} ({})",
+            plist.display(),
+            state.fix()
+        ),
     }
 }
 
@@ -1030,7 +1063,7 @@ fn disconnect_all_connections_once() {
 /// Best-effort per connection, like the uninstall sweep. No autostart: the
 /// socket was just confirmed reachable, and a missing daemon here must not
 /// leave an ad hoc one behind.
-fn reconnect_automatic_connections() {
+fn reconnect_automatic_connections(bin: &Path) {
     let client = PrivilegedClient::new().without_autostart();
     let connections = match client.list_connections(ConnectionScope::All) {
         Ok(connections) => connections,
@@ -1041,10 +1074,16 @@ fn reconnect_automatic_connections() {
     };
     // Per-user connections belong to a GUI session: only bring them up for
     // the user running the install, and only while their session agent is
-    // loaded (it tears them down again at logout).
-    let session = invoking_user_uid().map(|uid| InstallSession {
-        uid: uid.as_raw(),
-        agent_loaded: crate::session_agent::is_loaded(uid.as_raw()),
+    // loaded (it tears them down again at logout). A missing agent is
+    // installed first, so a reboot does not leave their `Automatic`
+    // connections down.
+    let session = invoking_user_uid().map(|uid| {
+        let agent_started = ensure_invoking_user_agent(bin, &connections);
+        InstallSession {
+            uid: uid.as_raw(),
+            agent_loaded: agent_started || crate::session_agent::is_loaded(uid.as_raw()),
+            agent_started,
+        }
     });
     for conn in &connections {
         match post_install_action(conn, session) {
@@ -1072,6 +1111,89 @@ fn reconnect_automatic_connections() {
 struct InstallSession {
     uid: u32,
     agent_loaded: bool,
+    /// The agent was installed by this very install run.
+    agent_started: bool,
+}
+
+/// Install the invoking user's session agent when one of their per-user
+/// `Automatic` connections needs it and it is missing or not loaded. Returns
+/// whether it started a fresh agent.
+///
+/// Root cannot run `launchd agent install` itself (it refuses root, and the
+/// plist must belong to the user and be bootstrapped into their `gui/<uid>`
+/// domain). So the same command is spawned as the user:
+/// `launchctl asuser <uid>` enters their session's bootstrap namespace and
+/// `sudo -u <user> -H` drops privileges and sets `$HOME`, which lets the
+/// existing user-side install do all the work. A `Disabled` agent is only
+/// reported, since the user may have switched it off on purpose. Failures
+/// are loud but do not fail the daemon install.
+fn ensure_invoking_user_agent(bin: &Path, connections: &[ConnectionSummary]) -> bool {
+    use crate::session_agent::{
+        agent_dependents, agent_problem_message, agent_state, plan_for, AgentPlan,
+    };
+    let Some((user, uid, home)) = resolve_target_user().filter(|(_, uid, _)| *uid != 0) else {
+        return false;
+    };
+    let names: Vec<String> = agent_dependents(connections, uid)
+        .iter()
+        .map(|conn| conn.label())
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    let state = agent_state(uid, &home);
+    let warn = |detail: &str| {
+        eprintln!(
+            "{}",
+            crate::color::warning(&format!(
+                "Warning: {detail}{}",
+                agent_problem_message(state, &names)
+            ))
+        );
+    };
+    match plan_for(state, true) {
+        AgentPlan::Nothing => false,
+        AgentPlan::Warn => {
+            warn("");
+            false
+        }
+        AgentPlan::Install => {
+            let uid_arg = uid.to_string();
+            let bin_arg = bin.to_string_lossy();
+            let result = run_checked(
+                "/bin/launchctl",
+                &[
+                    "asuser",
+                    &uid_arg,
+                    "/usr/bin/sudo",
+                    "-u",
+                    &user,
+                    "-H",
+                    &bin_arg,
+                    "launchd",
+                    "agent",
+                    "install",
+                    "--force",
+                ],
+            );
+            match result {
+                Ok(()) => {
+                    println!(
+                        "Installed the session agent for {user} (was {}): it brings up {} at login.",
+                        state.describe(),
+                        names.join(", ")
+                    );
+                    true
+                }
+                Err(error) => {
+                    warn(&format!(
+                        "could not install the session agent for {user} ({error:#}); "
+                    ));
+                    false
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1114,6 +1236,11 @@ fn post_install_action(
         Some(session) if !session.agent_loaded => PostInstallAction::Skip(format!(
             "session agent for uid {owner} is not loaded (install it with `wgd launchd agent install`)"
         )),
+        // The fresh agent reconciles on start and connects this itself;
+        // connecting it here too would race that for the same connection.
+        Some(session) if session.agent_started => PostInstallAction::Skip(
+            "the session agent was just installed and connects it itself".into(),
+        ),
         Some(_) => PostInstallAction::Reconnect,
     }
 }
@@ -1654,7 +1781,11 @@ mod tests {
     }
 
     fn session(uid: u32, agent_loaded: bool) -> Option<InstallSession> {
-        Some(InstallSession { uid, agent_loaded })
+        Some(InstallSession {
+            uid,
+            agent_loaded,
+            agent_started: false,
+        })
     }
 
     fn is_skip(action: PostInstallAction) -> bool {
@@ -1690,6 +1821,42 @@ mod tests {
         // stay down until that user's session agent starts.
         assert!(is_skip(post_install_action(&mine, session(501, false))));
         assert!(is_skip(post_install_action(&mine, None)));
+    }
+
+    #[test]
+    fn post_install_leaves_per_user_connections_to_a_freshly_installed_agent() {
+        let mine = summary(false, Some(501));
+        let fresh = Some(InstallSession {
+            uid: 501,
+            agent_loaded: true,
+            agent_started: true,
+        });
+        assert!(is_skip(post_install_action(&mine, fresh)));
+        // Global connections are not the agent's business.
+        assert_eq!(
+            post_install_action(&summary(true, None), fresh),
+            PostInstallAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn session_agent_status_fails_only_when_connections_depend_on_it() {
+        use crate::session_agent::AgentState;
+        let plist = Path::new("/Users/a/Library/LaunchAgents/x.plist");
+        let deps = vec!["work".to_string()];
+        for state in [
+            AgentState::NotInstalled,
+            AgentState::Disabled,
+            AgentState::NotLoaded,
+        ] {
+            let with = format_session_agent_status(state, "a", 501, plist, &deps);
+            assert!(with.starts_with("FAIL  "), "{with}");
+            assert!(with.contains("work"));
+            let without = format_session_agent_status(state, "a", 501, plist, &[]);
+            assert!(!without.contains("FAIL"), "{without}");
+        }
+        let ok = format_session_agent_status(AgentState::Loaded, "a", 501, plist, &deps);
+        assert!(ok.starts_with("loaded"));
     }
 
     #[test]

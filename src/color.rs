@@ -33,6 +33,23 @@ pub fn enabled() -> bool {
     crate::logging::ansi_enabled(std::io::stdout().is_terminal())
 }
 
+/// Bold yellow, for warnings printed to stderr. Follows stderr being a
+/// terminal (and `WGD_LOG_COLOR`), not stdout.
+pub fn warning(text: &str) -> String {
+    paint_warning(
+        text,
+        crate::logging::ansi_enabled(std::io::stderr().is_terminal()),
+    )
+}
+
+fn paint_warning(text: &str, ansi: bool) -> String {
+    if ansi {
+        format!("{BOLD}{YELLOW}{text}{RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Grey, for the column headers and rules of tables wgd prints itself.
 pub fn table_frame(text: &str) -> String {
     paint_table_frame(text, enabled())

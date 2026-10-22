@@ -127,6 +127,18 @@ opaque id (you can also refer to it by the name you gave it). Two kinds:
   up at login and tears them down at logout (not on fast user switching to a
   different session; that case isn't handled yet).
 
+A per-user automatic connection only comes up at login if its owner's session
+agent is active. `wgd connection add --start-mode automatic`, `connection mode
+<id> automatic`, `connection connect`, and `connection refresh` therefore check
+the agent afterwards and install it when it is missing or not loaded. So does
+`sudo wgd launchd install` (or a Homebrew upgrade) for the user who ran it. If
+you switched the agent off in System Settings -> General -> Login Items, wgd
+does not turn it back on: it prints a warning, and `wgd launchd agent install
+--force` re-enables it if that is what you want. `wgd status` prints the same
+warning to stderr, and `wgd doctor` reports the session agent as `FAIL`, while
+a per-user automatic connection depends on an agent that is not loaded. Neither
+changes anything.
+
 ```bash
 wgd connection add --file <path> [--global] [--name <label>] [--mtu <n>] [--start-mode manual|automatic] [--force]
 wgd connection list [--global | --all]   # alias: ls

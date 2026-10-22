@@ -77,6 +77,24 @@ pub(crate) fn reinstall() -> anyhow::Result<()> {
 }
 
 fn cmd_install(force: bool) -> anyhow::Result<()> {
+    let installed = install_agent(force)?;
+    println!("wgd session agent installed.");
+    println!("  plist:  {}", installed.plist.display());
+    println!("  binary: {}", installed.bin.display());
+    println!(
+        "  it will connect every `Automatic` connection owned by this user on login \
+         (`wgd connection mode <id> automatic`) and disconnect them again on logout."
+    );
+    Ok(())
+}
+
+struct InstalledAgent {
+    plist: PathBuf,
+    bin: PathBuf,
+}
+
+/// Render the plist, write it and bootstrap the agent, without printing.
+fn install_agent(force: bool) -> anyhow::Result<InstalledAgent> {
     refuse_if_root()?;
 
     let home = std::env::var("HOME").context("could not determine $HOME")?;
@@ -124,14 +142,10 @@ fn cmd_install(force: bool) -> anyhow::Result<()> {
         &["bootstrap", &gui_domain(uid), plist_path_str],
     )?;
 
-    println!("wgd session agent installed.");
-    println!("  plist:  {}", plist_path.display());
-    println!("  binary: {}", bin.display());
-    println!(
-        "  it will connect every `Automatic` connection owned by this user on login \
-         (`wgd connection mode <id> automatic`) and disconnect them again on logout."
-    );
-    Ok(())
+    Ok(InstalledAgent {
+        plist: plist_path,
+        bin,
+    })
 }
 
 fn cmd_uninstall() -> anyhow::Result<()> {
@@ -298,6 +312,209 @@ pub(crate) fn is_loaded(uid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Where a user's session agent stands. The rule this exists for: a per-user
+/// (non-global) `Automatic` connection only comes up at login if its owner's
+/// agent is active, so anything but `Loaded` means such a connection silently
+/// stays down after a reboot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentState {
+    /// The plist is missing.
+    NotInstalled,
+    /// Installed, but launchd has the label disabled (toggled off in System
+    /// Settings -> Login Items, or a stale override). Possibly deliberate.
+    Disabled,
+    /// Installed and enabled, but not bootstrapped into the GUI domain.
+    NotLoaded,
+    Loaded,
+}
+
+impl AgentState {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::Disabled => "disabled in Login Items",
+            Self::NotLoaded => "installed but not loaded",
+            Self::Loaded => "loaded",
+        }
+    }
+
+    /// The command (or setting) that gets the agent back to `Loaded`.
+    pub(crate) fn fix(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "run `wgd launchd agent install`",
+            Self::Disabled => {
+                "re-enable it in System Settings -> General -> Login Items, \
+                 or run `wgd launchd agent install --force`"
+            }
+            Self::NotLoaded => "run `wgd launchd agent install --force`",
+            Self::Loaded => "",
+        }
+    }
+}
+
+/// What to do about an agent state when a per-user `Automatic` connection
+/// depends on it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgentPlan {
+    Nothing,
+    Install,
+    Warn,
+}
+
+/// `can_install` is false for root callers that have no way to install the
+/// agent as the user. `Disabled` is never fixed automatically: the user may
+/// have switched it off on purpose.
+pub(crate) fn plan_for(state: AgentState, can_install: bool) -> AgentPlan {
+    match state {
+        AgentState::Loaded => AgentPlan::Nothing,
+        AgentState::Disabled => AgentPlan::Warn,
+        AgentState::NotInstalled | AgentState::NotLoaded if can_install => AgentPlan::Install,
+        AgentState::NotInstalled | AgentState::NotLoaded => AgentPlan::Warn,
+    }
+}
+
+/// State of the agent for the user `uid` whose home directory is `home`.
+pub(crate) fn agent_state(uid: u32, home: &Path) -> AgentState {
+    if !launch_agents_dir(&home.to_string_lossy())
+        .join(format!("{LABEL}.plist"))
+        .exists()
+    {
+        AgentState::NotInstalled
+    } else if is_disabled(uid) {
+        AgentState::Disabled
+    } else if !is_loaded(uid) {
+        AgentState::NotLoaded
+    } else {
+        AgentState::Loaded
+    }
+}
+
+fn is_disabled(uid: u32) -> bool {
+    std::process::Command::new("/bin/launchctl")
+        .args(["print-disabled", &gui_domain(uid)])
+        .stderr(Stdio::null())
+        .output()
+        .map(|out| parse_print_disabled(&String::from_utf8_lossy(&out.stdout), LABEL))
+        .unwrap_or(false)
+}
+
+/// Whether `launchctl print-disabled` output lists `label` as disabled.
+/// Current macOS prints `"label" => disabled`; older releases print
+/// `"label" => true`.
+fn parse_print_disabled(output: &str, label: &str) -> bool {
+    let key = format!("\"{label}\"");
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix(&key)
+            .and_then(|rest| rest.trim_start().strip_prefix("=>"))
+            .is_some_and(|value| matches!(value.trim().trim_end_matches(';'), "disabled" | "true"))
+    })
+}
+
+/// The per-user `Automatic` connections of `uid`: the ones that need the
+/// session agent to come up at login.
+pub(crate) fn agent_dependents(
+    connections: &[ConnectionSummary],
+    uid: u32,
+) -> Vec<&ConnectionSummary> {
+    connections
+        .iter()
+        .filter(|conn| {
+            !conn.global
+                && conn.start_mode == ConnectionStartMode::Automatic
+                && conn.owner_uid == Some(uid)
+        })
+        .collect()
+}
+
+/// One-line explanation that `names` will not connect at login while the
+/// agent is in `state`, with the fix.
+pub(crate) fn agent_problem_message(state: AgentState, names: &[String]) -> String {
+    format!(
+        "session agent {}: {} (per-user, start mode Automatic) will NOT connect at login. Fix: {}.",
+        state.describe(),
+        names.join(", "),
+        state.fix()
+    )
+}
+
+/// `(uid, home)` of the user whose session agent matters for this process:
+/// the caller itself, or the `sudo` invoker when running as root.
+pub(crate) fn target_user() -> Option<(u32, PathBuf)> {
+    if geteuid().is_root() {
+        crate::launchd::resolve_target_user()
+            .filter(|(_, uid, _)| *uid != 0)
+            .map(|(_, uid, home)| (uid, home))
+    } else {
+        let uid = getuid();
+        nix::unistd::User::from_uid(uid)
+            .ok()
+            .flatten()
+            .map(|user| (uid.as_raw(), user.dir))
+    }
+}
+
+/// Write-path guard, run after a command that made (or confirmed) a per-user
+/// `Automatic` connection: make sure the owner's agent will bring it up at
+/// login. Installs a missing or unloaded agent when running as the user,
+/// warns loudly otherwise. Never fails the caller: the command it follows
+/// already succeeded.
+///
+/// Installing starts the agent, whose startup reconcile connects every
+/// `Automatic` connection that is down (and not `user_disconnected`); one that
+/// is already connected is skipped by `connect_candidates`.
+pub(crate) fn ensure_for_automatic(client: &PrivilegedClient) {
+    let Some((uid, home)) = target_user() else {
+        return;
+    };
+    let is_root = geteuid().is_root();
+    let scope = if is_root {
+        ConnectionScope::All
+    } else {
+        ConnectionScope::Mine
+    };
+    let connections = match client.list_connections(scope) {
+        Ok(connections) => connections,
+        Err(error) => {
+            debug!(error = %error, "session_agent_check_list_failed");
+            return;
+        }
+    };
+    let names: Vec<String> = agent_dependents(&connections, uid)
+        .iter()
+        .map(|conn| conn.label())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let state = agent_state(uid, &home);
+    match plan_for(state, !is_root) {
+        AgentPlan::Nothing => {}
+        AgentPlan::Warn => eprintln!(
+            "{}",
+            crate::color::warning(&format!(
+                "Warning: {}",
+                agent_problem_message(state, &names)
+            ))
+        ),
+        AgentPlan::Install => match install_agent(true) {
+            Ok(installed) => println!(
+                "Installed the session agent ({}, was {}): it brings up {} at login.",
+                installed.plist.display(),
+                state.describe(),
+                names.join(", ")
+            ),
+            Err(error) => eprintln!(
+                "{}",
+                crate::color::warning(&format!(
+                    "Warning: could not install the session agent ({error:#}); {}",
+                    agent_problem_message(state, &names)
+                ))
+            ),
+        },
+    }
+}
+
 /// Write the rendered plist to `path` atomically (temp file + rename), user
 /// owned mode 0644.
 fn write_plist(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -395,6 +612,73 @@ mod tests {
     #[test]
     fn connect_candidates_is_empty_for_no_connections() {
         assert_eq!(connect_candidates(&[]), Vec::new());
+    }
+
+    #[test]
+    fn parse_print_disabled_detects_disabled_label() {
+        let output = "disabled services = {\n\t\"com.example.a\" => enabled\n\t\"me.pansen.wgd.session-agent\" => disabled\n}\n";
+        assert!(parse_print_disabled(output, LABEL));
+        // Older macOS: `true` means disabled.
+        let old = "{\n\t\"me.pansen.wgd.session-agent\" => true;\n}";
+        assert!(parse_print_disabled(old, LABEL));
+    }
+
+    #[test]
+    fn parse_print_disabled_ignores_enabled_absent_and_other_labels() {
+        let enabled = "{\n\t\"me.pansen.wgd.session-agent\" => enabled\n}";
+        assert!(!parse_print_disabled(enabled, LABEL));
+        let old_enabled = "{\n\t\"me.pansen.wgd.session-agent\" => false;\n}";
+        assert!(!parse_print_disabled(old_enabled, LABEL));
+        let other = "{\n\t\"me.pansen.wgd.session-agent2\" => disabled\n\t\"other\" => disabled\n}";
+        assert!(!parse_print_disabled(other, LABEL));
+        assert!(!parse_print_disabled("", LABEL));
+    }
+
+    #[test]
+    fn plan_per_state() {
+        use AgentPlan::*;
+        use AgentState::*;
+        assert_eq!(plan_for(Loaded, true), Nothing);
+        assert_eq!(plan_for(Loaded, false), Nothing);
+        assert_eq!(plan_for(NotInstalled, true), Install);
+        assert_eq!(plan_for(NotLoaded, true), Install);
+        assert_eq!(plan_for(NotInstalled, false), Warn);
+        assert_eq!(plan_for(NotLoaded, false), Warn);
+        // Never re-enabled behind the user's back.
+        assert_eq!(plan_for(Disabled, true), Warn);
+        assert_eq!(plan_for(Disabled, false), Warn);
+    }
+
+    #[test]
+    fn agent_dependents_are_per_user_automatic_and_owned() {
+        let mut mine = sample(ConnectionStartMode::Automatic, false, false);
+        mine.name = Some("work".into());
+        let manual = sample(ConnectionStartMode::Manual, false, false);
+        let mut global = sample(ConnectionStartMode::Automatic, false, false);
+        global.global = true;
+        global.owner_uid = None;
+        let mut other_user = sample(ConnectionStartMode::Automatic, false, false);
+        other_user.owner_uid = Some(502);
+
+        let all = [mine.clone(), manual, global, other_user];
+        let deps = agent_dependents(&all, 501);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].id, mine.id);
+        assert!(agent_dependents(&all, 503).is_empty());
+    }
+
+    #[test]
+    fn problem_message_names_connections_and_fix() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let msg = agent_problem_message(AgentState::NotInstalled, &names);
+        assert!(msg.contains("a, b"));
+        assert!(msg.contains("NOT connect at login"));
+        assert!(msg.contains("wgd launchd agent install"));
+        assert!(agent_problem_message(AgentState::NotLoaded, &names)
+            .contains("wgd launchd agent install --force"));
+        let disabled = agent_problem_message(AgentState::Disabled, &names);
+        assert!(disabled.contains("Login Items"));
+        assert!(disabled.contains("--force"));
     }
 
     #[test]
