@@ -1,0 +1,8 @@
+---
+source: src/status_render.rs
+expression: "render_wg_device(&device(true, Some(51820), vec![]), NOW, &PLAIN)"
+---
+interface: wgconf0
+  public key: B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=
+  private key: (hidden)
+  listening port: 51820

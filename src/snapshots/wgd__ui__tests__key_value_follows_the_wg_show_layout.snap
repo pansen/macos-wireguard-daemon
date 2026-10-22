@@ -1,0 +1,9 @@
+---
+source: src/ui.rs
+expression: "format!(\"{}\\n{}\", render(&block, &RenderCtx::plain()),\nvisible_ansi(&render(&block, &RenderCtx::ansi())))"
+---
+interface: wg0
+  transfer: 1.25 GiB received
+
+⟨1m⟩⟨32m⟩interface⟨0m⟩: ⟨32m⟩wg0⟨0m⟩
+  ⟨1m⟩transfer⟨0m⟩: 1.25 ⟨36m⟩GiB⟨0m⟩ received

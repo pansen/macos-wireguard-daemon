@@ -1,0 +1,41 @@
+---
+source: src/status_render.rs
+expression: "render_network_overview(&ov, &PLAIN)"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=enabled gateway=192.168.1.1 local_subnets=55.56.57.0/24, 192.168.1.0/24
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+DESTINATION       VIA                    FAMILY  LIVE                 MTU   STATUS
+----------------  ---------------------  ------  -------------------  ----  --------------------------------------------------------------------
+23.88.101.22      gateway 192.168.1.1    IPv4    en0 via 192.168.1.1  1430  owned (endpoint pin: handshakes bypass the tunnel)
+55.56.57.0/24     direct (attached LAN)  IPv4    absent               -     excluded: we are inside 55.56.57.0/24, kept off the tunnel
+100.64.0.0/24     interface utun6        IPv4    utun6                1384  owned
+100.64.9.0/24     interface utun6        IPv4    absent               -     owned, but absent from the kernel table (drift)
+100.64.5.0/24     interface utun6        IPv4    en0                  1500  owned, but the kernel entry disagrees (see LIVE)
+10.20.30.0/24     -                      IPv4    en0                  1500  blocked: route table entry held by en0, unreachable via tunnel
+10.30.0.0/16      -                      IPv4    via 192.168.1.9      -     blocked: route table entry held by a gateway, unreachable via tunnel
+192.168.188.0/24  -                      IPv4    absent               -     not installed: reconcile pending
+2a01:db8::/64     -                      IPv6    -                    -     not installed: tunnel has no IPv6 address
+10.99.0.0/16      interface utun6        IPv4    utun6                -     owned: no longer desired, cleanup pending
+10.98.0.0/16      system                 IPv4    ?                    -     owned: no longer desired, cleanup pending
+fd00::/8          interface utun6        IPv6    absent               -     owned: no longer desired, cleanup pending
+
+DNS tunnel_servers=100.64.1.1 primary_service=Wi-Fi
+SERVICE             ROLE       LIVE DNS    OWNED  ORIGINAL DNS      STATUS
+------------------  ---------  ----------  -----  ----------------  ----------------------
+Ethernet            secondary  8.8.8.8     yes    1.1.1.1, 1.0.0.1  owned; pending restore
+Thunderbolt Bridge  secondary  empty       no     empty             not targeted
+USB 10/100 LAN      secondary  100.64.1.1  no     empty             not targeted
+Wi-Fi               primary    100.64.1.1  yes    9.9.9.9           tunnel DNS active
+
+System resolver=100.64.1.1 (matches tunnel DNS)
+
+Other tunnels (foreign VPN / utun interfaces)
+INTERFACE  MTU   ADDRESSES             NOTE
+---------  ----  --------------------  -------------------------------------------
+utun3      1384  100.64.1.2            wgd (own address; another/stale connection)
+utun4      1280  100.96.10.5, fd7a::1  CGNAT 100.64/10 (Tailscale?)
+utun5      -     link-local only       -
+utun8      1400  10.8.0.2              -
+tailscaled=running (socket present; userspace mode has no utun of its own)

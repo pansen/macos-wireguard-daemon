@@ -1145,7 +1145,7 @@ fn ensure_invoking_user_agent(bin: &Path, connections: &[ConnectionSummary]) -> 
     let warn = |detail: &str| {
         eprintln!(
             "{}",
-            crate::color::warning(&format!(
+            crate::ui::warning(&format!(
                 "Warning: {detail}{}",
                 agent_problem_message(state, &names)
             ))

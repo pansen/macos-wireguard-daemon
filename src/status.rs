@@ -11,12 +11,12 @@ use std::fmt::Write;
 
 use serde::Serialize;
 
-use crate::color;
 use crate::macos_dns;
 use crate::privileged_api::{ConnectionId, ConnectionScope, ConnectionSummary, DnsCustodyStatus};
 use crate::privileged_client::PrivilegedClient;
 use crate::status_model::{NetworkOverview, WgDeviceStatus};
 use crate::status_render;
+use crate::ui::{self, Component, RenderCtx, Separator, Span, Table};
 
 /// Everything `wgd status` shows, as fetched from the privileged service.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -56,7 +56,7 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", render_status(&report));
+        print!("{}", render_status(&report, &RenderCtx::stdout()));
         for line in &report.diagnostics {
             eprintln!("{line}");
         }
@@ -64,7 +64,7 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     // Stderr only, so stdout stays parseable. `doctor` reports the same
     // condition in its own session agent section instead.
     if let Some(warning) = session_agent_warning(&report.connections) {
-        eprintln!("{}", color::warning(&warning));
+        eprintln!("{}", ui::warning(&warning));
     }
     Ok(())
 }
@@ -95,7 +95,7 @@ fn session_agent_warning(connections: &[ConnectionSummary]) -> Option<String> {
 pub fn print_service_dns() {
     let mut out = String::new();
     let mut diag = String::new();
-    render_service_dns(&mut out, &mut diag);
+    render_service_dns(&RenderCtx::stdout(), &mut out, &mut diag);
     println!();
     print!("{out}");
     eprint!("{diag}");
@@ -175,18 +175,17 @@ pub fn collect_status(client: &PrivilegedClient) -> anyhow::Result<StatusReport>
 
 /// Render the stdout part of `wgd status`. Diagnostics are left to the
 /// caller, which sends them to stderr (`status`) or into its report (`doctor`).
-pub fn render_status(report: &StatusReport) -> String {
+pub fn render_status(report: &StatusReport, ctx: &RenderCtx) -> String {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    render_status_at(report, now_unix)
+    render_status_at(report, now_unix, ctx)
 }
 
 /// [`render_status`] with the current time given, so handshake ages are
 /// reproducible.
-fn render_status_at(report: &StatusReport, now_unix: u64) -> String {
-    let ansi = color::enabled();
+fn render_status_at(report: &StatusReport, now_unix: u64, ctx: &RenderCtx) -> String {
     let mut out = String::new();
     if report.connections.is_empty() {
         let _ = writeln!(
@@ -194,79 +193,56 @@ fn render_status_at(report: &StatusReport, now_unix: u64) -> String {
             "No stored connections. Add one with: wgd connection add --file <path>"
         );
     } else {
-        render_connection_table(&report.connections, &mut out);
+        connection_table(&report.connections).render(ctx, &mut out);
         for detail in &report.details {
             if let Some(device) = &detail.wg {
                 let _ = writeln!(out);
-                let text = status_render::render_wg_device(device, now_unix);
-                let _ = writeln!(out, "{}", color::wg_show(&text));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    status_render::render_wg_device(device, now_unix, ctx)
+                );
             }
             if let Some(overview) = &detail.network_overview {
                 let _ = writeln!(out);
-                let text = status_render::render_network_overview(overview, ansi);
-                let _ = writeln!(out, "{}", color::tables(&text));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    status_render::render_network_overview(overview, ctx)
+                );
             }
         }
     }
     if let Some(custody) = &report.dns_custody {
-        render_dns_custody_notes(custody, &mut out);
+        let notes = crate::connection_cli::format_dns_custody_notes(custody);
+        if !notes.is_empty() {
+            let _ = writeln!(out);
+            for note in notes {
+                note.render(ctx, &mut out);
+            }
+        }
     }
     out
 }
 
-fn render_connection_table(connections: &[ConnectionSummary], out: &mut String) {
-    let headers = ["Id", "Name", "Global", "Mode", "Connected", "Interface"];
-    let rows: Vec<[String; 6]> = connections
-        .iter()
-        .map(|conn| {
-            [
-                conn.id.to_string(),
-                conn.name.clone().unwrap_or_else(|| "-".to_string()),
-                conn.global.to_string(),
-                format!("{:?}", conn.start_mode),
-                conn.connected.to_string(),
-                conn.interface.clone(),
-            ]
-        })
-        .collect();
-
-    // Size each column to the widest of its header and cells so long values
-    // don't push the table out of alignment.
-    let mut widths = headers.map(str::len);
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
+fn connection_table(connections: &[ConnectionSummary]) -> Table {
+    let mut table = Table::new(&["Id", "Name", "Global", "Mode", "Connected", "Interface"])
+        .separator(Separator::Pipes);
+    for conn in connections {
+        table.row(vec![
+            Span::plain(conn.id.to_string()),
+            Span::plain(conn.name.clone().unwrap_or_else(|| "-".to_string())),
+            Span::plain(conn.global.to_string()),
+            Span::plain(format!("{:?}", conn.start_mode)),
+            Span::plain(conn.connected.to_string()),
+            Span::plain(conn.interface.as_str()),
+        ]);
     }
-
-    let render_row = |cells: &[String]| {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
-
-    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
-    let _ = writeln!(
-        out,
-        "{}",
-        color::table_frame(render_row(&header_cells).trim_end())
-    );
-    let rule = widths
-        .iter()
-        .map(|w| "-".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("-+-");
-    let _ = writeln!(out, "{}", color::table_frame(&rule));
-    for row in &rows {
-        let _ = writeln!(out, "{}", render_row(row).trim_end());
-    }
+    table
 }
 
-/// The live DNS servers of every macOS network service, one per line.
-pub fn render_service_dns(out: &mut String, diag: &mut String) {
+/// The live DNS servers of every macOS network service, one row each.
+pub fn render_service_dns(ctx: &RenderCtx, out: &mut String, diag: &mut String) {
     let _ = writeln!(out, "DNS per network service:");
     let services = match macos_dns::list_network_services() {
         Ok(services) => services,
@@ -275,25 +251,16 @@ pub fn render_service_dns(out: &mut String, diag: &mut String) {
             return;
         }
     };
+    let mut table = Table::new(&["SERVICE", "DNS SERVERS"]).indent(2);
     for service in services {
         let servers = match macos_dns::get_dns_servers(&service) {
             Ok(Some(servers)) => servers.join(" "),
             Ok(None) => "(dhcp/default)".to_string(),
             Err(e) => format!("(failed: {e:#})"),
         };
-        let _ = writeln!(out, "  {service:<24} {servers}");
+        table.row(vec![Span::plain(service), Span::plain(servers)]);
     }
-}
-
-/// DNS custody state that is not normal; a healthy system renders nothing.
-fn render_dns_custody_notes(custody: &DnsCustodyStatus, out: &mut String) {
-    let lines = crate::connection_cli::format_dns_custody_notes(custody);
-    if !lines.is_empty() {
-        let _ = writeln!(out);
-        for line in lines {
-            let _ = writeln!(out, "{line}");
-        }
-    }
+    table.render(ctx, out);
 }
 
 /// Under `sudo` (including the root child `wgd doctor` spawns), the socket
@@ -379,7 +346,7 @@ mod tests {
 
     #[test]
     fn empty_report_points_at_connection_add() {
-        let rendered = render_status(&StatusReport::default());
+        let rendered = render_status(&StatusReport::default(), &RenderCtx::plain());
         assert_eq!(
             rendered,
             "No stored connections. Add one with: wgd connection add --file <path>\n"
@@ -407,7 +374,7 @@ mod tests {
             }),
             diagnostics: vec!["wg show wg-other failed: boom".to_string()],
         };
-        let rendered = render_status(&report);
+        let rendered = render_status(&report, &RenderCtx::plain());
 
         let row = rendered.find("| office |").expect("connection row");
         let wg = rendered
@@ -443,7 +410,7 @@ mod tests {
             }],
             ..StatusReport::default()
         };
-        let rendered = render_status_at(&report, 1_130);
+        let rendered = render_status_at(&report, 1_130, &RenderCtx::plain());
         assert!(rendered.contains("  latest handshake: 2 minutes\n"));
         assert!(rendered.contains("  transfer: 0 B received, 2.00 KiB sent\n"));
     }

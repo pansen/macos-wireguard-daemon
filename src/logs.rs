@@ -292,12 +292,55 @@ fn format_log_files_tail(files: &[PathBuf], max_lines: usize) -> String {
         }
         match fs::read_to_string(path) {
             Ok(content) => {
-                let tailed = tail_lines(&content, max_lines);
+                // A service started with `WGD_LOG_COLOR` forced on writes
+                // escapes into its file; the tail is plain text.
+                let tailed = strip_ansi(&tail_lines(&content, max_lines));
                 out.push_str(&tailed);
             }
             Err(err) => {
                 out.push_str(&format!("(unable to read {}: {err})\n", path.display()));
             }
+        }
+    }
+    out
+}
+
+/// Remove ANSI escape sequences (CSI and OSC) from `text`.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // Parameters and intermediates, then one final byte.
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // Up to BEL or ESC \.
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
         }
     }
     out
@@ -352,6 +395,12 @@ fn escalate_logs(args: &LogsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_ansi() {
+        let s = "\u{1b}[2m2026\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m ok\u{1b}]0;title\u{7}!";
+        assert_eq!(strip_ansi(s), "2026  INFO ok!");
+    }
 
     #[test]
     fn direct_stem_recognizes_interfaces_uuids_and_privileged() {

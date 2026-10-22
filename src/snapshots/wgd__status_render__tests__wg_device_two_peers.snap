@@ -1,0 +1,19 @@
+---
+source: src/status_render.rs
+expression: "render_wg_device(&two_peers(), NOW, &PLAIN)"
+---
+interface: wgconf0
+  public key: B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=
+  private key: (hidden)
+
+peer: oaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8A=
+  endpoint: 203.0.113.7:51820
+  allowed ips: 10.66.77.0/24, 100.64.0.1/32
+  preshared key: (hidden)
+  latest handshake: 2 minutes
+  transfer: 1.50 KiB received, 5.00 MiB sent
+  persistent keepalive: every 25 seconds
+
+peer: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=
+  latest handshake: (none)
+  transfer: 0 B received, 0 B sent

@@ -1,0 +1,6 @@
+---
+source: src/status_render.rs
+expression: "render_wg_device(&device(false, None, vec![]), NOW, &PLAIN)"
+---
+interface: wgconf0
+  private key: (hidden)

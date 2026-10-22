@@ -1,0 +1,19 @@
+---
+source: src/status_render.rs
+expression: "visible_ansi(&render_wg_device(&two_peers(), NOW, &RenderCtx::ansi()))"
+---
+⟨1m⟩⟨32m⟩interface⟨0m⟩: ⟨32m⟩wgconf0⟨0m⟩
+  ⟨1m⟩public key⟨0m⟩: B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=
+  ⟨1m⟩private key⟨0m⟩: (hidden)
+
+⟨1m⟩⟨33m⟩peer⟨0m⟩: ⟨33m⟩oaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8A=⟨0m⟩
+  ⟨1m⟩endpoint⟨0m⟩: 203.0.113.7:51820
+  ⟨1m⟩allowed ips⟨0m⟩: 10.66.77.0/24, 100.64.0.1/32
+  ⟨1m⟩preshared key⟨0m⟩: (hidden)
+  ⟨1m⟩latest handshake⟨0m⟩: 2 ⟨36m⟩minutes⟨0m⟩
+  ⟨1m⟩transfer⟨0m⟩: 1.50 ⟨36m⟩KiB⟨0m⟩ received, 5.00 ⟨36m⟩MiB⟨0m⟩ sent
+  ⟨1m⟩persistent keepalive⟨0m⟩: every 25 ⟨36m⟩seconds⟨0m⟩
+
+⟨1m⟩⟨33m⟩peer⟨0m⟩: ⟨33m⟩AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=⟨0m⟩
+  ⟨1m⟩latest handshake⟨0m⟩: (none)
+  ⟨1m⟩transfer⟨0m⟩: 0 ⟨36m⟩B⟨0m⟩ received, 0 ⟨36m⟩B⟨0m⟩ sent

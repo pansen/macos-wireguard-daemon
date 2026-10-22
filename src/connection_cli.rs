@@ -527,8 +527,11 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
 /// Lines `wgd status` prints about DNS custody. Empty on a healthy system:
 /// records whose helper is live are normal and never reach this function.
 #[must_use]
-pub fn format_dns_custody_notes(status: &crate::privileged_api::DnsCustodyStatus) -> Vec<String> {
+pub fn format_dns_custody_notes(
+    status: &crate::privileged_api::DnsCustodyStatus,
+) -> Vec<crate::ui::Note> {
     use crate::privileged_api::DnsCustodyEntry;
+    use crate::ui::Note;
 
     let label = |entry: &DnsCustodyEntry| match &entry.name {
         Some(name) => format!("{} ({name})", entry.interface),
@@ -538,29 +541,29 @@ pub fn format_dns_custody_notes(status: &crate::privileged_api::DnsCustodyStatus
 
     let mut lines = Vec::new();
     for entry in &status.pending {
-        lines.push(format!(
+        lines.push(Note::warn(format!(
             "DNS left by {} on {} is not restored yet; wgd keeps retrying.",
             label(entry),
             services(entry)
-        ));
+        )));
     }
     for entry in &status.deferred {
-        lines.push(format!(
+        lines.push(Note::warn(format!(
             "DNS left by {} on {} cannot be restored from this network location; \
              switch back to that location to restore it.",
             label(entry),
             services(entry)
-        ));
+        )));
     }
     if let Some(last) = &status.last_restore {
         let seconds = last.at % 86_400;
-        lines.push(format!(
+        lines.push(Note::info(format!(
             "DNS restored on {} after {} exited without cleanup, {:02}:{:02} UTC",
             services(&last.entry),
             label(&last.entry),
             seconds / 3600,
             seconds % 3600 / 60
-        ));
+        )));
     }
     lines
 }
@@ -595,10 +598,9 @@ mod dns_custody_note_tests {
         };
         assert_eq!(
             format_dns_custody_notes(&status),
-            vec![
+            vec![crate::ui::Note::info(
                 "DNS restored on Wi-Fi after wg-1ce3a4a1 (office) exited without cleanup, 13:49 UTC"
-                    .to_string()
-            ]
+            )]
         );
     }
 
@@ -611,9 +613,12 @@ mod dns_custody_note_tests {
         };
         let lines = format_dns_custody_notes(&status);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("not restored yet"));
-        assert!(lines[1].contains("wg-1ce3a4a1 (office)"));
-        assert!(lines[1].contains("network location"));
+        assert!(lines
+            .iter()
+            .all(|note| note.level == crate::ui::NoteLevel::Warn));
+        assert!(lines[0].text.contains("not restored yet"));
+        assert!(lines[1].text.contains("wg-1ce3a4a1 (office)"));
+        assert!(lines[1].text.contains("network location"));
     }
 
     #[test]

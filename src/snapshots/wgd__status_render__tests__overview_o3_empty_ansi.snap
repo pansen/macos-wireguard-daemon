@@ -1,0 +1,24 @@
+---
+source: src/status_render.rs
+expression: "visible_ansi(&render_network_overview(&ov, &RenderCtx::ansi()))"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=none local_subnets=none
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+⟨90m⟩DESTINATION  VIA  FAMILY  LIVE  MTU  STATUS⟨0m⟩
+⟨90m⟩-----------  ---  ------  ----  ---  -----------------⟨0m⟩
+none         -    -       -     -    no routes desired
+
+DNS tunnel_servers=100.64.1.1 primary_service=none
+⟨90m⟩SERVICE  ROLE  LIVE DNS  OWNED  ORIGINAL DNS  STATUS⟨0m⟩
+⟨90m⟩-------  ----  --------  -----  ------------  --------------------⟨0m⟩
+⟨2m⟩none     -     -         no     -             no services observed⟨0m⟩
+
+System resolver=none (DHCP/unset)
+
+Other tunnels (foreign VPN / utun interfaces)
+⟨90m⟩INTERFACE  MTU  ADDRESSES  NOTE⟨0m⟩
+⟨90m⟩---------  ---  ---------  ----------------⟨0m⟩
+none       -    -          no other tunnels
+tailscaled=not detected

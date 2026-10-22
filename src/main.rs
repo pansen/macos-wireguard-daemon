@@ -1,5 +1,4 @@
 mod cli;
-mod color;
 mod completion;
 mod config;
 mod connection_cli;
@@ -21,6 +20,7 @@ mod status;
 mod status_model;
 mod status_render;
 mod trusted_exec;
+mod ui;
 mod userspace_helper;
 mod wireguard;
 

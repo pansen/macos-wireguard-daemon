@@ -1,0 +1,24 @@
+---
+source: src/status_render.rs
+expression: "render_network_overview(&ov, &PLAIN)"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=enabled gateway=none local_subnets=none
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+DESTINATION   VIA  FAMILY  LIVE    MTU  STATUS
+------------  ---  ------  ------  ---  --------------------------------------------------
+23.88.101.22  -    IPv4    absent  -    missing: no default gateway to pin the endpoint to
+
+DNS tunnel_servers=100.64.1.1 primary_service=Wi-Fi
+SERVICE  ROLE     LIVE DNS  OWNED  ORIGINAL DNS  STATUS
+-------  -------  --------  -----  ------------  ----------------------
+Wi-Fi    primary  8.8.8.8   yes    empty         owned; pending reapply
+
+! System resolver 1.1.1.1 is not the tunnel resolver; a foreign VPN or DHCP owns resolution
+
+Other tunnels (foreign VPN / utun interfaces)
+INTERFACE  MTU  ADDRESSES  NOTE
+---------  ---  ---------  ----------------
+none       -    -          no other tunnels
+tailscaled=not detected

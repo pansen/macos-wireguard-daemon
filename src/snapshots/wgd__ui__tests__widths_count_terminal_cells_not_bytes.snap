@@ -1,0 +1,8 @@
+---
+source: src/ui.rs
+expression: "render(&table, &RenderCtx::plain())"
+---
+A     | B
+------+--
+Ä — ü | 1
+abcde | 2
