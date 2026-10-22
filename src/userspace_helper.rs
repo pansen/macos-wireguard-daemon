@@ -2982,7 +2982,7 @@ fn macos_route_display_destination(route: &MacosRoute) -> String {
     }
 }
 
-/// How the kernel's answer for a prefix reads in the LIVE column: the device
+/// How the kernel's answer for a prefix reads in the Live column: the device
 /// or gateway that actually holds the entry right now, or absent.
 #[cfg(target_os = "macos")]
 fn macos_live_route(entry: &Option<MacosRouteEntry>) -> LiveRoute {
@@ -3007,7 +3007,7 @@ fn macos_ip_family(is_ipv6: bool) -> IpFamily {
 
 /// Rows for the Routes table: every route the tunnel *wants* — the AllowedIPs
 /// routes plus the endpoint pin — each with its outcome, next to what the
-/// kernel table actually holds (LIVE/MTU). The earlier owned-only listing hid
+/// kernel table actually holds (Live/MTU). The earlier owned-only listing hid
 /// exactly the entries worth debugging: a prefix excluded because we sit in
 /// that LAN, one a foreign route-table entry keeps off the tunnel, or an
 /// "owned" route the kernel has since dropped.

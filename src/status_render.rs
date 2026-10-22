@@ -5,8 +5,8 @@
 //! caller's [`RenderCtx`] alone. The output has no trailing newline.
 
 use crate::status_model::{
-    DnsServiceStatus, ForeignTunnelRow, IpFamily, LiveRoute, NetworkOverview, ResolverState,
-    RouteOutcome, RouteRow, RouteVia, WgDeviceStatus,
+    DnsOverview, DnsServiceStatus, ForeignTunnelRow, IpFamily, LiveRoute, NetworkOverview,
+    ResolverState, RouteOutcome, RouteRow, RouteVia, WgDeviceStatus,
 };
 use crate::ui::{Component, KeyValue, Line, Note, RenderCtx, Role, Span, Table};
 
@@ -109,8 +109,9 @@ pub fn wg_format_bytes(bytes: u64) -> (String, &'static str) {
     }
 }
 
-/// The route/DNS overview text. DNS rows that are not in effect are muted;
-/// problems are notes under the line they concern.
+/// The route/DNS overview text. Rows that are not in effect (routes the
+/// tunnel does not hold, DNS services it does not carry, placeholder rows)
+/// are muted; problems are notes under the line they concern.
 pub fn render_network_overview(ov: &NetworkOverview, ctx: &RenderCtx) -> String {
     let mut out = String::new();
     let line = |out: &mut String, text: String| Line::from(text).render(ctx, out);
@@ -138,24 +139,7 @@ pub fn render_network_overview(ov: &NetworkOverview, ctx: &RenderCtx) -> String 
         "Routes (AllowedIPs + endpoint pin, with what became of each)".to_string(),
     );
     route_table(&ov.routes).render(ctx, &mut out);
-    out.push('\n');
-
-    let dns = &ov.dns;
-    line(
-        &mut out,
-        format!(
-            "DNS tunnel_servers={} primary_service={}",
-            format_list(&dns.tunnel_servers),
-            dns.primary_service.as_deref().unwrap_or("none")
-        ),
-    );
-    if let Some(collision) = &dns.unreachable {
-        Note::warn(format!(
-            "{} is inside local LAN {}; tunnel DNS pulled back",
-            collision.server, collision.local_subnet
-        ))
-        .render(ctx, &mut out);
-    }
+    tunnel_dns_table(&ov.dns).render(ctx, &mut out);
     dns_table(ov).render(ctx, &mut out);
     out.push('\n');
 
@@ -206,9 +190,9 @@ fn strs(values: &[&str]) -> Vec<String> {
 }
 
 fn route_table(routes: &[RouteRow]) -> Table {
-    let mut table = Table::new(&["DESTINATION", "VIA", "FAMILY", "LIVE", "MTU", "STATUS"]);
+    let mut table = Table::new(&["Destination", "Via", "Family", "Live", "MTU", "Status"]);
     if routes.is_empty() {
-        table.row(cells(strs(&[
+        table.muted_row(cells(strs(&[
             "none",
             "-",
             "-",
@@ -245,16 +229,38 @@ fn route_table(routes: &[RouteRow]) -> Table {
                 mtu.map_or_else(|| "-".to_string(), |mtu| mtu.to_string()),
             ),
         };
-        table.row(cells(vec![
+        let row_cells = cells(vec![
             row.destination.clone(),
             via,
             family_label(row.family).to_string(),
             live,
             mtu,
             outcome_text(&row.outcome, row.family),
-        ]));
+        ]);
+        if route_in_effect(&row.outcome) {
+            table.row(row_cells);
+        } else {
+            table.muted_row(row_cells);
+        }
     }
     table
+}
+
+/// Whether the tunnel holds the route, so traffic for it actually takes the
+/// path the row describes. Every other row is muted.
+fn route_in_effect(outcome: &RouteOutcome) -> bool {
+    match outcome {
+        RouteOutcome::EndpointPinned
+        | RouteOutcome::Owned
+        | RouteOutcome::OwnedAbsentFromKernel
+        | RouteOutcome::OwnedKernelDisagrees
+        | RouteOutcome::NoLongerDesired => true,
+        RouteOutcome::EndpointPinMissing
+        | RouteOutcome::ExcludedLocalSubnet { .. }
+        | RouteOutcome::Blocked { .. }
+        | RouteOutcome::ReconcilePending
+        | RouteOutcome::NoAddressForFamily => false,
+    }
 }
 
 fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
@@ -273,7 +279,7 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
             "owned, but absent from the kernel table (drift)".to_string()
         }
         RouteOutcome::OwnedKernelDisagrees => {
-            "owned, but the kernel entry disagrees (see LIVE)".to_string()
+            "owned, but the kernel entry disagrees (see Live)".to_string()
         }
         RouteOutcome::Blocked { holder } => format!(
             "blocked: route table entry held by {}, unreachable via tunnel",
@@ -290,16 +296,57 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
     }
 }
 
+/// One row per tunnel DNS server with what became of it. Servers are muted
+/// unless a service actually resolves through them.
+fn tunnel_dns_table(dns: &DnsOverview) -> Table {
+    let mut table = Table::new(&["Tunnel DNS", "Status"]);
+    if dns.tunnel_servers.is_empty() {
+        table.muted_row(cells(strs(&["none", "the tunnel sets no DNS"])));
+        return table;
+    }
+    let primary = dns
+        .primary_service
+        .as_deref()
+        .unwrap_or("the primary service");
+    let applied = dns.services.iter().any(|row| {
+        matches!(
+            row.status,
+            DnsServiceStatus::TunnelDnsActive | DnsServiceStatus::AlreadyTunnelDns
+        )
+    });
+    let (status, active) = match &dns.unreachable {
+        Some(collision) => (
+            format!(
+                "pulled back: {} is inside local LAN {}",
+                collision.server, collision.local_subnet
+            ),
+            false,
+        ),
+        None if dns.dormant => ("held: no primary network service".to_string(), false),
+        None if applied => (format!("active via {primary}"), true),
+        None => (format!("pending: not applied to {primary} yet"), false),
+    };
+    for server in &dns.tunnel_servers {
+        let row_cells = cells(vec![server.clone(), status.clone()]);
+        if active {
+            table.row(row_cells);
+        } else {
+            table.muted_row(row_cells);
+        }
+    }
+    table
+}
+
 /// DNS rows, muted when not in effect: the whole block when it is dormant,
 /// else the services that are not targeted.
 fn dns_table(ov: &NetworkOverview) -> Table {
     let mut table = Table::new(&[
-        "SERVICE",
-        "ROLE",
-        "LIVE DNS",
-        "OWNED",
-        "ORIGINAL DNS",
-        "STATUS",
+        "Service",
+        "Role",
+        "Live DNS",
+        "Owned",
+        "Original DNS",
+        "Status",
     ]);
     if ov.dns.services.is_empty() {
         table.muted_row(cells(strs(&[
@@ -366,9 +413,9 @@ fn system_resolver_note(ov: &NetworkOverview) -> Note {
 }
 
 fn foreign_tunnel_table(tunnels: &[ForeignTunnelRow]) -> Table {
-    let mut table = Table::new(&["INTERFACE", "MTU", "ADDRESSES", "NOTE"]);
+    let mut table = Table::new(&["Interface", "MTU", "Addresses", "Note"]);
     if tunnels.is_empty() {
-        table.row(cells(strs(&["none", "-", "-", "no other tunnels"])));
+        table.muted_row(cells(strs(&["none", "-", "-", "no other tunnels"])));
         return table;
     }
     for t in tunnels {
@@ -951,7 +998,7 @@ mod tests {
                 subnet: "55.56.57.0/24".to_string(),
             },
         )];
-        assert!(render_network_overview(&ov, &PLAIN).contains("direct (en0)  "));
+        assert!(render_network_overview(&ov, &PLAIN).contains("direct (en0) | "));
     }
 
     #[test]

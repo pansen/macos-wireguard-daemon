@@ -6,19 +6,24 @@ wgd network overview
 interface=utun6 endpoint=23.88.101.22 endpoint_pin=enabled gateway=none local_subnets=none
 
 Routes (AllowedIPs + endpoint pin, with what became of each)
-⟨90m⟩DESTINATION   VIA  FAMILY  LIVE    MTU  STATUS⟨0m⟩
-⟨90m⟩------------  ---  ------  ------  ---  --------------------------------------------------⟨0m⟩
-23.88.101.22  -    IPv4    absent  -    missing: no default gateway to pin the endpoint to
 
-DNS tunnel_servers=100.64.1.1 primary_service=Wi-Fi
-⟨90m⟩SERVICE  ROLE     LIVE DNS  OWNED  ORIGINAL DNS  STATUS⟨0m⟩
-⟨90m⟩-------  -------  --------  -----  ------------  ----------------------⟨0m⟩
-Wi-Fi    primary  8.8.8.8   yes    empty         owned; pending reapply
+⟨90m⟩Destination  | Via | Family | Live   | MTU | Status⟨0m⟩
+⟨90m⟩-------------+-----+--------+--------+-----+---------------------------------------------------⟨0m⟩
+⟨2m⟩23.88.101.22 | -   | IPv4   | absent | -   | missing: no default gateway to pin the endpoint to⟨0m⟩
+
+⟨90m⟩Tunnel DNS | Status⟨0m⟩
+⟨90m⟩-----------+----------------------------------⟨0m⟩
+⟨2m⟩100.64.1.1 | pending: not applied to Wi-Fi yet⟨0m⟩
+
+⟨90m⟩Service | Role    | Live DNS | Owned | Original DNS | Status⟨0m⟩
+⟨90m⟩--------+---------+----------+-------+--------------+-----------------------⟨0m⟩
+Wi-Fi   | primary | 8.8.8.8  | yes   | empty        | owned; pending reapply
 
 ⟨1m⟩⟨33m⟩! System resolver 1.1.1.1 is not the tunnel resolver; a foreign VPN or DHCP owns resolution⟨0m⟩
 
 Other tunnels (foreign VPN / utun interfaces)
-⟨90m⟩INTERFACE  MTU  ADDRESSES  NOTE⟨0m⟩
-⟨90m⟩---------  ---  ---------  ----------------⟨0m⟩
-none       -    -          no other tunnels
+
+⟨90m⟩Interface | MTU | Addresses | Note⟨0m⟩
+⟨90m⟩----------+-----+-----------+-----------------⟨0m⟩
+⟨2m⟩none      | -   | -         | no other tunnels⟨0m⟩
 tailscaled=not detected

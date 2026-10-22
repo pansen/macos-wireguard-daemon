@@ -2,7 +2,8 @@
 source: src/ui.rs
 expression: "render(&table(), &RenderCtx::plain())"
 ---
-NAME         NOTE
------------  ----
-a            warn
-longer name  x
+
+Name        | Note
+------------+-----
+a           | warn
+longer name | x

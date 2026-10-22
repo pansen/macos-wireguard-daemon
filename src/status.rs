@@ -16,7 +16,7 @@ use crate::privileged_api::{ConnectionId, ConnectionScope, ConnectionSummary, Dn
 use crate::privileged_client::PrivilegedClient;
 use crate::status_model::{NetworkOverview, WgDeviceStatus};
 use crate::status_render;
-use crate::ui::{self, Component, RenderCtx, Separator, Span, Table};
+use crate::ui::{self, Component, RenderCtx, Span, Table};
 
 /// Everything `wgd status` shows, as fetched from the privileged service.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -226,8 +226,7 @@ fn render_status_at(report: &StatusReport, now_unix: u64, ctx: &RenderCtx) -> St
 }
 
 fn connection_table(connections: &[ConnectionSummary]) -> Table {
-    let mut table = Table::new(&["Id", "Name", "Global", "Mode", "Connected", "Interface"])
-        .separator(Separator::Pipes);
+    let mut table = Table::new(&["Id", "Name", "Global", "Mode", "Connected", "Interface"]);
     for conn in connections {
         table.row(vec![
             Span::plain(conn.id.to_string()),
@@ -251,7 +250,7 @@ pub fn render_service_dns(ctx: &RenderCtx, out: &mut String, diag: &mut String) 
             return;
         }
     };
-    let mut table = Table::new(&["SERVICE", "DNS SERVERS"]).indent(2);
+    let mut table = Table::new(&["Service", "DNS servers"]).indent(2);
     for service in services {
         let servers = match macos_dns::get_dns_servers(&service) {
             Ok(Some(servers)) => servers.join(" "),

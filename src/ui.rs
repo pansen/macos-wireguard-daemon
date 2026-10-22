@@ -29,7 +29,8 @@ pub enum Role {
     Unit,
     /// Table headers and rules, quieter than the data they frame.
     Frame,
-    /// A row that is not in effect.
+    /// Something that is not in effect. wgd greys out every inactive
+    /// entry the same way, so what is active stands out.
     Muted,
     /// Something the user should look at.
     Warn,
@@ -229,30 +230,10 @@ impl Component for KeyValue {
     }
 }
 
-/// How table columns are separated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Separator {
-    /// Two spaces, a dashed rule under the header.
-    Spaces,
-    /// ` | `, a `-+-` rule under the header.
-    Pipes,
-}
-
-impl Separator {
-    fn column(self) -> &'static str {
-        match self {
-            Separator::Spaces => "  ",
-            Separator::Pipes => " | ",
-        }
-    }
-
-    fn rule(self) -> &'static str {
-        match self {
-            Separator::Spaces => "  ",
-            Separator::Pipes => "-+-",
-        }
-    }
-}
+/// Between two cells of a row.
+const COLUMN_SEPARATOR: &str = " | ";
+/// Where the dashed rule under the header crosses a column separator.
+const RULE_JUNCTION: &str = "-+-";
 
 #[derive(Debug, Clone)]
 struct Row {
@@ -260,12 +241,13 @@ struct Row {
     muted: bool,
 }
 
-/// Left-aligned columns, each as wide as its widest cell or header.
+/// Left-aligned columns, each as wide as its widest cell or header, separated
+/// by ` | ` with a `-+-` rule under the header. A blank line above keeps the
+/// table off the text before it.
 #[derive(Debug, Clone)]
 pub struct Table {
     headers: Vec<String>,
     rows: Vec<Row>,
-    separator: Separator,
     indent: usize,
 }
 
@@ -274,14 +256,8 @@ impl Table {
         Self {
             headers: headers.iter().map(|header| header.to_string()).collect(),
             rows: Vec::new(),
-            separator: Separator::Spaces,
             indent: 0,
         }
-    }
-
-    pub fn separator(mut self, separator: Separator) -> Self {
-        self.separator = separator;
-        self
     }
 
     /// Spaces in front of every line.
@@ -322,7 +298,7 @@ impl Table {
         let last = cells.len().saturating_sub(1);
         for (index, (text, width)) in cells.iter().enumerate() {
             if index > 0 {
-                line.push_str(self.separator.column());
+                line.push_str(COLUMN_SEPARATOR);
             }
             line.push_str(text);
             if index < last {
@@ -338,6 +314,7 @@ impl Component for Table {
     fn render(&self, ctx: &RenderCtx, out: &mut String) {
         let widths = self.widths();
         let plain = RenderCtx::plain();
+        out.push('\n');
 
         let header: Vec<(String, usize)> = self
             .headers
@@ -349,7 +326,7 @@ impl Component for Table {
             .iter()
             .map(|width| "-".repeat(*width))
             .collect::<Vec<_>>()
-            .join(self.separator.rule());
+            .join(RULE_JUNCTION);
         for frame in [header, format!("{}{rule}", " ".repeat(self.indent))] {
             let (indent, text) = frame.split_at(self.indent);
             out.push_str(&format!("{indent}{}\n", ctx.paint(text, Role::Frame)));
@@ -450,7 +427,7 @@ mod tests {
     use super::*;
 
     fn table() -> Table {
-        let mut table = Table::new(&["NAME", "NOTE"]);
+        let mut table = Table::new(&["Name", "Note"]);
         table.row(vec!["a".into(), Span::styled("warn", Role::Warn)]);
         table.muted_row(vec!["longer name".into(), Span::styled("x", Role::Warn)]);
         table
@@ -468,7 +445,7 @@ mod tests {
 
     #[test]
     fn widths_count_terminal_cells_not_bytes() {
-        let mut table = Table::new(&["A", "B"]).separator(Separator::Pipes);
+        let mut table = Table::new(&["A", "B"]);
         table.row(vec!["Ä — ü".into(), "1".into()]);
         table.row(vec!["abcde".into(), "2".into()]);
         insta::assert_snapshot!(render(&table, &RenderCtx::plain()));
@@ -476,7 +453,7 @@ mod tests {
 
     #[test]
     fn indented_table_indents_frame_and_rows() {
-        let mut table = Table::new(&["SERVICE", "DNS"]).indent(2);
+        let mut table = Table::new(&["Service", "DNS"]).indent(2);
         table.muted_row(vec!["Wi-Fi".into(), "1.1.1.1".into()]);
         insta::assert_snapshot!(visible_ansi(&render(&table, &RenderCtx::ansi())));
     }

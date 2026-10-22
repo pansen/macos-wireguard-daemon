@@ -6,19 +6,24 @@ wgd network overview
 interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=none local_subnets=none
 
 Routes (AllowedIPs + endpoint pin, with what became of each)
-DESTINATION  VIA  FAMILY  LIVE  MTU  STATUS
------------  ---  ------  ----  ---  -----------------
-none         -    -       -     -    no routes desired
 
-DNS tunnel_servers=100.64.1.1 primary_service=Wi-Fi
-SERVICE  ROLE     LIVE DNS  OWNED  ORIGINAL DNS  STATUS
--------  -------  --------  -----  ------------  -----------------
-Wi-Fi    primary  8.8.8.8   no     empty         target; not owned
+Destination | Via | Family | Live | MTU | Status
+------------+-----+--------+------+-----+------------------
+none        | -   | -      | -    | -   | no routes desired
+
+Tunnel DNS | Status
+-----------+----------------------------------
+100.64.1.1 | pending: not applied to Wi-Fi yet
+
+Service | Role    | Live DNS | Owned | Original DNS | Status
+--------+---------+----------+-------+--------------+------------------
+Wi-Fi   | primary | 8.8.8.8  | no    | empty        | target; not owned
 
 ! System resolver 100.64.1.1, 1.1.1.1 is only partly tunnel DNS; another resolver is also active
 
 Other tunnels (foreign VPN / utun interfaces)
-INTERFACE  MTU  ADDRESSES  NOTE
----------  ---  ---------  ----------------
-none       -    -          no other tunnels
+
+Interface | MTU | Addresses | Note
+----------+-----+-----------+-----------------
+none      | -   | -         | no other tunnels
 tailscaled=not detected
