@@ -1,0 +1,30 @@
+---
+source: src/status_render.rs
+expression: "visible_ansi(&render_network_overview(&ov, &RenderCtx::ansi()))"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=none local_subnets=none
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+
+⟨90m⟩Destination | Via | Family | Live | MTU | Status⟨0m⟩
+⟨90m⟩------------+-----+--------+------+-----+------------------⟨0m⟩
+⟨2m⟩none        | -   | -      | -    | -   | no routes desired⟨0m⟩
+
+⟨90m⟩Tunnel DNS | Status⟨0m⟩
+⟨90m⟩-----------+-----------------⟨0m⟩
+100.64.1.1 | active via Wi-Fi
+
+⟨90m⟩Service  | Role      | Live DNS   | Owned | Original DNS | Status⟨0m⟩
+⟨90m⟩---------+-----------+------------+-------+--------------+-------------------⟨0m⟩
+⟨2m⟩Ethernet | secondary | empty      | no    | empty        | not targeted⟨0m⟩
+Wi-Fi    | primary   | 100.64.1.1 | no    | empty        | already tunnel DNS
+
+System resolver=100.64.1.1 (matches tunnel DNS)
+
+Other tunnels (foreign VPN / utun interfaces)
+
+⟨90m⟩Interface | MTU | Addresses | Note⟨0m⟩
+⟨90m⟩----------+-----+-----------+-----------------⟨0m⟩
+⟨2m⟩none      | -   | -         | no other tunnels⟨0m⟩
+tailscaled=running (socket present; userspace mode has no utun of its own)

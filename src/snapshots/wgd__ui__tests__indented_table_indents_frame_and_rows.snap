@@ -1,0 +1,8 @@
+---
+source: src/ui.rs
+expression: "visible_ansi(&render(&table, &RenderCtx::ansi()))"
+---
+
+  ⟨90m⟩Service | DNS⟨0m⟩
+  ⟨90m⟩--------+--------⟨0m⟩
+  ⟨2m⟩Wi-Fi   | 1.1.1.1⟨0m⟩

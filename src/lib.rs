@@ -5,7 +5,6 @@
 
 // Provider-agnostic infrastructure
 pub mod cli;
-pub mod color;
 pub mod completion;
 pub mod config;
 pub mod dns_custody;
@@ -23,7 +22,10 @@ pub mod reload;
 pub mod session_agent;
 pub mod state_file;
 pub mod status;
+pub mod status_model;
+pub mod status_render;
 pub mod trusted_exec;
+pub mod ui;
 
 // WireGuard config parsing shared by the CLI and the privileged daemon.
 pub mod wireguard;

@@ -22,6 +22,7 @@ use anyhow::Context;
 use nix::unistd::{geteuid, Gid, Uid};
 
 use crate::privileged_api::ConnectionSummary;
+use crate::ui::RenderCtx;
 
 /// Report sections, in output order. The launchd status report has to run
 /// before anything connects to `ctl.sock`: connecting socket-activates the
@@ -150,24 +151,23 @@ fn build_report(privileged: bool, caller_in_wgd_group: Option<bool>) -> String {
             "dns per network service" => {
                 let mut body = String::new();
                 let mut diag = String::new();
-                crate::status::render_service_dns(&mut body, &mut diag);
+                crate::status::render_service_dns(&RenderCtx::plain(), &mut body, &mut diag);
                 body.push_str(&diag);
                 body
             }
             "wgd status" => {
-                let mut body = String::new();
-                let mut diag = String::new();
-                match crate::status::render_status(&mut body, &mut diag) {
-                    Ok(conns) => {
-                        body.push_str(&diag);
-                        connections = Some(conns);
+                let client = crate::privileged_client::PrivilegedClient::new();
+                match crate::status::collect_status(&client) {
+                    Ok(report) => {
+                        let mut body = crate::status::render_status(&report, &RenderCtx::plain());
+                        for line in &report.diagnostics {
+                            let _ = writeln!(body, "{line}");
+                        }
+                        connections = Some(report.connections);
+                        body
                     }
-                    Err(e) => {
-                        body.push_str(&diag);
-                        let _ = writeln!(body, "wgd status failed: {e:#}");
-                    }
+                    Err(e) => format!("wgd status failed: {e:#}\n"),
                 }
-                body
             }
             "reachability" => reachability_section(connections.as_deref()),
             "launchd log (last 10m)" if privileged => crate::logs::collect_launchd_logs(LOG_LINES),
@@ -412,7 +412,7 @@ fn create_report_file(path: &Path) -> anyhow::Result<std::fs::File> {
 
 /// Redact `report` and write it into the file [`create_report_file`] opened.
 fn write_report_file(path: &Path, mut file: std::fs::File, report: &str) -> anyhow::Result<()> {
-    let text = redact_report(&strip_ansi(report));
+    let text = redact_report(report);
     file.write_all(text.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
@@ -421,47 +421,6 @@ fn write_report_file(path: &Path, mut file: std::fs::File, report: &str) -> anyh
         "Only the report file is redacted and safe to attach publicly; the terminal output above is not."
     );
     Ok(())
-}
-
-/// Remove ANSI escape sequences (CSI and OSC) from `text`.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                // Parameters and intermediates, then one final byte.
-                for n in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                // Up to BEL or ESC \.
-                while let Some(n) = chars.next() {
-                    if n == '\u{7}' {
-                        break;
-                    }
-                    if n == '\u{1b}' {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------
@@ -864,12 +823,6 @@ mod tests {
         assert!(pos("wgd status") < pos("reachability"));
         assert_eq!(*SECTIONS.last().unwrap(), "/var/log/wgd tails");
         assert_eq!(render_section("x", "a"), "==> x\na\n\n");
-    }
-
-    #[test]
-    fn strips_ansi() {
-        let s = "\u{1b}[2m2026\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m ok\u{1b}]0;title\u{7}!";
-        assert_eq!(strip_ansi(s), "2026  INFO ok!");
     }
 
     #[test]

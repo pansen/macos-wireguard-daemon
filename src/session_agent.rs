@@ -492,7 +492,7 @@ pub(crate) fn ensure_for_automatic(client: &PrivilegedClient) {
         AgentPlan::Nothing => {}
         AgentPlan::Warn => eprintln!(
             "{}",
-            crate::color::warning(&format!(
+            crate::ui::warning(&format!(
                 "Warning: {}",
                 agent_problem_message(state, &names)
             ))
@@ -506,7 +506,7 @@ pub(crate) fn ensure_for_automatic(client: &PrivilegedClient) {
             ),
             Err(error) => eprintln!(
                 "{}",
-                crate::color::warning(&format!(
+                crate::ui::warning(&format!(
                     "Warning: could not install the session agent ({error:#}); {}",
                     agent_problem_message(state, &names)
                 ))

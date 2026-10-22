@@ -1,0 +1,14 @@
+---
+source: src/status_render.rs
+expression: "render_wg_device(&device(true, Some(62401), vec![long_ago]), NOW, &PLAIN)"
+---
+interface: wgconf0
+  public key: B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=
+  private key: (hidden)
+  listening port: 62401
+
+peer: oaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8A=
+  endpoint: [2001:db8::1]:51820
+  allowed ips: 0.0.0.0/0, ::/0
+  latest handshake: 3 hours
+  transfer: 1.00 MiB received, 3.00 GiB sent

@@ -1,0 +1,9 @@
+---
+source: src/ui.rs
+expression: "render(&table(), &RenderCtx::plain())"
+---
+
+Name        | Note
+------------+-----
+a           | warn
+longer name | x

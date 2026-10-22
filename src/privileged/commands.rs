@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::error::{AppError, Result};
 use crate::privileged_api::ConnectionId;
+use crate::status_model::{NetworkOverview, WgDeviceStatus, WgPeerStatus};
 
 use super::daemon::self_executable_for_spawn;
 use super::managed_pids::{pid_is_alive, process_executable};
@@ -15,7 +16,7 @@ use super::managed_pids::{pid_is_alive, process_executable};
 /// Fetch the live network overview from a userspace helper's query socket.
 /// Returns `Ok(None)` when there is no such socket (kernel backend, or
 /// the tunnel isn't a gotatun userspace one) so the caller can quietly skip it.
-pub(super) fn run_network_overview(interface: &str) -> Result<Option<String>> {
+pub(super) fn run_network_overview(interface: &str) -> Result<Option<NetworkOverview>> {
     use std::io::Read;
 
     let socket_path =
@@ -26,14 +27,19 @@ pub(super) fn run_network_overview(interface: &str) -> Result<Option<String>> {
 
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|e| AppError::Other(format!("overview query connect: {e}")))?;
-    let mut overview = String::new();
+    let mut payload = Vec::new();
     stream
-        .read_to_string(&mut overview)
+        .read_to_end(&mut payload)
         .map_err(|e| AppError::Other(format!("overview query read: {e}")))?;
+    let overview = serde_json::from_slice(&payload).map_err(|e| {
+        AppError::Other(format!(
+            "overview query for {interface} returned invalid JSON: {e}"
+        ))
+    })?;
     Ok(Some(overview))
 }
 
-pub(super) fn run_wg_show(interface: &str) -> Result<String> {
+pub(super) fn run_wg_show(interface: &str) -> Result<WgDeviceStatus> {
     let socket_path =
         std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));
 
@@ -45,7 +51,7 @@ pub(super) fn run_wg_show(interface: &str) -> Result<String> {
     }
 }
 
-fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<String> {
+fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<WgDeviceStatus> {
     use std::io::BufRead;
 
     debug!(socket = ?socket_path.display().to_string(), "uapi_get");
@@ -74,10 +80,10 @@ fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<St
         }
     }
 
-    format_wg_show(&raw, interface)
+    parse_wg_show(&raw, interface)
 }
 
-fn run_wg_show_kernel(_interface: &str) -> Result<String> {
+fn run_wg_show_kernel(_interface: &str) -> Result<WgDeviceStatus> {
     // macOS has no in-kernel WireGuard; userspace tunnels always expose a UAPI
     // socket, so this path (no socket present) means the interface is not up.
     Err(AppError::WireGuard(
@@ -85,7 +91,8 @@ fn run_wg_show_kernel(_interface: &str) -> Result<String> {
     ))
 }
 
-pub(super) fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
+/// Parse a UAPI `get=1` response into the device state.
+pub(super) fn parse_wg_show(raw: &str, interface: &str) -> Result<WgDeviceStatus> {
     use base64::Engine;
     use gotatun::x25519::{PublicKey, StaticSecret};
 
@@ -100,12 +107,7 @@ pub(super) fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
         keepalive: u32,
     }
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut listen_port: u32 = 0;
+    let mut listen_port: u16 = 0;
     let mut iface_pub_b64 = String::new();
     let mut peers: Vec<PeerState> = Vec::new();
     let mut current_peer: Option<PeerState> = None;
@@ -173,48 +175,25 @@ pub(super) fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
         peers.push(peer);
     }
 
-    let mut out = String::new();
-    out.push_str(&format!("interface: {interface}\n"));
-    if !iface_pub_b64.is_empty() {
-        out.push_str(&format!("  public key: {iface_pub_b64}\n"));
-    }
-    out.push_str("  private key: (hidden)\n");
-    if listen_port != 0 {
-        out.push_str(&format!("  listening port: {listen_port}\n"));
-    }
-
-    for peer in &peers {
-        out.push('\n');
-        out.push_str(&format!("peer: {}\n", peer.public_key_b64));
-        if let Some(ref ep) = peer.endpoint {
-            out.push_str(&format!("  endpoint: {ep}\n"));
-        }
-        if !peer.allowed_ips.is_empty() {
-            out.push_str(&format!("  allowed ips: {}\n", peer.allowed_ips.join(", ")));
-        }
-        if peer.has_preshared_key {
-            out.push_str("  preshared key: (hidden)\n");
-        }
-        if peer.last_handshake_sec > 0 {
-            let ago = now_secs.saturating_sub(peer.last_handshake_sec);
-            out.push_str(&format!("  latest handshake: {}\n", wg_format_ago(ago)));
-        } else {
-            out.push_str("  latest handshake: (none)\n");
-        }
-        out.push_str(&format!(
-            "  transfer: {} received, {} sent\n",
-            wg_format_bytes(peer.rx_bytes),
-            wg_format_bytes(peer.tx_bytes)
-        ));
-        if peer.keepalive > 0 {
-            out.push_str(&format!(
-                "  persistent keepalive: every {} seconds\n",
-                peer.keepalive
-            ));
-        }
-    }
-
-    Ok(out)
+    Ok(WgDeviceStatus {
+        interface: interface.to_string(),
+        public_key: (!iface_pub_b64.is_empty()).then_some(iface_pub_b64),
+        listen_port: (listen_port != 0).then_some(listen_port),
+        peers: peers
+            .into_iter()
+            .map(|peer| WgPeerStatus {
+                public_key: peer.public_key_b64,
+                endpoint: peer.endpoint,
+                allowed_ips: peer.allowed_ips,
+                has_preshared_key: peer.has_preshared_key,
+                latest_handshake_unix: (peer.last_handshake_sec > 0)
+                    .then_some(peer.last_handshake_sec),
+                rx_bytes: peer.rx_bytes,
+                tx_bytes: peer.tx_bytes,
+                persistent_keepalive_secs: (peer.keepalive > 0).then_some(peer.keepalive),
+            })
+            .collect(),
+    })
 }
 
 pub(super) fn wg_hex_to_32(s: &str) -> std::result::Result<[u8; 32], ()> {
@@ -226,37 +205,6 @@ pub(super) fn wg_hex_to_32(s: &str) -> std::result::Result<[u8; 32], ()> {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
     }
     Ok(bytes)
-}
-
-pub(super) fn wg_format_ago(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs} second{}", if secs == 1 { "" } else { "s" });
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins} minute{}", if mins == 1 { "" } else { "s" });
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
-    }
-    let days = hours / 24;
-    format!("{days} day{}", if days == 1 { "" } else { "s" })
-}
-
-pub(super) fn wg_format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.2} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 pub(super) fn run_gotatun_up(
@@ -575,9 +523,10 @@ fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_gotatun_process_identity, gotatun_runtime_path, read_gotatun_pid, rotate_helper_log,
-        wait_for_cleanup_status,
+        ensure_gotatun_process_identity, gotatun_runtime_path, parse_wg_show, read_gotatun_pid,
+        rotate_helper_log, wait_for_cleanup_status,
     };
+    use crate::status_model::WgPeerStatus;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -692,5 +641,73 @@ mod tests {
         writer.join().expect("cleanup status writer");
         let _ = std::fs::remove_file(path);
         assert_eq!(status.as_deref(), Some("ok"));
+    }
+
+    const PRIVATE_KEY_HEX: &str =
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const PEER_1_HEX: &str = "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0";
+    const PEER_2_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn parse_wg_show_reads_the_interface() {
+        let raw = format!("private_key={PRIVATE_KEY_HEX}\nlisten_port=51820\nerrno=0\n\n");
+        let device = parse_wg_show(&raw, "wgconf0").unwrap();
+        assert_eq!(device.interface, "wgconf0");
+        assert_eq!(
+            device.public_key.as_deref(),
+            Some("B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=")
+        );
+        assert_eq!(device.listen_port, Some(51820));
+        assert!(device.peers.is_empty());
+    }
+
+    #[test]
+    fn parse_wg_show_without_key_or_port_leaves_them_unset() {
+        let device = parse_wg_show("errno=0\n\n", "wgconf0").unwrap();
+        assert_eq!(device.public_key, None);
+        assert_eq!(device.listen_port, None);
+        let zero_port = parse_wg_show("listen_port=0\nerrno=0\n\n", "wgconf0").unwrap();
+        assert_eq!(zero_port.listen_port, None);
+    }
+
+    #[test]
+    fn parse_wg_show_reads_peers() {
+        let zero = "0".repeat(64);
+        let psk = "ff".repeat(32);
+        let raw = format!(
+            "private_key={PRIVATE_KEY_HEX}\n\
+             public_key={PEER_1_HEX}\npreshared_key={psk}\nendpoint=203.0.113.7:51820\n\
+             allowed_ip=10.66.77.0/24\nallowed_ip=100.64.0.1/32\n\
+             last_handshake_time_sec=1699999875\nlast_handshake_time_nsec=5\n\
+             tx_bytes=5242880\nrx_bytes=1536\npersistent_keepalive_interval=25\n\
+             public_key={PEER_2_HEX}\npreshared_key={zero}\ntx_bytes=0\nrx_bytes=0\n\
+             last_handshake_time_sec=0\npersistent_keepalive_interval=0\nerrno=0\n\n"
+        );
+        let device = parse_wg_show(&raw, "wgconf0").unwrap();
+        assert_eq!(
+            device.peers,
+            vec![
+                WgPeerStatus {
+                    public_key: "oaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8A=".to_string(),
+                    endpoint: Some("203.0.113.7:51820".to_string()),
+                    allowed_ips: vec!["10.66.77.0/24".to_string(), "100.64.0.1/32".to_string()],
+                    has_preshared_key: true,
+                    latest_handshake_unix: Some(1_699_999_875),
+                    rx_bytes: 1536,
+                    tx_bytes: 5_242_880,
+                    persistent_keepalive_secs: Some(25),
+                },
+                WgPeerStatus {
+                    public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=".to_string(),
+                    endpoint: None,
+                    allowed_ips: vec![],
+                    has_preshared_key: false,
+                    latest_handshake_unix: None,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    persistent_keepalive_secs: None,
+                },
+            ]
+        );
     }
 }

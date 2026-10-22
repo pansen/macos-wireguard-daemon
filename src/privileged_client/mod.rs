@@ -15,6 +15,7 @@ use crate::privileged_api::{
     ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
     DisconnectReason, PrivilegedRequest, PrivilegedResponse, RefreshOutcome,
 };
+use crate::status_model::{NetworkOverview, WgDeviceStatus};
 
 use self::transport::{is_transport_error, StdioSession};
 use self::util::{build_lease_token, request_kind, resolve_client_authorized_group};
@@ -188,29 +189,27 @@ impl PrivilegedClient {
         self
     }
 
-    /// Run `wg show <interface>` as root and return the output.
-    /// Works for both kernel and userspace (gotatun) backends.
-    #[allow(dead_code)]
-    pub fn wg_show(&self, interface: &str) -> Result<String> {
+    /// Read the WireGuard device state of `interface` as root, as `wg show`
+    /// would report it. Works for both kernel and userspace (gotatun) backends.
+    pub fn wg_show(&self, interface: &str) -> Result<WgDeviceStatus> {
         match self.send(PrivilegedRequest::WgShow {
             interface: interface.to_string(),
         })? {
-            PrivilegedResponse::Text(output) => Ok(output),
+            PrivilegedResponse::WgDevice(device) => Ok(device),
             _ => Err(AppError::Other(
                 "invalid privileged response for WgShow".into(),
             )),
         }
     }
 
-    /// Fetch the live route/DNS overview for a userspace tunnel, rendered by the
-    /// helper that owns the interface. Returns `None` when the tunnel has no
-    /// overview to show (kernel backend, or the helper isn't running).
-    pub fn network_overview(&self, interface: &str) -> Result<Option<String>> {
+    /// Fetch the live route/DNS overview for a userspace tunnel, collected by
+    /// the helper that owns the interface. Returns `None` when the tunnel has
+    /// no overview to show (kernel backend, or the helper isn't running).
+    pub fn network_overview(&self, interface: &str) -> Result<Option<NetworkOverview>> {
         match self.send(PrivilegedRequest::NetworkOverview {
             interface: interface.to_string(),
         })? {
-            PrivilegedResponse::Text(output) if output.is_empty() => Ok(None),
-            PrivilegedResponse::Text(output) => Ok(Some(output)),
+            PrivilegedResponse::NetworkOverview(overview) => Ok(overview.map(|boxed| *boxed)),
             _ => Err(AppError::Other(
                 "invalid privileged response for NetworkOverview".into(),
             )),

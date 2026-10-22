@@ -1,0 +1,30 @@
+---
+source: src/status_render.rs
+expression: "render_network_overview(&ov, &PLAIN)"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=none local_subnets=none
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+
+Destination | Via | Family | Live | MTU | Status
+------------+-----+--------+------+-----+------------------
+none        | -   | -      | -    | -   | no routes desired
+
+Tunnel DNS | Status
+-----------+---------------------------------
+100.64.1.1 | held: no primary network service
+
+Service  | Role      | Live DNS   | Owned | Original DNS | Status
+---------+-----------+------------+-------+--------------+------------------------
+Ethernet | secondary | 100.64.1.1 | no    | empty        | not targeted
+Wi-Fi    | secondary | 100.64.1.1 | yes   | 9.9.9.9      | owned; held, no primary
+
+System resolver=none (DHCP/unset)
+
+Other tunnels (foreign VPN / utun interfaces)
+
+Interface | MTU | Addresses | Note
+----------+-----+-----------+-----------------
+none      | -   | -         | no other tunnels
+tailscaled=not detected

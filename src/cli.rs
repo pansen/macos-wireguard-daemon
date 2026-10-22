@@ -23,6 +23,10 @@ pub enum TopCommand {
         /// Also show live DNS servers configured on each macOS network service
         #[arg(long)]
         dns: bool,
+
+        /// Print the status report as JSON instead of text
+        #[arg(long, conflicts_with = "dns")]
+        json: bool,
     },
 
     /// Run system and connection diagnostics (and optionally write a redacted report file)
@@ -421,10 +425,34 @@ mod tests {
     #[test]
     fn parse_status_with_and_without_dns_flag() {
         let bare = Cli::try_parse_from(["wgd", "status"]).expect("parse bare status");
-        assert!(matches!(bare.command, TopCommand::Status { dns: false }));
+        assert!(matches!(
+            bare.command,
+            TopCommand::Status {
+                dns: false,
+                json: false
+            }
+        ));
 
         let with_dns = Cli::try_parse_from(["wgd", "status", "--dns"]).expect("parse status --dns");
-        assert!(matches!(with_dns.command, TopCommand::Status { dns: true }));
+        assert!(matches!(
+            with_dns.command,
+            TopCommand::Status {
+                dns: true,
+                json: false
+            }
+        ));
+
+        let with_json =
+            Cli::try_parse_from(["wgd", "status", "--json"]).expect("parse status --json");
+        assert!(matches!(
+            with_json.command,
+            TopCommand::Status {
+                dns: false,
+                json: true
+            }
+        ));
+
+        assert!(Cli::try_parse_from(["wgd", "status", "--json", "--dns"]).is_err());
     }
 
     #[test]

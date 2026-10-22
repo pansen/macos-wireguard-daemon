@@ -104,7 +104,7 @@ pub(super) fn dispatch(
                 return DispatchOutcome::Immediate(response);
             }
             DispatchOutcome::Immediate(match run_wg_show(interface.as_str()) {
-                Ok(output) => PrivilegedResponse::Text(output),
+                Ok(device) => PrivilegedResponse::WgDevice(device),
                 Err(e) => PrivilegedResponse::Error {
                     code: categorize_error(&e),
                     message: format!("{}", e),
@@ -117,9 +117,9 @@ pub(super) fn dispatch(
                 return DispatchOutcome::Immediate(response);
             }
             DispatchOutcome::Immediate(match run_network_overview(interface.as_str()) {
-                // No query socket (kernel backend, or not up): empty text
-                // tells the caller to render nothing rather than an error.
-                Ok(overview) => PrivilegedResponse::Text(overview.unwrap_or_default()),
+                // No query socket (kernel backend, or not up): `None` tells the
+                // caller to show nothing rather than an error.
+                Ok(overview) => PrivilegedResponse::NetworkOverview(overview.map(Box::new)),
                 Err(e) => PrivilegedResponse::Error {
                     code: categorize_error(&e),
                     message: format!("{}", e),

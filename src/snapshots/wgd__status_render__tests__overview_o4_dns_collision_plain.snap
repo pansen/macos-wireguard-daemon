@@ -1,0 +1,32 @@
+---
+source: src/status_render.rs
+expression: "render_network_overview(&ov, &PLAIN)"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=55.56.57.1 local_subnets=55.56.57.0/24
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+
+Destination   | Via             | Family | Live  | MTU  | Status
+--------------+-----------------+--------+-------+------+-------
+100.64.0.0/24 | interface utun6 | IPv4   | utun6 | 1384 | owned
+
+Tunnel DNS | Status
+-----------+----------------------------------------------------------
+55.56.57.2 | pulled back: 55.56.57.2 is inside local LAN 55.56.57.0/24
+100.64.1.1 | pulled back: 55.56.57.2 is inside local LAN 55.56.57.0/24
+
+Service  | Role      | Live DNS               | Owned | Original DNS | Status
+---------+-----------+------------------------+-------+--------------+------------------------
+Bridge   | secondary | 8.8.8.8                | no    | empty        | not targeted
+Ethernet | secondary | 55.56.57.2, 100.64.1.1 | yes   | 1.1.1.1      | owned; pending restore
+Wi-Fi    | primary   | 55.56.57.2, 100.64.1.1 | no    | empty        | stale tunnel DNS on LAN
+
+System resolver=55.56.57.2, 100.64.1.1 (matches tunnel DNS)
+
+Other tunnels (foreign VPN / utun interfaces)
+
+Interface | MTU | Addresses | Note
+----------+-----+-----------+-----------------
+none      | -   | -         | no other tunnels
+tailscaled=not detected
