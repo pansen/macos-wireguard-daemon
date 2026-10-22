@@ -1,21 +1,25 @@
 //! `wgd status`, shared by the `status` command and `wgd doctor`.
 //!
 //! [`collect_status`] gathers everything from the privileged service into a
-//! [`StatusReport`]; [`render_status`] turns that report into text and does no
-//! I/O of its own. `doctor` uses the same pair, so its report shows exactly
-//! what `status` prints. Fetch failures that `status` has always sent to
-//! stderr travel in [`StatusReport::diagnostics`]; `doctor` folds them into
-//! its report.
+//! typed [`StatusReport`]; [`render_status`] turns that report into text and
+//! does no I/O of its own. `wgd status --json` prints the report itself.
+//! `doctor` uses the same pair, so its report shows exactly what `status`
+//! prints. Fetch failures that `status` has always sent to stderr travel in
+//! [`StatusReport::diagnostics`]; `doctor` folds them into its report.
 
 use std::fmt::Write;
 
+use serde::Serialize;
+
 use crate::color;
 use crate::macos_dns;
-use crate::privileged_api::{ConnectionScope, ConnectionSummary, DnsCustodyStatus};
+use crate::privileged_api::{ConnectionId, ConnectionScope, ConnectionSummary, DnsCustodyStatus};
 use crate::privileged_client::PrivilegedClient;
+use crate::status_model::{NetworkOverview, WgDeviceStatus};
+use crate::status_render;
 
 /// Everything `wgd status` shows, as fetched from the privileged service.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StatusReport {
     /// This user's connections first, then the global ones.
     pub connections: Vec<ConnectionSummary>,
@@ -25,29 +29,37 @@ pub struct StatusReport {
     /// `None` when the daemon could not report DNS custody; that only costs
     /// the custody notes, so it is not a diagnostic.
     pub dns_custody: Option<DnsCustodyStatus>,
-    /// Best-effort fetches that failed, one line each, for stderr.
+    /// Best-effort fetches that failed, one line each. `status` prints them to
+    /// stderr, or includes them in the JSON with `--json`.
     pub diagnostics: Vec<String>,
 }
 
 /// Live detail of one connected interface. Both parts are best-effort and
 /// `None` when there is nothing to show or the fetch failed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConnectionDetail {
-    /// `wg show` style tunnel state, without trailing whitespace.
-    pub wg_show: Option<String>,
-    /// The helper's route/DNS overview, without trailing whitespace.
-    pub network_overview: Option<String>,
+    pub connection_id: ConnectionId,
+    pub interface: String,
+    /// `wg show` state of the tunnel.
+    pub wg: Option<WgDeviceStatus>,
+    /// The helper's route/DNS overview.
+    pub network_overview: Option<NetworkOverview>,
 }
 
 /// `wgd status`: built entirely from the privileged connection store --
 /// this user's own connections plus every global one (global connections
 /// have no owner to match `Mine`, so it's fetched as a second, disjoint
-/// scope and appended).
-pub fn cmd_status() -> anyhow::Result<()> {
+/// scope and appended). With `json`, prints the whole report, diagnostics
+/// included, as JSON instead of text.
+pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     let report = collect_status(&PrivilegedClient::new())?;
-    print!("{}", render_status(&report));
-    for line in &report.diagnostics {
-        eprintln!("{line}");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_status(&report));
+        for line in &report.diagnostics {
+            eprintln!("{line}");
+        }
     }
     // Stderr only, so stdout stays parseable. `doctor` reports the same
     // condition in its own session agent section instead.
@@ -121,16 +133,15 @@ pub fn collect_status(client: &PrivilegedClient) -> anyhow::Result<StatusReport>
         .iter()
         .filter(|c| c.connected && (is_root || !c.global))
     {
-        let wg_show = match client.wg_show(&conn.interface) {
-            Ok(output) if !output.trim().is_empty() => Some(output.trim_end().to_string()),
-            Ok(_) => None,
+        let wg = match client.wg_show(&conn.interface) {
+            Ok(device) => Some(device),
             Err(e) => {
                 diagnostics.push(format!("wg show {} failed: {}", conn.interface, e));
                 None
             }
         };
         let network_overview = match client.network_overview(&conn.interface) {
-            Ok(overview) => overview.map(|text| text.trim_end().to_string()),
+            Ok(overview) => overview,
             Err(e) => {
                 diagnostics.push(format!(
                     "network overview for {} unavailable: {}",
@@ -140,7 +151,9 @@ pub fn collect_status(client: &PrivilegedClient) -> anyhow::Result<StatusReport>
             }
         };
         details.push(ConnectionDetail {
-            wg_show,
+            connection_id: conn.id,
+            interface: conn.interface.clone(),
+            wg,
             network_overview,
         });
     }
@@ -163,6 +176,17 @@ pub fn collect_status(client: &PrivilegedClient) -> anyhow::Result<StatusReport>
 /// Render the stdout part of `wgd status`. Diagnostics are left to the
 /// caller, which sends them to stderr (`status`) or into its report (`doctor`).
 pub fn render_status(report: &StatusReport) -> String {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    render_status_at(report, now_unix)
+}
+
+/// [`render_status`] with the current time given, so handshake ages are
+/// reproducible.
+fn render_status_at(report: &StatusReport, now_unix: u64) -> String {
+    let ansi = color::enabled();
     let mut out = String::new();
     if report.connections.is_empty() {
         let _ = writeln!(
@@ -172,13 +196,15 @@ pub fn render_status(report: &StatusReport) -> String {
     } else {
         render_connection_table(&report.connections, &mut out);
         for detail in &report.details {
-            if let Some(wg_show) = &detail.wg_show {
+            if let Some(device) = &detail.wg {
                 let _ = writeln!(out);
-                let _ = writeln!(out, "{}", color::wg_show(wg_show));
+                let text = status_render::render_wg_device(device, now_unix);
+                let _ = writeln!(out, "{}", color::wg_show(&text));
             }
             if let Some(overview) = &detail.network_overview {
                 let _ = writeln!(out);
-                let _ = writeln!(out, "{}", color::tables(overview));
+                let text = status_render::render_network_overview(overview, ansi);
+                let _ = writeln!(out, "{}", color::tables(&text));
             }
         }
     }
@@ -294,7 +320,8 @@ fn select_root_status_connections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privileged_api::{ConnectionId, ConnectionStartMode};
+    use crate::privileged_api::ConnectionStartMode;
+    use crate::status_model::{DnsOverview, ResolverState, SystemResolver};
 
     fn sample_conn(name: &str, global: bool, owner_uid: Option<u32>) -> ConnectionSummary {
         ConnectionSummary {
@@ -317,6 +344,39 @@ mod tests {
         }
     }
 
+    fn sample_device(interface: &str) -> WgDeviceStatus {
+        WgDeviceStatus {
+            interface: interface.to_string(),
+            public_key: None,
+            listen_port: None,
+            peers: vec![],
+        }
+    }
+
+    fn sample_overview(interface: &str) -> NetworkOverview {
+        NetworkOverview {
+            interface: interface.to_string(),
+            endpoint: "203.0.113.7".to_string(),
+            endpoint_pin: false,
+            gateway: None,
+            local_subnets: vec![],
+            routes: vec![],
+            dns: DnsOverview {
+                tunnel_servers: vec![],
+                primary_service: None,
+                unreachable: None,
+                dormant: false,
+                services: vec![],
+            },
+            system_resolver: SystemResolver {
+                servers: vec![],
+                state: ResolverState::Unset,
+            },
+            foreign_tunnels: vec![],
+            tailscaled_running: false,
+        }
+    }
+
     #[test]
     fn empty_report_points_at_connection_add() {
         let rendered = render_status(&StatusReport::default());
@@ -331,8 +391,10 @@ mod tests {
         let report = StatusReport {
             connections: vec![sample_conn("office", false, Some(501))],
             details: vec![ConnectionDetail {
-                wg_show: Some("interface: wg-office".to_string()),
-                network_overview: Some("wgd network overview".to_string()),
+                connection_id: ConnectionId::new(),
+                interface: "wg-office".to_string(),
+                wg: Some(sample_device("wg-office")),
+                network_overview: Some(sample_overview("wg-office")),
             }],
             dns_custody: Some(DnsCustodyStatus {
                 pending: vec![crate::privileged_api::DnsCustodyEntry {
@@ -348,12 +410,64 @@ mod tests {
         let rendered = render_status(&report);
 
         let row = rendered.find("| office |").expect("connection row");
-        let wg = rendered.find("wg-office\n\n").expect("wg show block");
+        let wg = rendered
+            .find("interface: wg-office\n")
+            .expect("wg show block");
         let overview = rendered.find("wgd network overview").expect("overview");
         let custody = rendered.find("not restored yet").expect("custody note");
         assert!(row < wg && wg < overview && overview < custody);
         // Diagnostics belong to stderr, never to the rendered stdout.
         assert!(!rendered.contains("boom"));
+    }
+
+    #[test]
+    fn detail_is_rendered_from_the_typed_data_at_the_given_time() {
+        let mut device = sample_device("wg-office");
+        device.peers.push(crate::status_model::WgPeerStatus {
+            public_key: "peerkey=".to_string(),
+            endpoint: None,
+            allowed_ips: vec![],
+            has_preshared_key: false,
+            latest_handshake_unix: Some(1_000),
+            rx_bytes: 0,
+            tx_bytes: 2048,
+            persistent_keepalive_secs: None,
+        });
+        let report = StatusReport {
+            connections: vec![sample_conn("office", false, Some(501))],
+            details: vec![ConnectionDetail {
+                connection_id: ConnectionId::new(),
+                interface: "wg-office".to_string(),
+                wg: Some(device),
+                network_overview: None,
+            }],
+            ..StatusReport::default()
+        };
+        let rendered = render_status_at(&report, 1_130);
+        assert!(rendered.contains("  latest handshake: 2 minutes\n"));
+        assert!(rendered.contains("  transfer: 0 B received, 2.00 KiB sent\n"));
+    }
+
+    #[test]
+    fn report_serializes_with_typed_detail_and_diagnostics() {
+        let report = StatusReport {
+            connections: vec![sample_conn("office", false, Some(501))],
+            details: vec![ConnectionDetail {
+                connection_id: ConnectionId::new(),
+                interface: "wg-office".to_string(),
+                wg: Some(sample_device("wg-office")),
+                network_overview: Some(sample_overview("wg-office")),
+            }],
+            dns_custody: None,
+            diagnostics: vec!["wg show wg-other failed: boom".to_string()],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["details"][0]["wg"]["interface"], "wg-office");
+        assert_eq!(
+            json["details"][0]["network_overview"]["system_resolver"]["state"],
+            "unset"
+        );
+        assert_eq!(json["diagnostics"][0], "wg show wg-other failed: boom");
     }
 
     #[test]

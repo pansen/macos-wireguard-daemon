@@ -20,7 +20,7 @@ const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const GREY: &str = "\x1b[90m";
 
-/// Byte and duration units `format_wg_show` emits. Colored cyan the way
+/// Byte and duration units `status_render::render_wg_device` emits. Colored cyan the way
 /// `wg show` colors them, so the number stays the thing you read first.
 const UNITS: &[&str] = &[
     "B", "KiB", "MiB", "GiB", "TiB", "second", "seconds", "minute", "minutes", "hour", "hours",
@@ -115,7 +115,7 @@ fn split_trailing_punctuation(token: &str) -> (&str, &str) {
 
 /// Grey out the column headers and rules of every table in `text`. A header is
 /// the line directly above a rule of dashes, which is how both the summary
-/// table and the helper's network overview render one.
+/// table and the network overview from `status_render` render one.
 pub fn tables(text: &str) -> String {
     paint_tables(text, enabled())
 }

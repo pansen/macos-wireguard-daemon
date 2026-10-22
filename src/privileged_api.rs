@@ -3,6 +3,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::status_model::{NetworkOverview, WgDeviceStatus};
+
 /// Opaque, randomly generated identity for a stored connection (see
 /// `privileged::connection_store`). Never derived from caller input --
 /// `AddConnection` is the only place one is minted, and interface names are
@@ -349,7 +351,8 @@ pub enum PrivilegedResponse {
     Unit,
     Bool(bool),
     Pid(u32),
-    Text(String),
+    WgDevice(WgDeviceStatus),
+    NetworkOverview(Option<Box<NetworkOverview>>),
     Error { code: String, message: String },
     ConnectionId(ConnectionId),
     Connection(ConnectionSummary),

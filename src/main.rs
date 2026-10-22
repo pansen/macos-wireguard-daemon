@@ -18,6 +18,8 @@ mod reload;
 mod session_agent;
 mod state_file;
 mod status;
+mod status_model;
+mod status_render;
 mod trusted_exec;
 mod userspace_helper;
 mod wireguard;
@@ -79,9 +81,9 @@ fn main() {
             }
         }
         // Status is a quick sync command, no tokio needed.
-        TopCommand::Status { dns } => {
+        TopCommand::Status { dns, json } => {
             init_logging(cli.verbose);
-            let result = status::cmd_status();
+            let result = status::cmd_status(json);
             // Printed even when the daemon is unreachable: live DNS is read
             // straight from `networksetup` and matters most exactly then.
             if dns {
@@ -199,7 +201,10 @@ mod tests {
         assert!(!defaults_to_debug(&TopCommand::Launchd {
             command: LaunchdCommand::Reload(ReloadArgs { silent: true }),
         }));
-        assert!(!defaults_to_debug(&TopCommand::Status { dns: false }));
+        assert!(!defaults_to_debug(&TopCommand::Status {
+            dns: false,
+            json: false
+        }));
     }
 
     #[test]

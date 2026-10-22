@@ -23,6 +23,8 @@ pub mod reload;
 pub mod session_agent;
 pub mod state_file;
 pub mod status;
+pub mod status_model;
+pub mod status_render;
 pub mod trusted_exec;
 
 // WireGuard config parsing shared by the CLI and the privileged daemon.
