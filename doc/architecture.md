@@ -682,4 +682,4 @@ up.
 | How is a connection's identity and store layout defined? | `src/privileged/connection_store.rs` |
 | How does admin authentication work? | `src/privileged/authz.rs` |
 | How does per-user login/logout reconciliation work? | `src/session_agent.rs` |
-| How do routes and DNS stay correct? | `src/userspace_helper.rs` |
+| How do routes and DNS stay correct? | `src/userspace_helper/macos/` |

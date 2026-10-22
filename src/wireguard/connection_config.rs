@@ -3,7 +3,7 @@
 //!
 //! Replaces two previously-duplicated, inconsistent parsers:
 //! `wireguard::config::{WgParsedConfig, WgParsedPeer, parse_config}` (string
-//! typed) and `userspace_helper::{ParsedUserspaceConfig, parse_wg_quick_config}`
+//! typed) and `userspace_helper::config::{ParsedUserspaceConfig, parse_wg_quick_config}`
 //! (byte typed, and buggy: a second `[Peer]` section silently overwrote the
 //! first because peer fields were accumulated in scalars instead of flushed
 //! into a list). Every field is fully typed. Directive keys and section

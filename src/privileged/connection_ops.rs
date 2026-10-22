@@ -80,7 +80,7 @@ fn stale_error() -> AppError {
 /// `stored.fingerprint`. Guards against a parser version change (or on-disk
 /// tampering) making the daemon's stored identity and the text it would
 /// actually execute silently diverge: the helper re-parses `raw_conf` itself
-/// (see `userspace_helper::parse_wg_quick_config`), so if that reparse would
+/// (see `userspace_helper::config::parse_wg_quick_config`), so if that reparse would
 /// now disagree with what this record was fingerprinted as, refuse rather
 /// than run with drifted semantics.
 fn reparse_and_verify(stored: &StoredConnection) -> Result<ConnectionConfig> {
@@ -159,7 +159,7 @@ pub(super) fn connect(
         let _network_lock = lock_system_network_mutation()?;
         // The directory is created at daemon start; re-ensure it here in case
         // someone removed it while the daemon was running, because the helper
-        // never creates it (see `userspace_helper::persist_dns_custody`).
+        // never creates it (see `userspace_helper::macos::dns::persist_dns_custody`).
         crate::config::ensure_dns_custody_dir()?;
         // A crashed predecessor on this interface may have left DNS behind.
         // The daemon's startup sweep normally resolved that already; doing it
