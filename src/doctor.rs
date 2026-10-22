@@ -155,19 +155,18 @@ fn build_report(privileged: bool, caller_in_wgd_group: Option<bool>) -> String {
                 body
             }
             "wgd status" => {
-                let mut body = String::new();
-                let mut diag = String::new();
-                match crate::status::render_status(&mut body, &mut diag) {
-                    Ok(conns) => {
-                        body.push_str(&diag);
-                        connections = Some(conns);
+                let client = crate::privileged_client::PrivilegedClient::new();
+                match crate::status::collect_status(&client) {
+                    Ok(report) => {
+                        let mut body = crate::status::render_status(&report);
+                        for line in &report.diagnostics {
+                            let _ = writeln!(body, "{line}");
+                        }
+                        connections = Some(report.connections);
+                        body
                     }
-                    Err(e) => {
-                        body.push_str(&diag);
-                        let _ = writeln!(body, "wgd status failed: {e:#}");
-                    }
+                    Err(e) => format!("wgd status failed: {e:#}\n"),
                 }
-                body
             }
             "reachability" => reachability_section(connections.as_deref()),
             "launchd log (last 10m)" if privileged => crate::logs::collect_launchd_logs(LOG_LINES),

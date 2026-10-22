@@ -1,35 +1,60 @@
-//! `wgd status` rendering, shared by the `status` command and `wgd doctor`.
+//! `wgd status`, shared by the `status` command and `wgd doctor`.
 //!
-//! The renderers append to a `String` instead of printing so `doctor` can
-//! capture the very same output for its report. Diagnostics that `status`
-//! has always sent to stderr go to a second `String`; `doctor` folds both
-//! into one report.
+//! [`collect_status`] gathers everything from the privileged service into a
+//! [`StatusReport`]; [`render_status`] turns that report into text and does no
+//! I/O of its own. `doctor` uses the same pair, so its report shows exactly
+//! what `status` prints. Fetch failures that `status` has always sent to
+//! stderr travel in [`StatusReport::diagnostics`]; `doctor` folds them into
+//! its report.
 
 use std::fmt::Write;
 
 use crate::color;
 use crate::macos_dns;
-use crate::privileged_api::{ConnectionScope, ConnectionSummary};
+use crate::privileged_api::{ConnectionScope, ConnectionSummary, DnsCustodyStatus};
 use crate::privileged_client::PrivilegedClient;
+
+/// Everything `wgd status` shows, as fetched from the privileged service.
+#[derive(Debug, Clone, Default)]
+pub struct StatusReport {
+    /// This user's connections first, then the global ones.
+    pub connections: Vec<ConnectionSummary>,
+    /// One entry per connected interface the caller may inspect, in the
+    /// order of `connections`.
+    pub details: Vec<ConnectionDetail>,
+    /// `None` when the daemon could not report DNS custody; that only costs
+    /// the custody notes, so it is not a diagnostic.
+    pub dns_custody: Option<DnsCustodyStatus>,
+    /// Best-effort fetches that failed, one line each, for stderr.
+    pub diagnostics: Vec<String>,
+}
+
+/// Live detail of one connected interface. Both parts are best-effort and
+/// `None` when there is nothing to show or the fetch failed.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionDetail {
+    /// `wg show` style tunnel state, without trailing whitespace.
+    pub wg_show: Option<String>,
+    /// The helper's route/DNS overview, without trailing whitespace.
+    pub network_overview: Option<String>,
+}
 
 /// `wgd status`: built entirely from the privileged connection store --
 /// this user's own connections plus every global one (global connections
 /// have no owner to match `Mine`, so it's fetched as a second, disjoint
 /// scope and appended).
 pub fn cmd_status() -> anyhow::Result<()> {
-    let mut out = String::new();
-    let mut diag = String::new();
-    let result = render_status(&mut out, &mut diag);
-    print!("{out}");
-    eprint!("{diag}");
+    let report = collect_status(&PrivilegedClient::new())?;
+    print!("{}", render_status(&report));
+    for line in &report.diagnostics {
+        eprintln!("{line}");
+    }
     // Stderr only, so stdout stays parseable. `doctor` reports the same
     // condition in its own session agent section instead.
-    if let Ok(connections) = &result {
-        if let Some(warning) = session_agent_warning(connections) {
-            eprintln!("{}", color::warning(&warning));
-        }
+    if let Some(warning) = session_agent_warning(&report.connections) {
+        eprintln!("{}", color::warning(&warning));
     }
-    result.map(|_| ())
+    Ok(())
 }
 
 /// Warning for per-user `Automatic` connections of the caller (the `sudo`
@@ -64,14 +89,9 @@ pub fn print_service_dns() {
     eprint!("{diag}");
 }
 
-/// Render the `wgd status` view into `out` (stdout material) and `diag`
-/// (stderr material). Returns the connections it listed so `doctor` can
-/// derive its ping targets without a second round trip.
-pub fn render_status(
-    out: &mut String,
-    diag: &mut String,
-) -> anyhow::Result<Vec<ConnectionSummary>> {
-    let client = PrivilegedClient::new();
+/// Fetch everything `wgd status` shows. Only listing the connections can
+/// fail; the per-interface detail and DNS custody are best-effort.
+pub fn collect_status(client: &PrivilegedClient) -> anyhow::Result<StatusReport> {
     let is_root = nix::unistd::geteuid().is_root();
     let connections = if is_root {
         let all = client.list_connections(ConnectionScope::All)?;
@@ -86,15 +106,89 @@ pub fn render_status(
         connections
     };
 
-    if connections.is_empty() {
+    // Per-connected-interface detail: the WireGuard tunnel state from
+    // `wg show`, and the live route/DNS overview. Both live behind the
+    // privileged service and are best-effort: a fetch failure becomes a
+    // diagnostic but never fails `status`. A non-root caller is denied these
+    // two calls for a *global* connection by the daemon's own
+    // `legacy_interface_access_denied` (global detail is root-only, matching
+    // every other global mutation/read), so skip them here rather than
+    // reporting an `Auth` error for every global connection on every plain
+    // `wgd status` a non-admin user runs.
+    let mut details = Vec::new();
+    let mut diagnostics = Vec::new();
+    for conn in connections
+        .iter()
+        .filter(|c| c.connected && (is_root || !c.global))
+    {
+        let wg_show = match client.wg_show(&conn.interface) {
+            Ok(output) if !output.trim().is_empty() => Some(output.trim_end().to_string()),
+            Ok(_) => None,
+            Err(e) => {
+                diagnostics.push(format!("wg show {} failed: {}", conn.interface, e));
+                None
+            }
+        };
+        let network_overview = match client.network_overview(&conn.interface) {
+            Ok(overview) => overview.map(|text| text.trim_end().to_string()),
+            Err(e) => {
+                diagnostics.push(format!(
+                    "network overview for {} unavailable: {}",
+                    conn.interface, e
+                ));
+                None
+            }
+        };
+        details.push(ConnectionDetail {
+            wg_show,
+            network_overview,
+        });
+    }
+
+    // An older daemon that does not know the request, or a failed call, only
+    // costs the custody notes.
+    let dns_custody = client
+        .list_dns_custody()
+        .inspect_err(|e| tracing::debug!(error = %e, "dns_custody_status_unavailable"))
+        .ok();
+
+    Ok(StatusReport {
+        connections,
+        details,
+        dns_custody,
+        diagnostics,
+    })
+}
+
+/// Render the stdout part of `wgd status`. Diagnostics are left to the
+/// caller, which sends them to stderr (`status`) or into its report (`doctor`).
+pub fn render_status(report: &StatusReport) -> String {
+    let mut out = String::new();
+    if report.connections.is_empty() {
         let _ = writeln!(
             out,
             "No stored connections. Add one with: wgd connection add --file <path>"
         );
-        render_dns_custody_notes(&client, out);
-        return Ok(connections);
+    } else {
+        render_connection_table(&report.connections, &mut out);
+        for detail in &report.details {
+            if let Some(wg_show) = &detail.wg_show {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{}", color::wg_show(wg_show));
+            }
+            if let Some(overview) = &detail.network_overview {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{}", color::tables(overview));
+            }
+        }
     }
+    if let Some(custody) = &report.dns_custody {
+        render_dns_custody_notes(custody, &mut out);
+    }
+    out
+}
 
+fn render_connection_table(connections: &[ConnectionSummary], out: &mut String) {
     let headers = ["Id", "Name", "Global", "Mode", "Connected", "Interface"];
     let rows: Vec<[String; 6]> = connections
         .iter()
@@ -143,49 +237,6 @@ pub fn render_status(
     for row in &rows {
         let _ = writeln!(out, "{}", render_row(row).trim_end());
     }
-
-    // Beneath the summary table, print per-connected-interface detail: the
-    // WireGuard tunnel state from `wg show`, and the live route/DNS overview.
-    // Both live behind the privileged service and are best-effort: a fetch
-    // failure goes to `diag` but never fails `status`. A non-root caller
-    // is denied these two calls for a *global* connection by the daemon's
-    // own `legacy_interface_access_denied` (global detail is root-only,
-    // matching every other global mutation/read), so skip them here rather
-    // than printing an `Auth` error for every global connection on
-    // every plain `wgd status` a non-admin user runs.
-    for conn in connections
-        .iter()
-        .filter(|c| c.connected && (is_root || !c.global))
-    {
-        match client.wg_show(&conn.interface) {
-            Ok(output) if !output.trim().is_empty() => {
-                let _ = writeln!(out);
-                let _ = writeln!(out, "{}", color::wg_show(output.trim_end()));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let _ = writeln!(diag, "wg show {} failed: {}", conn.interface, e);
-            }
-        }
-
-        match client.network_overview(&conn.interface) {
-            Ok(Some(overview)) => {
-                let _ = writeln!(out);
-                let _ = writeln!(out, "{}", color::tables(overview.trim_end()));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = writeln!(
-                    diag,
-                    "network overview for {} unavailable: {}",
-                    conn.interface, e
-                );
-            }
-        }
-    }
-
-    render_dns_custody_notes(&client, out);
-    Ok(connections)
 }
 
 /// The live DNS servers of every macOS network service, one per line.
@@ -208,21 +259,14 @@ pub fn render_service_dns(out: &mut String, diag: &mut String) {
     }
 }
 
-/// DNS custody state that is not normal; a healthy system renders
-/// nothing. Best-effort like the per-interface detail above: an older daemon
-/// that does not know the request, or a failed call, only costs these lines.
-fn render_dns_custody_notes(client: &PrivilegedClient, out: &mut String) {
-    match client.list_dns_custody() {
-        Ok(status) => {
-            let lines = crate::connection_cli::format_dns_custody_notes(&status);
-            if !lines.is_empty() {
-                let _ = writeln!(out);
-                for line in lines {
-                    let _ = writeln!(out, "{line}");
-                }
-            }
+/// DNS custody state that is not normal; a healthy system renders nothing.
+fn render_dns_custody_notes(custody: &DnsCustodyStatus, out: &mut String) {
+    let lines = crate::connection_cli::format_dns_custody_notes(custody);
+    if !lines.is_empty() {
+        let _ = writeln!(out);
+        for line in lines {
+            let _ = writeln!(out, "{line}");
         }
-        Err(e) => tracing::debug!(error = %e, "dns_custody_status_unavailable"),
     }
 }
 
@@ -271,6 +315,45 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn empty_report_points_at_connection_add() {
+        let rendered = render_status(&StatusReport::default());
+        assert_eq!(
+            rendered,
+            "No stored connections. Add one with: wgd connection add --file <path>\n"
+        );
+    }
+
+    #[test]
+    fn report_renders_table_then_detail_per_interface_then_custody_notes() {
+        let report = StatusReport {
+            connections: vec![sample_conn("office", false, Some(501))],
+            details: vec![ConnectionDetail {
+                wg_show: Some("interface: wg-office".to_string()),
+                network_overview: Some("wgd network overview".to_string()),
+            }],
+            dns_custody: Some(DnsCustodyStatus {
+                pending: vec![crate::privileged_api::DnsCustodyEntry {
+                    id: None,
+                    interface: "wg-office".to_string(),
+                    name: None,
+                    services: vec!["Wi-Fi".to_string()],
+                }],
+                ..DnsCustodyStatus::default()
+            }),
+            diagnostics: vec!["wg show wg-other failed: boom".to_string()],
+        };
+        let rendered = render_status(&report);
+
+        let row = rendered.find("| office |").expect("connection row");
+        let wg = rendered.find("wg-office\n\n").expect("wg show block");
+        let overview = rendered.find("wgd network overview").expect("overview");
+        let custody = rendered.find("not restored yet").expect("custody note");
+        assert!(row < wg && wg < overview && overview < custody);
+        // Diagnostics belong to stderr, never to the rendered stdout.
+        assert!(!rendered.contains("boom"));
     }
 
     #[test]
