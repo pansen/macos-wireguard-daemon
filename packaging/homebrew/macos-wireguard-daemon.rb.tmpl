@@ -8,6 +8,8 @@ cask "macos-wireguard-daemon" do
   homepage "https://github.com/pansen/macos-wireguard-daemon"
 
   depends_on arch: :arm64
+  # WgdBar.app needs macOS 14 (LSMinimumSystemVersion).
+  depends_on macos: ">= :sonoma"
 
   installer script: {
     executable: "wgd",
@@ -15,13 +17,19 @@ cask "macos-wireguard-daemon" do
     sudo:       true,
   }
   binary "wgd", target: "wgd"
+  # Menu bar status. Only a client of the daemon: quitting or removing it
+  # leaves the daemon and the tunnels running.
+  app "WgdBar.app"
 
-  uninstall script: {
-    executable:   "/usr/local/bin/wgd",
-    args:         ["launchd", "uninstall"],
-    sudo:         true,
-    must_succeed: false,
-  }
+  # `quit` runs on upgrade too, so the old app is not left running from a
+  # bundle that has just been replaced.
+  uninstall quit:   "me.pansen.wgd.bar",
+            script: {
+              executable:   "/usr/local/bin/wgd",
+              args:         ["launchd", "uninstall"],
+              sudo:         true,
+              must_succeed: false,
+            }
 
   # `launchd purge` also restores DNS a crashed helper left behind and
   # removes the authorization right and the session agent, which a plain
@@ -37,6 +45,10 @@ cask "macos-wireguard-daemon" do
         "/Library/Application Support/wgd",
         "/usr/local/bin/wgd",
         "/var/log/wgd",
+      ],
+      trash:  [
+        "~/Library/Preferences/me.pansen.wgd.bar.plist",
+        "~/Library/Saved Application State/me.pansen.wgd.bar.savedState",
       ]
 
   caveats <<~EOS
@@ -51,6 +63,10 @@ cask "macos-wireguard-daemon" do
     run from):
       sudo /usr/local/bin/wgd launchd restart
       sudo /usr/local/bin/wgd launchd uninstall
+
+    WgdBar.app in /Applications shows the tunnel state in the menu bar.
+    Start it once; "Open at login" in its menu keeps it running across
+    logins. `brew upgrade` quits it, so start it again afterwards.
 
     Remove everything, including the wgd group and logs, with:
       brew uninstall --zap macos-wireguard-daemon

@@ -6,7 +6,7 @@
 
 use crate::status_model::{
     DnsOverview, DnsServiceStatus, ForeignTunnelRow, IpFamily, LiveRoute, NetworkOverview,
-    ResolverState, RouteOutcome, RouteRow, RouteVia, WgDeviceStatus,
+    ResolverState, RouteOutcome, RouteRow, RouteVia, TunnelDnsState, WgDeviceStatus,
 };
 use crate::ui::{Component, KeyValue, Line, Note, RenderCtx, Role, Span, Table};
 
@@ -300,32 +300,13 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
 /// unless a service actually resolves through them.
 fn tunnel_dns_table(dns: &DnsOverview) -> Table {
     let mut table = Table::new(&["Tunnel DNS", "Status"]);
-    if dns.tunnel_servers.is_empty() {
+    let state = dns.tunnel_dns_state();
+    if state == TunnelDnsState::NoServers {
         table.muted_row(cells(strs(&["none", "the tunnel sets no DNS"])));
         return table;
     }
-    let primary = dns
-        .primary_service
-        .as_deref()
-        .unwrap_or("the primary service");
-    let applied = dns.services.iter().any(|row| {
-        matches!(
-            row.status,
-            DnsServiceStatus::TunnelDnsActive | DnsServiceStatus::AlreadyTunnelDns
-        )
-    });
-    let (status, active) = match &dns.unreachable {
-        Some(collision) => (
-            format!(
-                "pulled back: {} is inside local LAN {}",
-                collision.server, collision.local_subnet
-            ),
-            false,
-        ),
-        None if dns.dormant => ("held: no primary network service".to_string(), false),
-        None if applied => (format!("active via {primary}"), true),
-        None => (format!("pending: not applied to {primary} yet"), false),
-    };
+    let status = tunnel_dns_status(dns, &state);
+    let active = state == TunnelDnsState::Active;
     for server in &dns.tunnel_servers {
         let row_cells = cells(vec![server.clone(), status.clone()]);
         if active {
@@ -335,6 +316,24 @@ fn tunnel_dns_table(dns: &DnsOverview) -> Table {
         }
     }
     table
+}
+
+/// The "Status" cell of the tunnel DNS table, also shown by the menu bar.
+pub fn tunnel_dns_status(dns: &DnsOverview, state: &TunnelDnsState) -> String {
+    let primary = dns
+        .primary_service
+        .as_deref()
+        .unwrap_or("the primary service");
+    match state {
+        TunnelDnsState::NoServers => "the tunnel sets no DNS".to_string(),
+        TunnelDnsState::PulledBack(collision) => format!(
+            "pulled back: {} is inside local LAN {}",
+            collision.server, collision.local_subnet
+        ),
+        TunnelDnsState::Held => "held: no primary network service".to_string(),
+        TunnelDnsState::Active => format!("active via {primary}"),
+        TunnelDnsState::Pending => format!("pending: not applied to {primary} yet"),
+    }
 }
 
 /// DNS rows, muted when not in effect: the whole block when it is dormant,

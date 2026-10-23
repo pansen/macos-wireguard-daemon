@@ -120,3 +120,8 @@ check:
 	@# Same report a Homebrew user attaches to a bug report, redacted.
 	mkdir -p target
 	$(WGD) doctor --report target/$$(date +%Y-%m-%d_%H-%M.%s)_check.log
+
+.PHONY: bar
+bar:
+	@# Menu bar app (Swift UI over the Rust core); output target/WgdBar.app.
+	$(MAKE) -C macos/WgdBar

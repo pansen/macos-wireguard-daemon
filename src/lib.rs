@@ -18,6 +18,8 @@ pub mod launchd;
 pub mod logging;
 pub mod logs;
 pub mod macos_dns;
+// State for the menu bar app, exported to Swift by `crates/wgd-bar-ffi`.
+pub mod menu_bar;
 pub mod reload;
 pub mod session_agent;
 pub mod state_file;

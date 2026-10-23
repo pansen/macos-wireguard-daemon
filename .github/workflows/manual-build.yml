@@ -101,6 +101,31 @@ jobs:
             --sign "Developer ID Application" "${binary}"
           codesign --verify --strict --verbose=2 "${binary}"
 
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The menu bar app uses macOS 26 APIs behind `#available`, which
+          # only compile against the macOS 26 SDK (Xcode 26 or newer). The
+          # runner image's default Xcode may be older, so pick the newest
+          # installed one and fail clearly if none is recent enough.
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
+          major="$(basename "${xcode}" .app | sed -E 's/^Xcode_([0-9]+).*/\1/')"
+          if [ "${major}" -lt 26 ]; then
+            echo "::error::need Xcode 26 or newer for the menu bar app, newest installed is ${xcode}"
+            exit 1
+          fi
+          sudo xcode-select -s "${xcode}"
+          xcodebuild -version
+
+      - name: Build and sign menu bar app
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          make -C macos/WgdBar app VERSION="${version#v}" \
+            SIGN_IDENTITY="Developer ID Application"
+
       - name: Package artifact
         shell: bash
         run: |
@@ -113,9 +138,13 @@ jobs:
           mkdir -p dist "${asset_base}" dmg-root
           cp "target/${{ matrix.target }}/release/${APP_NAME}" "${asset_base}/"
           cp "target/${{ matrix.target }}/release/${APP_NAME}" dmg-root/
+          # ditto keeps the bundle's signature and extended attributes intact.
+          ditto target/WgdBar.app dmg-root/WgdBar.app
+          # The tar.gz stays the plain CLI download, without the app.
           tar -czf "dist/${asset_base}.tar.gz" "${asset_base}"
-          # The DMG carries the binary at the volume root; the cask's
-          # `binary "wgd"` stanza depends on that layout.
+          # The DMG carries the binary and WgdBar.app at the volume root; the
+          # cask's `binary "wgd"` and `app "WgdBar.app"` stanzas depend on
+          # that layout. Notarizing the DMG covers the app inside it.
           hdiutil create -volname "${APP_NAME}" -srcfolder dmg-root \
             -ov -format UDZO "dist/${asset_base}.dmg"
           codesign --force --timestamp \

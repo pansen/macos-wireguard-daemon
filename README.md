@@ -45,6 +45,11 @@ This installs `wgd` on your PATH and registers the privileged launchd
 daemon, prompting for your password once (via `sudo`). `brew upgrade` prompts
 again on every new release, to reinstall the daemon from the upgraded binary.
 
+The cask also installs `WgdBar.app` into `/Applications`, a menu bar icon
+that shows whether the tunnel and its DNS are in effect. It is only a client
+of the daemon: quitting it leaves the tunnels running. "Open at login" in its
+menu is off by default.
+
 The release DMG is signed with a Developer ID certificate, notarized, and
 stapled, so Gatekeeper accepts it without a quarantine workaround. Binaries
 you build from source are not signed or notarized.

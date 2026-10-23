@@ -129,6 +129,48 @@ pub struct DnsOverview {
     pub services: Vec<DnsServiceRow>,
 }
 
+/// What became of a tunnel's DNS servers: the verdict of the "Tunnel DNS"
+/// table in `wgd status`, and what the menu bar icon shows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TunnelDnsState {
+    /// The tunnel sets no DNS servers.
+    NoServers,
+    /// A service resolves through the tunnel DNS.
+    Active,
+    /// A tunnel DNS server sits inside a directly connected LAN, so the
+    /// reconciler took tunnel DNS off every service.
+    PulledBack(DnsCollision),
+    /// No primary network service to put tunnel DNS on.
+    Held,
+    /// Not applied to the primary service yet.
+    Pending,
+}
+
+impl DnsOverview {
+    pub fn tunnel_dns_state(&self) -> TunnelDnsState {
+        if self.tunnel_servers.is_empty() {
+            return TunnelDnsState::NoServers;
+        }
+        if let Some(collision) = &self.unreachable {
+            return TunnelDnsState::PulledBack(collision.clone());
+        }
+        if self.dormant {
+            return TunnelDnsState::Held;
+        }
+        let applied = self.services.iter().any(|row| {
+            matches!(
+                row.status,
+                DnsServiceStatus::TunnelDnsActive | DnsServiceStatus::AlreadyTunnelDns
+            )
+        });
+        if applied {
+            TunnelDnsState::Active
+        } else {
+            TunnelDnsState::Pending
+        }
+    }
+}
+
 /// A tunnel DNS server that sits inside a directly connected LAN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DnsCollision {

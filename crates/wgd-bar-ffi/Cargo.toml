@@ -1,0 +1,21 @@
+[package]
+name = "wgd-bar-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Swift bindings for the wgd menu bar app (macos/WgdBar)"
+
+[lib]
+name = "wgd_bar_ffi"
+# Static only: the app links it, and a cdylib next to it would make the
+# linker's `-lwgd_bar_ffi` pick the dylib instead.
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+# Generates the Swift sources, header and modulemap from the built library.
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+
+[dependencies]
+wgd = { path = "../.." }
+uniffi = { version = "0.32", features = ["cli"] }
