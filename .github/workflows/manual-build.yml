@@ -145,8 +145,18 @@ jobs:
           # The DMG carries the binary and WgdBar.app at the volume root; the
           # cask's `binary "wgd"` and `app "WgdBar.app"` stanzas depend on
           # that layout. Notarizing the DMG covers the app inside it.
-          hdiutil create -volname "${APP_NAME}" -srcfolder dmg-root \
-            -ov -format UDZO "dist/${asset_base}.dmg"
+          # On hosted runners hdiutil intermittently fails with "Resource
+          # busy" while XProtect or Spotlight hold the fresh image, so retry.
+          for attempt in 1 2 3 4 5; do
+            hdiutil create -volname "${APP_NAME}" -srcfolder dmg-root \
+              -ov -format UDZO "dist/${asset_base}.dmg" && break
+            if [[ $attempt == 5 ]]; then
+              echo "::error::hdiutil create failed after ${attempt} attempts"
+              exit 1
+            fi
+            echo "hdiutil create failed (attempt ${attempt}), retrying"
+            sleep $((attempt * 5))
+          done
           codesign --force --timestamp \
             --sign "Developer ID Application" "dist/${asset_base}.dmg"
 
