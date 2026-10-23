@@ -9,17 +9,17 @@ cask "macos-wireguard-daemon" do
 
   depends_on arch: :arm64
   # WgdBar.app needs macOS 14 (LSMinimumSystemVersion).
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
+  # Menu bar status. Only a client of the daemon: quitting or removing it
+  # leaves the daemon and the tunnels running.
+  app "WgdBar.app"
   installer script: {
     executable: "wgd",
     args:       ["launchd", "install"],
     sudo:       true,
   }
   binary "wgd", target: "wgd"
-  # Menu bar status. Only a client of the daemon: quitting or removing it
-  # leaves the daemon and the tunnels running.
-  app "WgdBar.app"
 
   # `quit` runs on upgrade too, so the old app is not left running from a
   # bundle that has just been replaced.
