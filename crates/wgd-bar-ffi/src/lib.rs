@@ -41,6 +41,13 @@ pub fn snapshot() -> Snapshot {
     menu_bar::snapshot().into()
 }
 
+/// The Darwin notification name daemon and helper post on status changes
+/// (see `wgd::status_notify`).
+#[uniffi::export]
+pub fn status_notification_name() -> String {
+    wgd::status_notify::NAME.to_string_lossy().into_owned()
+}
+
 impl From<menu_bar::Overall> for Overall {
     fn from(state: menu_bar::Overall) -> Self {
         match state {

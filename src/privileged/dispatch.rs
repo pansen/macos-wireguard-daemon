@@ -9,6 +9,7 @@ use super::authz;
 use super::commands::{run_network_overview, run_wg_show};
 use super::connection_store::{self, StoredConnection};
 use super::ControlState;
+use crate::status_notify::{self, Trigger};
 use crate::wireguard::connection_config;
 use tracing::debug;
 
@@ -149,17 +150,25 @@ pub(super) fn dispatch(
             force,
             source_path,
             auth_external_form,
-        } => DispatchOutcome::Immediate(handle_add_connection(
-            origin,
-            conf_text,
-            global,
-            start_mode,
-            name,
-            mtu_override,
-            force,
-            source_path,
-            auth_external_form,
-        )),
+        } => {
+            let response = handle_add_connection(
+                origin,
+                conf_text,
+                global,
+                start_mode,
+                name,
+                mtu_override,
+                force,
+                source_path,
+                auth_external_form,
+            );
+            // Also for an identical resubmission that only returned the
+            // existing id: harmless, one extra fetch for the app.
+            if let PrivilegedResponse::ConnectionId(id) = response {
+                status_notify::post(Trigger::Added { id });
+            }
+            DispatchOutcome::Immediate(response)
+        }
 
         PrivilegedRequest::RefreshConnection {
             id,
@@ -171,7 +180,13 @@ pub(super) fn dispatch(
         PrivilegedRequest::RemoveConnection {
             id,
             auth_external_form,
-        } => DispatchOutcome::Immediate(handle_remove_connection(origin, id, auth_external_form)),
+        } => {
+            let response = handle_remove_connection(origin, id, auth_external_form);
+            if !matches!(response, PrivilegedResponse::Error { .. }) {
+                status_notify::post(Trigger::Removed { id });
+            }
+            DispatchOutcome::Immediate(response)
+        }
 
         PrivilegedRequest::ConnectConnection { id, debug, reason } => {
             handle_connect_connection(origin, id, debug, reason)

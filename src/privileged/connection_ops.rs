@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::error::{AppError, Result};
 use crate::privileged_api::ConnectionId;
+use crate::status_notify::Trigger;
 use crate::wireguard::connection_config::{self, ConnectionConfig};
 
 use super::connection_store::{self, ActiveConnectionState, ConnectionLock, StoredConnection};
@@ -222,6 +223,10 @@ pub(super) fn connect(
         },
     )?;
     debug!(id = %id, interface = %stored.interface, "connection_connected");
+    crate::status_notify::post(Trigger::Connected {
+        id,
+        interface: &stored.interface,
+    });
     Ok(())
 }
 
@@ -252,6 +257,10 @@ pub(super) fn disconnect(conn_lock: &ConnectionLock, id: ConnectionId) -> Result
 
     connection_store::clear_active(conn_lock, id)?;
     debug!(id = %id, interface = %stored.interface, "connection_disconnected");
+    crate::status_notify::post(Trigger::Disconnected {
+        id,
+        interface: &stored.interface,
+    });
     Ok(())
 }
 

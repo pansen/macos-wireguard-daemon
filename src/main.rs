@@ -18,6 +18,7 @@ mod session_agent;
 mod state_file;
 mod status;
 mod status_model;
+mod status_notify;
 mod status_render;
 mod trusted_exec;
 mod ui;

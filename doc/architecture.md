@@ -641,6 +641,23 @@ since the daemon correctly denies those legacy calls to non-owners. Both
 detail fetches are best-effort regardless: a failure prints to stderr and
 never makes `status` fail.
 
+The menu bar app (`macos/WgdBar`) shows the same data through
+`menu_bar::snapshot`, which calls `collect_status`. It does not poll on a
+short interval. Daemon and helper post the Darwin notification
+`me.pansen.wgd.status-changed` (`src/status_notify.rs`) and the app fetches
+once per ping, debounced by 250 ms:
+
+- the daemon posts after a connect or disconnect in `connection_ops` (which
+  covers boot and session reconciliation too), after a successful Add or
+  Remove, and when `dns_watch` sees a helper exit;
+- the helper posts when a reconcile pass changed routes or DNS.
+
+The notification carries no data and is not authenticated; a forged ping
+costs one extra fetch over the authenticated socket. A 30-second fallback
+poll covers lost pings and a daemon that is not running. Because the app
+holds no connection between fetches, it does not keep the daemon from idling
+out.
+
 ## Installation and lifecycle
 
 ```mermaid

@@ -25,6 +25,7 @@ pub mod session_agent;
 pub mod state_file;
 pub mod status;
 pub mod status_model;
+pub mod status_notify;
 pub mod status_render;
 pub mod trusted_exec;
 pub mod ui;

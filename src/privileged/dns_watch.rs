@@ -274,6 +274,11 @@ fn handle_exit(pid: u32, helper: WatchedHelper) {
     {
         std::thread::sleep(Duration::from_millis(100));
     }
+    // A crashed helper takes its tunnel down without any disconnect.
+    crate::status_notify::post(crate::status_notify::Trigger::HelperExited {
+        interface: &helper.interface,
+        pid,
+    });
     let recorded = crate::dns_custody::record_path(&helper.interface)
         .map(|path| path.exists())
         .unwrap_or(false);

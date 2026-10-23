@@ -443,12 +443,19 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                         next_reconcile_at = std::time::Instant::now() + MACOS_RECONCILE_INTERVAL;
                         if let CleanupState::Macos(state) = &running.cleanup {
                             let state = std::sync::Arc::clone(state);
+                            let interface = running.control_interface_name.clone();
                             run_macos_maintenance("reconcile", move || {
                                 let routes_changed = macos_reconcile_routes(&state);
                                 let dns_changed = macos_reconcile_dns(&state);
                                 if routes_changed || dns_changed {
                                     log_macos_network_diagnostics("after_reconcile", &state.reconcile);
                                     log_macos_network_overview("reconcile", &state);
+                                    // E.g. tunnel DNS pulled back after joining a LAN.
+                                    crate::status_notify::post(crate::status_notify::Trigger::Reconciled {
+                                        interface: &interface,
+                                        routes_changed,
+                                        dns_changed,
+                                    });
                                 }
                             })
                             .await?;
