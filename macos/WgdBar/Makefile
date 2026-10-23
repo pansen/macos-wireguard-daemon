@@ -48,6 +48,7 @@ bindings: rust
 		--module-name wgd_bar_ffiFFI --modulemap-filename module.modulemap \
 		$(LIB) $(GEN)
 	cp $(GEN)/wgd_bar_ffi.swift Sources/WgdBar/Generated.swift
+	mkdir -p Sources/wgd_bar_ffiFFI
 	cp $(GEN)/wgd_bar_ffiFFI.h $(GEN)/module.modulemap Sources/wgd_bar_ffiFFI/
 
 .PHONY: swift
