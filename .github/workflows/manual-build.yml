@@ -120,6 +120,9 @@ jobs:
 
       - name: Build and sign menu bar app
         shell: bash
+        env:
+          # Same label as the CLI build above; the Makefile adds the commit.
+          WGD_GIT_TAG: ${{ inputs.version }}
         run: |
           set -euo pipefail
           version="${{ inputs.version }}"

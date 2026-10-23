@@ -9,6 +9,8 @@ import notify
 final class StatusModel {
     private(set) var snapshot: Snapshot?
     private(set) var updatedAt: Date?
+    /// `v0.1.5 bd3e6659`, as `wgd --version` prints it.
+    let buildLabel = WgdBar.buildLabel()
 
     /// Covers lost notifications and a daemon that is not running at all
     /// (then nobody posts).

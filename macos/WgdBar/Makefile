@@ -19,6 +19,11 @@ else
 CODESIGN_FLAGS := --timestamp --options runtime
 endif
 
+# Read by build.rs for the label the flyout shows, as in the CLI's release
+# build. CI sets WGD_GIT_TAG itself; locally it is the latest tag.
+export WGD_GIT_TAG ?= $(shell git describe --tags --abbrev=0 2>/dev/null)
+export WGD_GIT_COMMIT ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null)
+
 # Must match `platforms` in Package.swift and LSMinimumSystemVersion.
 export MACOSX_DEPLOYMENT_TARGET := 14.0
 

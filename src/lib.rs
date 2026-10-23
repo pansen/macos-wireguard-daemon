@@ -3,6 +3,10 @@
 // Exports the modules shared between the `wgd` binary and any library
 // consumers. This build targets macOS only.
 
+/// `v0.1.5 bd3e6659` in release builds, the crate version otherwise (see
+/// `build.rs`). The menu bar app shows it through `wgd-bar-ffi`.
+pub const BUILD_LABEL: &str = env!("WGD_BUILD_LABEL");
+
 // Provider-agnostic infrastructure
 pub mod cli;
 pub mod completion;

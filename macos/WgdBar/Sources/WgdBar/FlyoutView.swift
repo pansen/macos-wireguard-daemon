@@ -11,19 +11,29 @@ struct FlyoutView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 12) {
-                header
-                if let error = model.snapshot?.error {
-                    Text(error)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 12) {
+                    header
+                    if let error = model.snapshot?.error {
+                        Text(error)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    ForEach(model.snapshot?.connections ?? [], id: \.interface) { line in
+                        ConnectionRow(line: line)
+                    }
                 }
-                ForEach(model.snapshot?.connections ?? [], id: \.interface) { line in
-                    ConnectionRow(line: line)
-                }
+                // Styled like "Updated … ago", close under the last row.
+                Text(model.buildLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
-            .padding(14)
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 8)
             // Edge to edge, outside the content padding.
             Divider()
             footer

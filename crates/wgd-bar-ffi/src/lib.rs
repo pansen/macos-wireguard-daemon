@@ -41,6 +41,12 @@ pub fn snapshot() -> Snapshot {
     menu_bar::snapshot().into()
 }
 
+/// Same label `wgd --version` prints, from the build this app was linked in.
+#[uniffi::export]
+pub fn build_label() -> String {
+    wgd::BUILD_LABEL.to_string()
+}
+
 /// The Darwin notification name daemon and helper post on status changes
 /// (see `wgd::status_notify`).
 #[uniffi::export]
