@@ -3,6 +3,8 @@
 `wgd` is a command-line WireGuard VPN client for macOS, written in Rust,
 built around a privileged, multi-connection store.
 
+![Flyout](doc/flyout_preview.png)
+
 ## Why
 
 Install once, forget about it.
