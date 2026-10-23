@@ -120,14 +120,7 @@ private final class FlyoutPanel: NSPanel {
         animationBehavior = .utilityWindow
         isReleasedWhenClosed = false
 
-        let background = NSVisualEffectView()
-        background.material = .menu
-        background.blendingMode = .behindWindow
-        background.state = .active
-        // The material renders in its own backdrop layer, which ignores
-        // `layer.cornerRadius` and leaves square corners behind; a mask
-        // image is what actually clips it.
-        background.maskImage = Self.roundedMask(radius: FlyoutStyle.cornerRadius)
+        let background = FlyoutBackgroundView()
 
         let hosting = NSHostingView(rootView: rootView.onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
             self?.resize(to: size)
@@ -142,19 +135,6 @@ private final class FlyoutPanel: NSPanel {
         ])
         contentView = background
         resize(to: hosting.fittingSize)
-    }
-
-    /// Stretchable rounded rectangle: only the corners keep their shape.
-    private static func roundedMask(radius: CGFloat) -> NSImage {
-        let edge = 2 * radius + 1
-        let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
-            NSColor.black.setFill()
-            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
-            return true
-        }
-        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
-        image.resizingMode = .stretch
-        return image
     }
 
     // Lets Escape and the buttons work without activating the app.
@@ -187,5 +167,44 @@ private final class FlyoutPanel: NSPanel {
         // The shadow follows the rounded content only once recomputed.
         invalidateShadow()
         onSizeChange?()
+    }
+}
+
+/// Opaque, nearly white like the system menus and Stats (`#FAFAFA` in light
+/// mode). The `.menu` material came out a noticeably darker grey. A plain
+/// layer also rounds cleanly with `cornerRadius`, unlike a visual effect
+/// view's backdrop.
+private final class FlyoutBackgroundView: NSView {
+    private static let fill = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 0.16, alpha: 1)
+            : NSColor(white: 0.98, alpha: 1)
+    }
+    private static let border = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 1, alpha: 0.12)
+            : NSColor(white: 0, alpha: 0.12)
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = FlyoutStyle.cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = 0.5
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    // Called again on every light/dark switch; CGColors don't follow the
+    // appearance by themselves.
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = Self.fill.cgColor
+            layer?.borderColor = Self.border.cgColor
+        }
     }
 }
