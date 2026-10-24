@@ -207,11 +207,21 @@ pub(super) fn macos_route_destination(route: &MacosRoute) -> Option<(IpAddr, u8)
 ///
 /// `route get` answers with whatever route wins the lookup for an address, so
 /// the reply is only an exact match when its own destination and mask match the
-/// prefix we asked about.
+/// prefix we asked about. A network query carries its prefix: given a bare
+/// network address, `route` infers a classful mask (`128.0.0.0` becomes a /16,
+/// `0.0.0.0` the default route) and never finds a /1 split-default half. Host
+/// queries stay bare, since a `/32` asks for a masked net entry and misses the
+/// mask-less host routes the endpoint pin installs.
 pub(super) fn macos_route_table_entry(destination: (IpAddr, u8)) -> Option<MacosRouteEntry> {
     let (ip, prefix) = destination;
     let is_ipv6 = ip.is_ipv6();
-    let base = macos_network_base(ip, prefix).to_string();
+    let network = macos_network_base(ip, prefix);
+    let host_prefix = if is_ipv6 { 128 } else { 32 };
+    let base = if prefix == host_prefix {
+        network.to_string()
+    } else {
+        format!("{network}/{prefix}")
+    };
     let mut args: Vec<&str> = vec!["-n", "get"];
     if is_ipv6 {
         args.push("-inet6");
@@ -252,9 +262,19 @@ pub(super) fn parse_macos_route_get(text: &str, is_ipv6: bool) -> Option<MacosRo
             stats_mtu_column = trimmed.split_whitespace().position(|name| name == "mtu");
         }
     }
-    // A default route reports "default" rather than an address; it never is the
-    // exact entry for a prefix we install, so failing to parse is the answer.
-    let destination: IpAddr = destination?.parse().ok()?;
+    // `route` prints the unspecified address as "default". With a default mask
+    // that is the default route, never the exact entry for a prefix we install;
+    // with a real mask it is a prefix such as the 0.0.0.0/1 split-default half.
+    let destination: IpAddr = match destination?.as_str() {
+        "default" if mask.as_deref().is_some_and(|mask| mask != "default") => {
+            if is_ipv6 {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            }
+        }
+        value => value.parse().ok()?,
+    };
     let prefix = match mask.as_deref() {
         // Host routes come back without a mask line.
         None => {
@@ -485,6 +505,23 @@ mod tests {
                            gateway: 192.168.168.1\n\
                          interface: en0\n";
         assert_eq!(parse_macos_route_get(covered, false), None);
+
+        // The lower split-default half: the unspecified address prints as
+        // "default", but the mask says it is the /1, not the default route.
+        let lower_half = "   route to: default\n\
+                          destination: default\n\
+                                 mask: 128.0.0.0\n\
+                            interface: utun4\n";
+        let entry = parse_macos_route_get(lower_half, false).expect("parsed");
+        assert_eq!(entry.destination, subnet("0.0.0.0/1"));
+        assert!(entry.is_tunnel_owned());
+
+        let upper_half = "   route to: 128.0.0.0\n\
+                          destination: 128.0.0.0\n\
+                                 mask: 128.0.0.0\n\
+                            interface: utun4\n";
+        let entry = parse_macos_route_get(upper_half, false).expect("parsed");
+        assert_eq!(entry.destination, subnet("128.0.0.0/1"));
 
         // A host route comes back without a mask line.
         let host = "   route to: 100.64.1.1\n\
