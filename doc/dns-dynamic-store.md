@@ -337,6 +337,11 @@ of a `scutil` co-process:
   mDNSResponder cache flushed.
 - The notification watch republished a key removed with `scutil` within 1 s
   (`trigger=notification`).
+- Reboot with a connection in active mode: nothing to repair at boot (the
+  first sweep reported `restored=0`, `dns-custody/` stayed empty, Wi-Fi had no
+  DNS set), and the session agent brought the tunnel back up in active mode.
+  The same reboot from shadow mode needed the custody sweep
+  (`privileged_dns_custody_restored`, about 16 s after boot).
 - Chrome, 6, 7 and 8 are open (see "Open questions").
 
 ## Rollout
