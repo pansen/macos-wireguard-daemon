@@ -60,8 +60,10 @@
         </dict>
     </dict>
 
-    <!-- `ExitTimeOut` is intentionally omitted to use launchd's 5s default;
-         please see: issues/shutdown-teardown.md. -->
+    <!-- No `ExitTimeOut`: launchd's default is 5s (`launchctl print` shows
+         `exit timeout = 5`), and the daemon installs no SIGTERM handler, so it
+         exits at once anyway. A future SIGTERM teardown has to fit into
+         these 5s too; see issues/shutdown-teardown.md, item 3. -->
 
     <key>StandardOutPath</key>
     <string>/var/log/wgd/privileged.out.log</string>

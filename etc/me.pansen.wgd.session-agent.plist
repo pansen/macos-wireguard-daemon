@@ -9,7 +9,7 @@
     <!-- `launchd agent run` is long-lived: it reconciles this user's
          Automatic connections on start, then blocks on SIGTERM and
          disconnects them again before exiting. launchd sends SIGTERM to
-         Aqua-session agents at logout, so this covers logout -- it does NOT
+         Aqua-session agents at logout, so this covers logout. It does NOT
          cover fast user switching (switching sessions does not terminate the
          other session's agents), so a tunnel can still be live in a
          switched-away session today. -->
@@ -26,8 +26,12 @@
     <key>KeepAlive</key>
     <true />
 
-    <!-- `ExitTimeOut` is intentionally omitted to use launchd's 5s default;
-         please see: issues/shutdown-teardown.md. -->
+    <!-- No `ExitTimeOut`: launchd's 5s default is the whole budget for the
+         logout teardown, and a teardown that needs longer counts as broken.
+         The daemon finishes a disconnect it has already received even if
+         launchd kills this agent; only requests not yet sent are lost. At
+         shutdown launchd removes the daemon at the same moment, so the agent
+         cannot reach it anyway; see issues/shutdown-teardown.md. -->
 
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>   <!-- only in a real GUI login session -->
