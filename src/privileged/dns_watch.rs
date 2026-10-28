@@ -294,10 +294,52 @@ fn handle_exit(pid: u32, helper: WatchedHelper) {
     } else {
         debug!(interface = %helper.interface, pid, "privileged_dns_custody_helper_exited");
     }
+    log_store_key_after_exit(&helper, pid, recorded);
     if let Err(error) = dns_sweep::sweep_interface(&helper.interface) {
         warn!(interface = %helper.interface, error = %error, "privileged_dns_sweep_failed");
         // Keep trying: the record is still there.
         ensure_retry_loop();
+    }
+}
+
+/// How long to give configd to drop a dead helper's session keys before the
+/// key counts as left behind. configd learns of the dead session from
+/// its mach port, asynchronously to the process exit.
+const KEY_RECHECK: Duration = Duration::from_secs(1);
+
+/// Did the helper's dynamic store DNS key go away with it? Read-only: only the
+/// owning helper may write the key (`crate::dns_dynamic_store`). `died` is true when
+/// the helper exited without its teardown (the custody record was still there).
+fn log_store_key_after_exit(helper: &WatchedHelper, pid: u32, died: bool) {
+    let check = || crate::dns_dynamic_store::key_present(helper.connection_id);
+    let present = match check() {
+        Ok(true) => {
+            std::thread::sleep(KEY_RECHECK);
+            check()
+        }
+        other => other,
+    };
+    match present {
+        Ok(true) => warn!(
+            interface = %helper.interface,
+            pid,
+            died,
+            present = true,
+            "privileged_dns_store_key_after_exit"
+        ),
+        Ok(false) => info!(
+            interface = %helper.interface,
+            pid,
+            died,
+            present = false,
+            "privileged_dns_store_key_after_exit"
+        ),
+        Err(error) => warn!(
+            interface = %helper.interface,
+            pid,
+            error = %error,
+            "privileged_dns_store_key_check_failed"
+        ),
     }
 }
 

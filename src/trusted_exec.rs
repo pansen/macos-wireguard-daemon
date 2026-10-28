@@ -19,6 +19,8 @@ pub enum TrustedPath {
     Executable,
     /// A directory holding root-only state.
     Directory,
+    /// A root-only settings file.
+    File,
 }
 
 impl TrustedPath {
@@ -26,6 +28,7 @@ impl TrustedPath {
         match self {
             TrustedPath::Executable => "privileged executable path",
             TrustedPath::Directory => "privileged directory",
+            TrustedPath::File => "privileged file",
         }
     }
 
@@ -34,7 +37,8 @@ impl TrustedPath {
             TrustedPath::Executable => "install wgd where it and every parent directory are \
                  root-owned, are not symlinks, and have no group/other write access"
                 .into(),
-            TrustedPath::Directory => "chown it to root and remove group/other write access, \
+            TrustedPath::Directory | TrustedPath::File => "chown it to root and remove \
+                 group/other write access, \
                  including on every parent directory"
                 .into(),
         }

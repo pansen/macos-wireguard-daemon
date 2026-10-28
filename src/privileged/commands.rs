@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::error::{AppError, Result};
 use crate::privileged_api::ConnectionId;
@@ -251,6 +251,20 @@ pub(super) fn run_gotatun_up(
         .env("WGD_GOTATUN_CONFIG_B64", config_b64)
         .env("WGD_CONNECTION_ID", connection_id.to_string())
         .arg(interface);
+    // Phase 2 of `doc/dns-dynamic-store.md`: opted-in connections publish
+    // their DNS through the dynamic store instead of `networksetup`.
+    match crate::dns_dynamic_store::opted_in(connection_id) {
+        Ok(true) => {
+            info!(%connection_id, "privileged_dns_via_dynamic_store");
+            command.env(crate::dns_dynamic_store::ACTIVE_ENV, "1");
+        }
+        Ok(false) => {}
+        Err(error) => warn!(
+            path = %crate::dns_dynamic_store::opt_in_path().display(),
+            error = %error,
+            "privileged_dns_dynamic_store_opt_in_unreadable"
+        ),
+    }
     if let Some(mtu) = mtu_override {
         command.env("WGD_GOTATUN_MTU_OVERRIDE", mtu.to_string());
     }

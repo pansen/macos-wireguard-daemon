@@ -140,7 +140,7 @@ pub(super) fn build_macos_network_overview(state: &MacosCleanupState) -> Network
         global_resolvers: macos_global_resolvers(),
         tailscaled_present: tailscaled_socket_present(),
     };
-    assemble_macos_network_overview(
+    let mut overview = assemble_macos_network_overview(
         inputs,
         &routes,
         &route_fingerprint,
@@ -148,7 +148,9 @@ pub(super) fn build_macos_network_overview(state: &MacosCleanupState) -> Network
         &dns_fingerprint,
         &foreign,
         &|route| macos_route_destination(route).and_then(macos_route_table_entry),
-    )
+    );
+    overview.dns.dynamic_store = state.dns_store_key.as_ref().map(|key| key.overview());
+    overview
 }
 
 /// Log a full route + DNS overview as one structured field. Called once after
@@ -465,9 +467,16 @@ pub(super) fn macos_dns_overview(
     unreachable: Option<DnsCollision>,
 ) -> DnsOverview {
     // Use the reconciler's own decision, otherwise the table contradicts it.
+    // In active mode no service is a target: the dynamic store key carries
+    // the tunnel DNS and needs no primary service.
     let decision = dns_decision(DNS_POLICY, dns_fingerprint, unreachable.is_some());
-    let targets = decision.targets();
-    let held = decision == DnsDecision::Hold;
+    let networksetup = inputs.dns_mode == crate::dns_dynamic_store::StoreKeyMode::Shadow;
+    let targets = if networksetup {
+        decision.targets()
+    } else {
+        &[]
+    };
+    let held = networksetup && decision == DnsDecision::Hold;
     let services = dns_fingerprint
         .services
         .iter()
@@ -513,6 +522,8 @@ pub(super) fn macos_dns_overview(
         dormant: unreachable.is_some() || held,
         unreachable,
         services,
+        // Filled in by `build_macos_network_overview`, which owns the key.
+        dynamic_store: None,
     }
 }
 
@@ -731,6 +742,20 @@ mod tests {
             status(&unsettled, "Thunderbolt Bridge"),
             (DnsServiceStatus::NotTargeted, true)
         );
+    }
+
+    #[test]
+    fn active_dynamic_store_targets_no_service_and_needs_no_primary() {
+        let mut inputs = split_inputs();
+        inputs.dns_mode = crate::dns_dynamic_store::StoreKeyMode::Active;
+        let with_primary = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        let overview = macos_dns_overview(&inputs, &[], &with_primary, None);
+        assert_eq!(overview.services[0].status, DnsServiceStatus::NotTargeted);
+        assert!(!overview.dormant);
+
+        // `networksetup` would hold without a primary; the key does not care.
+        let no_primary = dns_fp(None, &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        assert!(!macos_dns_overview(&inputs, &[], &no_primary, None).dormant);
     }
 
     // --- foreign tunnels & system resolver overview ---

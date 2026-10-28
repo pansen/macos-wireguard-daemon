@@ -175,6 +175,7 @@ mod tests {
 
     fn dns(unreachable: Option<DnsCollision>, status: DnsServiceStatus) -> DnsOverview {
         DnsOverview {
+            dynamic_store: None,
             tunnel_servers: vec!["10.66.77.2".to_string(), "100.64.1.1".to_string()],
             primary_service: Some("Wi-Fi".to_string()),
             dormant: unreachable.is_some(),

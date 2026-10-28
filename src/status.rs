@@ -328,6 +328,7 @@ mod tests {
             local_subnets: vec![],
             routes: vec![],
             dns: DnsOverview {
+                dynamic_store: None,
                 tunnel_servers: vec![],
                 primary_service: None,
                 unreachable: None,

@@ -380,7 +380,14 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
     }
 
     let cleanup = if let Some(config) = parsed_config.as_ref() {
-        match configure_network(&interface_name, config, custody_identity(interface)) {
+        let connection_id = connection_id_from_env();
+        let dns_mode = dns_store_key_mode(connection_id.is_some());
+        // Active mode never touches `networksetup`, so there is nothing to
+        // keep in custody.
+        let custody = connection_id
+            .filter(|_| dns_mode == crate::dns_dynamic_store::StoreKeyMode::Shadow)
+            .and_then(|id| custody_identity(interface, id));
+        match configure_network(&interface_name, config, connection_id, custody, dns_mode) {
             Ok(cleanup) => cleanup,
             Err(e) => {
                 device.stop().await;
@@ -514,19 +521,45 @@ fn helper_tun_name(interface: &str) -> String {
     "utun".to_string()
 }
 
-/// Identity for the DNS custody record: the connection id the daemon passed
-/// in, this process's pid and its start time. `None` (with a WARN) when any
-/// part is missing, which only disables crash recovery for this session.
+/// The connection id the daemon passed in. `None` (with a WARN when it is
+/// malformed) disables DNS custody and the shadow DNS key for this session.
 #[cfg(unix)]
-fn custody_identity(interface: &str) -> Option<crate::dns_custody::DnsCustodyIdentity> {
+fn connection_id_from_env() -> Option<crate::privileged_api::ConnectionId> {
     let raw = std::env::var(CONNECTION_ID_ENV).ok()?;
-    let connection_id = match raw.parse::<crate::privileged_api::ConnectionId>() {
-        Ok(id) => id,
+    match raw.parse::<crate::privileged_api::ConnectionId>() {
+        Ok(id) => Some(id),
         Err(error) => {
             warn!(error = %error, "userspace_helper_dns_custody_unavailable");
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Active when the daemon found this connection in the opt-in file
+/// (`crate::dns_dynamic_store::opt_in_path`). The key is derived from the
+/// connection id, so without one the helper stays on `networksetup`.
+#[cfg(unix)]
+fn dns_store_key_mode(has_connection_id: bool) -> crate::dns_dynamic_store::StoreKeyMode {
+    use crate::dns_dynamic_store::{StoreKeyMode, ACTIVE_ENV};
+    if std::env::var(ACTIVE_ENV).as_deref() != Ok("1") {
+        return StoreKeyMode::Shadow;
+    }
+    if !has_connection_id {
+        warn!("userspace_helper_dns_store_key_active_without_connection_id");
+        return StoreKeyMode::Shadow;
+    }
+    info!("userspace_helper_dns_via_dynamic_store");
+    StoreKeyMode::Active
+}
+
+/// Identity for the DNS custody record: the connection id, this process's pid
+/// and its start time. `None` (with a WARN) when the start time is unreadable,
+/// which only disables crash recovery for this session.
+#[cfg(unix)]
+fn custody_identity(
+    interface: &str,
+    connection_id: crate::privileged_api::ConnectionId,
+) -> Option<crate::dns_custody::DnsCustodyIdentity> {
     let helper_pid = std::process::id();
     let Some(helper_start) = crate::privileged::managed_pids::process_start_ticks(helper_pid)
     else {
@@ -548,9 +581,11 @@ fn custody_identity(interface: &str) -> Option<crate::dns_custody::DnsCustodyIde
 fn configure_network(
     interface: &str,
     config: &ParsedUserspaceConfig,
+    connection_id: Option<crate::privileged_api::ConnectionId>,
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
+    dns_mode: crate::dns_dynamic_store::StoreKeyMode,
 ) -> anyhow::Result<CleanupState> {
-    let cleanup = configure_network_macos(interface, config, custody)?;
+    let cleanup = configure_network_macos(interface, config, connection_id, custody, dns_mode)?;
     Ok(CleanupState::Macos(std::sync::Arc::new(cleanup)))
 }
 
