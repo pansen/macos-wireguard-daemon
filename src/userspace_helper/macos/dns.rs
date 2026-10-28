@@ -10,6 +10,7 @@ use super::MacosCleanupState;
 use super::MacosDnsFingerprint;
 use super::MacosDnsServiceState;
 use super::MacosReconcileInputs;
+use crate::dns_dynamic_store::StoreKeyMode;
 use anyhow::Context;
 use std::net::IpAddr;
 use tracing::{debug, info, warn};
@@ -207,6 +208,9 @@ pub(in crate::userspace_helper) fn macos_reconcile_dns(state: &MacosCleanupState
     if inputs.dns_servers.is_empty() {
         return false; // VPN promotes no DNS -> nothing to own.
     }
+    if inputs.dns_mode == StoreKeyMode::Active {
+        return reconcile_dns_store_key(state);
+    }
 
     let fingerprint = match macos_current_dns_fingerprint() {
         Ok(fingerprint) => fingerprint,
@@ -229,6 +233,9 @@ pub(in crate::userspace_helper) fn macos_reconcile_dns(state: &MacosCleanupState
     // DNS fingerprint at all, so this is computed before the identity guard below.
     let local_subnets = macos_local_connected_subnets(&inputs.interface);
     let collision = macos_dns_server_in_local_subnet(&inputs.dns_servers, &local_subnets);
+    if let Some(key) = &state.dns_store_key {
+        key.set_wanted(collision.is_none());
+    }
 
     let mut dns = state
         .dns
@@ -369,9 +376,39 @@ pub(in crate::userspace_helper) fn macos_reconcile_dns(state: &MacosCleanupState
     } else {
         fingerprint
     };
+    // Would the dynamic store have needed this reconcile? (Rollout, phase 1.)
+    let shadow_key_intact = state
+        .dns_store_key
+        .as_ref()
+        .and_then(|key| key.key_intact());
     info!(
         interface = inputs.interface,
-        applied, captured, restored, dropped, errors, "userspace_helper_dns_reconcile_applied"
+        applied,
+        captured,
+        restored,
+        dropped,
+        errors,
+        shadow_key_intact = ?shadow_key_intact,
+        "userspace_helper_dns_reconcile_applied"
     );
     true
+}
+
+/// Active mode: the dynamic store key is the tunnel's DNS, so the only thing
+/// to reconcile is the LAN collision rule. Network changes, DHCP renewals and
+/// user edits do not touch the key; its owner thread heals a lost key itself.
+fn reconcile_dns_store_key(state: &MacosCleanupState) -> bool {
+    let inputs = &state.reconcile;
+    let Some(key) = &state.dns_store_key else {
+        return false;
+    };
+    let local_subnets = macos_local_connected_subnets(&inputs.interface);
+    let collision = macos_dns_server_in_local_subnet(&inputs.dns_servers, &local_subnets);
+    let changed = key.set_wanted(collision.is_none());
+    if changed {
+        if let Some(collision) = &collision {
+            log_dns_unreachable_local_lan(&inputs.interface, collision);
+        }
+    }
+    changed
 }

@@ -20,6 +20,7 @@ pub(super) fn split_inputs() -> MacosReconcileInputs {
         has_ipv4_address: true,
         has_ipv6_address: false,
         custody: None,
+        dns_mode: crate::dns_dynamic_store::StoreKeyMode::Shadow,
     }
 }
 

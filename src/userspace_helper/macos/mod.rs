@@ -1,6 +1,7 @@
 use anyhow::Context;
 pub(super) mod dns;
 mod dns_plan;
+mod dns_store_key;
 mod foreign;
 mod net;
 pub(super) mod overview;
@@ -12,6 +13,8 @@ mod test_support;
 
 use self::dns::configure_macos_dns;
 use self::dns::restore_macos_dns_services;
+use self::dns_plan::macos_dns_server_in_local_subnet;
+use self::dns_store_key::DnsStoreKey;
 use self::net::parse_cidr;
 use self::overview::log_macos_network_diagnostics;
 use self::overview::log_macos_network_overview;
@@ -40,6 +43,10 @@ pub(super) struct MacosCleanupState {
     /// Live DNS state. Like `routing`, the reconciler keeps this in sync with
     /// the active LAN while the tunnel is up and teardown reads it to restore.
     dns: std::sync::Mutex<MacosDnsState>,
+    /// Owner of the DNS key in the dynamic store (`doc/dns-dynamic-store.md`,
+    /// "Rollout"). `None` without tunnel DNS, without a connection id, or
+    /// when its thread could not start.
+    dns_store_key: Option<DnsStoreKey>,
     /// Immutable inputs the reconciler replays on every network change.
     pub(super) reconcile: MacosReconcileInputs,
 }
@@ -79,6 +86,10 @@ pub(super) struct MacosReconcileInputs {
     /// record (no `WGD_CONNECTION_ID`, or the helper's own start time was
     /// unreadable); connect still works, only crash recovery is lost.
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
+    /// `Active`: the dynamic store key carries the tunnel DNS and the
+    /// `networksetup` path (capture, custody, reconcile) is skipped.
+    /// `Shadow`: `networksetup` as always, plus an inert probe key.
+    dns_mode: crate::dns_dynamic_store::StoreKeyMode,
 }
 
 /// A snapshot of the host network environment relevant to tunnel routing.
@@ -270,7 +281,9 @@ async fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, 
 pub(super) fn configure_network_macos(
     interface: &str,
     config: &ParsedUserspaceConfig,
+    connection_id: Option<crate::privileged_api::ConnectionId>,
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
+    dns_mode: crate::dns_dynamic_store::StoreKeyMode,
 ) -> anyhow::Result<MacosCleanupState> {
     let has_ipv4_address = config
         .addresses
@@ -296,6 +309,7 @@ pub(super) fn configure_network_macos(
         has_ipv4_address,
         has_ipv6_address,
         custody,
+        dns_mode,
     };
     log_macos_network_diagnostics("before_connect", &inputs);
 
@@ -361,9 +375,12 @@ pub(super) fn configure_network_macos(
             }
         }
         // Apply DNS the same way the reconciler will, then seed the DNS
-        // fingerprint so the first reconcile tick is a no-op.
-        dns_fingerprint =
-            configure_macos_dns(&inputs, &fingerprint.local_subnets, &mut dns_services)?;
+        // fingerprint so the first reconcile tick is a no-op. In active mode
+        // the dynamic store key below is the tunnel's DNS instead.
+        if dns_mode == crate::dns_dynamic_store::StoreKeyMode::Shadow {
+            dns_fingerprint =
+                configure_macos_dns(&inputs, &fingerprint.local_subnets, &mut dns_services)?;
+        }
         Ok(())
     })();
 
@@ -389,6 +406,22 @@ pub(super) fn configure_network_macos(
         };
     }
 
+    // After routes, like the `networksetup` path; withdrawn from the start
+    // when the tunnel DNS collides with a connected LAN.
+    let dns_store_key = connection_id
+        .filter(|_| !inputs.dns_servers.is_empty())
+        .and_then(|connection_id| {
+            let collision =
+                macos_dns_server_in_local_subnet(&inputs.dns_servers, &fingerprint.local_subnets);
+            DnsStoreKey::start(
+                interface,
+                connection_id,
+                dns_mode,
+                &inputs.dns_servers,
+                collision.is_none(),
+            )
+        });
+
     let cleanup = MacosCleanupState {
         routing: std::sync::Mutex::new(MacosRoutingState {
             routes_added,
@@ -398,6 +431,7 @@ pub(super) fn configure_network_macos(
             services: dns_services,
             fingerprint: dns_fingerprint,
         }),
+        dns_store_key,
         reconcile: inputs,
     };
     log_macos_network_overview("connect", &cleanup);
@@ -406,6 +440,10 @@ pub(super) fn configure_network_macos(
 
 pub(super) fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
     let mut errors = Vec::new();
+    // The dynamic store key goes first, before routes (see "Lifecycle").
+    if let Some(key) = &state.dns_store_key {
+        key.remove();
+    }
     // Restore persistent DNS before spending the shutdown window on routes.
     // Keep route cleanup (including shadowed LAN-route restoration) intact.
     // Take the `dns` and `routing` locks independently (never both at once)

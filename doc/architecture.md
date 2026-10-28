@@ -2,21 +2,20 @@
 
 **Scope:** the whole `wgd` binary, all three roles it runs in.
 
-One binary, three roles. `main()` checks for the helper role first, before
-parsing any arguments; everything else, including the privileged service, is
-decided by parsing the CLI:
+One binary, three roles. `main()` checks for the helper role before parsing
+any arguments; everything else is decided by the CLI parser:
 
-- **helper** if `WGD_GOTATUN_HELPER` is set in the environment
-  (`userspace_helper::maybe_run_from_env`, checked before `Cli::parse()`),
-- **privileged service** for the `wgd privileged --serve` subcommand (an
-  ordinary, hidden clap subcommand, matched after parsing),
+- **helper** if `WGD_GOTATUN_HELPER` is set (`userspace_helper::maybe_run_from_env`),
+- **privileged service** for the hidden `wgd privileged --serve` subcommand,
 - **user CLI** for everything else.
 
-The user CLI never touches routes, DNS, or the WireGuard control socket. It
-sends a JSON request to the privileged service over a Unix socket (or over
-stdio when spawned via `sudo -n`), and the service either does the work
-itself or spawns a per-connection helper process that owns that tunnel for
-its lifetime.
+The user CLI never touches routes, tunnel DNS, or the WireGuard control
+socket. It sends a JSON request to the privileged service over a Unix socket
+(or over stdio when spawned via `sudo -n`), and the service either does the
+work itself or spawns a per-connection helper that owns that tunnel for its
+lifetime. Exceptions: `wgd launchd install|uninstall|purge` and `wgd dns
+repair` escalate with `sudo` and run as root in the CLI process, and the
+read-only `wgd status --dns` runs `networksetup` itself.
 
 ## Processes and the privilege boundary
 
@@ -30,8 +29,8 @@ flowchart TB
     subgraph root["Root (system domain)"]
         DAEMON["privileged service<br/>wgd privileged --serve<br/>privileged::serve"]
         HELPER["gotatun helper (one per connected connection)<br/>WGD_GOTATUN_HELPER=1<br/>userspace_helper"]
-        STORE[("/Library/Application Support/wgd/<br/>connections/&lt;id&gt;.json · active/&lt;id&gt;.json<br/>locks/&lt;id&gt;.lock · connections-index.lock")]
-        RUN[("/var/run/wireguard/<br/>&lt;iface&gt;.sock · .wgd.pid · .wgd.query.sock")]
+        STORE[("/Library/Application Support/wgd/<br/>connections/ · active/ · locks/<br/>run/ctl.sock · dns-custody/")]
+        RUN[("/var/run/wireguard/<br/>&lt;iface&gt;.sock · .wgd.pid · .wgd.name<br/>.wgd.query.sock · .wgd.cleanup")]
     end
 
     LD["launchd<br/>me.pansen.wgd.privileged<br/>socket-activated"]
@@ -43,43 +42,41 @@ flowchart TB
     DAEMON --> STORE
     HELPER --> RUN
     DAEMON -->|"reads"| RUN
-    HELPER -->|"ifconfig · route · networksetup · scutil"| SYS["macOS network stack"]
+    HELPER -->|"ifconfig · route · networksetup · scutil<br/>SCDynamicStore session key"| SYS["macOS network stack"]
+    HELPER -->|"DNS custody record"| STORE
 ```
 
 The boundary is the socket. Everything above it runs as you and is
 replaceable; everything below it runs as root and is deliberately small.
-`trusted_exec` (`src/trusted_exec.rs`) restricts what root ever executes:
-each tool name (`ifconfig`, `route`, `networksetup`, `scutil`, `sh` for
-hooks) is mapped to a hardcoded absolute system path rather than searched
-for on `PATH`. Root-owned-and-not-a-symlink validation is applied
-separately, to the wgd binary's own install location and to the
-root-owned state directories the daemon reads from.
+`trusted_exec` (`src/trusted_exec.rs`) maps every tool root runs (`ifconfig`,
+`route`, `networksetup`, `scutil`, `sh` for hooks and a few more) to a fixed
+absolute system path and sanitizes the environment. The wgd binary's install
+location and the root-owned state directories are separately checked for
+root ownership and no symlinks. The CLI holds no state; everything about a
+connection, including its private key, lives only in the privileged store.
 
-The user CLI holds no state of its own; everything about a connection,
-including its private key, lives only in the privileged store.
+How launchd starts the daemon and how clients reach it is in
+[launchd-socket-activation.md](launchd-socket-activation.md).
 
 ## The main types
 
 ```mermaid
 classDiagram
-    class Cli {
-        +TopCommand command
-        +bool verbose
-    }
     class TopCommand {
         <<enum>>
-        Status · Launchd · Connection
-        Reload · Privileged
+        Status · Doctor · Logs · Dns · Completion
+        Launchd · Connection · Privileged
+    }
+    class LaunchdCommand {
+        <<enum>>
+        Install · Restart · Reload · Uninstall
+        Status · Purge · Agent
     }
     class ConnectionCommand {
         <<enum>>
-        Add · List · Remove · Refresh
+        Add · List · Refresh · Remove
         Connect · Disconnect · Mode
-        Get · Agent
-    }
-    class ConnectionId {
-        +Uuid
-        +interface_name() String
+        Config · Get
     }
     class StoredConnection {
         +ConnectionId id
@@ -91,70 +88,58 @@ classDiagram
         +ConnectionConfig config
         +String raw_conf
         +String interface
-        +u64 created_at
-        +u64 updated_at
+        +bool user_disconnected
         +Option~String~ source_path
         +Option~u16~ mtu_override
+        +bool dns_dynamic_store
     }
     class ActiveConnectionState {
         +String fingerprint
         +String interface
         +PathBuf socket
-        +u64 device
-        +u64 inode
-        +i64 changed_sec
-        +i64 changed_nsec
+        +u64 device · inode
+        +i64 changed_sec · changed_nsec
         +u64 connected_at
-    }
-    class PrivilegedClient {
-        +add_connection()
-        +refresh_connection()
-        +remove_connection()
-        +connect_connection()
-        +disconnect_connection()
-        +set_connection_mode()
-        +list_connections()
-        +get_connection()
     }
     class PrivilegedRequest {
         <<enum>>
         AddConnection · RefreshConnection · RemoveConnection
         ConnectConnection · DisconnectConnection
-        SetConnectionMode · ListConnections · GetConnection
+        SetConnectionMode · SetConnectionDnsDynamicStore
+        ListConnections · GetConnection · ListDnsCustody
         LeaseAcquire · LeaseRelease · ShutdownIfIdle
         InterfaceActive · WgShow · NetworkOverview
     }
     class PrivilegedResponse {
         <<enum>>
-        Unit · Bool · Pid · Text · Error
+        Unit · Bool · Pid · Error
+        WgDevice · NetworkOverview · DnsCustody
         ConnectionId · Connection · ConnectionList · Refreshed
     }
 
-    Cli *-- TopCommand
+    TopCommand *-- LaunchdCommand
     TopCommand *-- ConnectionCommand
-    StoredConnection --> ConnectionId
-    PrivilegedClient ..> PrivilegedRequest : sends
-    PrivilegedClient ..> PrivilegedResponse : receives
     PrivilegedRequest ..> StoredConnection : Add creates
     StoredConnection ..> ActiveConnectionState : Connect produces
 ```
 
-`StoredConnection` is the daemon's on-disk record of a connection: one JSON
-file per id under `connections/`, containing the parsed `ConnectionConfig`,
-the verbatim `raw_conf` text, and a SHA-256 `fingerprint` over the parsed
-struct. `ActiveConnectionState` exists only while a connection is up; it
-records the real UAPI socket's device, inode, and change time, which is what
-lets the daemon tell a genuinely running tunnel apart from a stale marker
-left by a crash or reboot.
+`StoredConnection` is one JSON file per id under `connections/`: the parsed
+`ConnectionConfig`, the verbatim `raw_conf`, and a SHA-256 `fingerprint` over
+the parsed struct. Dedup identity is `(fingerprint, global, owner_uid)`, not
+the id. `ActiveConnectionState` exists only while a connection is up; the UAPI
+socket's device, inode and change time tell a running tunnel apart from a
+stale marker left by a crash or reboot.
 
-Two connections can differ only in `owner_uid`/`global` while everything else
-is identical; identity for dedup purposes is `(fingerprint, global,
-owner_uid)`, not the id.
+`user_disconnected` records an explicit `wgd connection disconnect` and keeps
+an `Automatic` connection down until the next explicit connect or a mode
+change to `Automatic`. Connect and disconnect requests carry a reason
+(`ConnectReason::User|Reconciliation`, `DisconnectReason::User|SessionTeardown`)
+so only the user's own actions change it. `dns_dynamic_store` selects the DNS
+path (see "Tunnel DNS").
 
 ## One connect, end to end
 
-This is `wgd connection connect home`, assuming `home` was already added
-as a per-user connection.
+`wgd connection connect home`, for a per-user connection `home`:
 
 ```mermaid
 sequenceDiagram
@@ -162,67 +147,46 @@ sequenceDiagram
     actor U as you
     participant CLI as connection_cli::cmd_connect
     participant PC as PrivilegedClient
-    participant SOCK as privileged::socket
     participant DISP as dispatch
-    participant CS as connection_store
     participant OPS as connection_ops::connect
     participant HP as gotatun helper (root)
     participant OS as macOS
 
     U->>CLI: wgd connection connect home
-    CLI->>PC: list_connections(Mine), then Global
-    PC->>SOCK: {"kind":"list_connections",...}
-    SOCK-->>PC: matching ConnectionSummary
-    PC-->>CLI: resolve_id resolves "home" -> ConnectionId
-
+    CLI->>PC: resolve_id: list_connections(Mine), then Global
     CLI->>PC: connect_connection(id, debug)
-    PC->>SOCK: {"kind":"connect_connection","id":...}
-    SOCK->>DISP: dispatch(peer_uid, request)
+    PC->>DISP: {"kind":"connect_connection",...} over ctl.sock
     DISP->>DISP: authorize_access (owner or root)
     DISP->>DISP: spawn worker thread, return Pending(rx)
-    Note over SOCK: accept loop keeps serving<br/>other clients while the worker runs
+    Note over DISP: accept loop keeps serving<br/>other clients meanwhile
 
-    DISP->>CS: lock_connection_patient(id), 30s
-    CS-->>DISP: ConnectionLock
-    DISP->>OPS: connect(&lock, id, debug)
-    OPS->>OPS: re-parse raw_conf, verify fingerprint unchanged
-    OPS->>OPS: run PreUp hooks (%i -> real interface name)
-    OPS->>OPS: lock_system_network_mutation(), 30s
-    OPS->>HP: run_gotatun_up: spawn self with<br/>WGD_GOTATUN_HELPER=1, config via env (base64)
-    HP->>HP: daemonize, log to /var/log/wgd/&lt;iface&gt;.log
-    HP->>OS: TunDevice + UapiServer + apply_wireguard_config
+    DISP->>OPS: lock_connection_patient(id) 30s, connect()
+    OPS->>OPS: re-parse raw_conf, verify fingerprint
+    OPS->>OPS: run PreUp hooks (%i -> interface)
+    OPS->>OPS: lock_system_network_mutation() 30s,<br/>DNS sweep for this interface, DNS sentinel
+    OPS->>HP: run_gotatun_up: spawn self with WGD_GOTATUN_HELPER=1,<br/>config (base64), WGD_CONNECTION_ID, WGD_DNS_DYNAMIC_STORE
+    HP->>OS: TunDevice + UapiServer + WireGuard config
     HP->>OS: configure_network_macos: addresses, routes, DNS
     HP-->>OPS: parent exits after child signals READY_OK
-    OPS->>OPS: run PostUp hooks
-    OPS->>CS: save_active(&lock, id, ActiveConnectionState)
-    OPS-->>DISP: Ok
-    DISP-->>SOCK: result over mpsc channel
-    SOCK-->>PC: {"kind":"unit"}
-    PC-->>CLI: Ok
+    OPS->>OPS: dns_watch::settle_locked, PostUp hooks
+    OPS->>OPS: save_active(ActiveConnectionState)
+    OPS-->>PC: {"kind":"unit"} via mpsc and the socket
     CLI-->>U: "Connected <id>"
 ```
 
-The parts worth noticing:
+`connect()` refuses a record whose re-parsed fingerprint no longer matches
+("stored connection is stale ...; remove and re-add it"), requires exactly one
+`[Peer]`, clears a dead helper's leftovers on the same interface, and refuses
+to adopt a socket whose device/inode/ctime does not match the active record.
+A failing PostUp hook rolls the tunnel back.
 
-`connect()` re-parses the stored `raw_conf` and compares its fingerprint
-against the one recorded at add time before doing anything else. A mismatch
-(for example after a parser change between versions) refuses with "stored
-connection is stale, remove and re-add it" rather than running with drifted
-semantics.
-
-`ConnectConnection`/`DisconnectConnection`/`RefreshConnection` run on a spawned
-worker thread, not on the accept loop itself, so a slow tunnel bring-up cannot
-freeze other clients. `Add`/`Remove`/`SetConnectionMode` still run synchronously on the
-accept thread, under a 2-second bound, since they are expected to be fast.
-
-Two separate locks are involved: `lock_connection_patient` (30s, per
-connection id) guards the `StoredConnection`/`ActiveConnectionState` record
-itself, while `lock_system_network_mutation()` (30s, one lock for the whole
-daemon) guards the actual `run_gotatun_up`/`run_gotatun_down` calls, since
-route and DNS mutation is genuinely machine-wide state. Two different
-connections can both hold their own per-id lock at once, but still serialize
-on the network-mutation lock around the moment they actually touch routes or
-DNS.
+Connect, Disconnect and Refresh run on a worker thread (the client waits up
+to 60 s), so a slow bring-up cannot freeze other clients. Everything else runs
+on the accept thread under a 2 s lock bound. Two locks are involved: the
+per-id lock guards the records, and `lock_system_network_mutation()`
+(`tunnel-operation.lock`, one for the whole daemon) guards
+`run_gotatun_up`/`run_gotatun_down` and every DNS custody sweep, because
+routes and DNS are machine-wide state.
 
 ## Command dispatch
 
@@ -233,30 +197,21 @@ flowchart LR
     HELPERCHK -->|no| PARSE["Cli::parse"]
 
     PARSE --> PRIV["Privileged --serve (hidden)<br/>privileged::serve / serve_stdio"]
-    PARSE --> STATUS["Status<br/>cmd_status (sync, no tokio)"]
+    PARSE --> STATUS["Status<br/>status::cmd_status"]
+    PARSE --> MAINT["Doctor / Logs / Dns repair / Completion"]
     PARSE --> LAUNCHD["Launchd<br/>launchd::dispatch"]
-    PARSE --> CONN["Connection<br/>connection_cli::dispatch (sync)"]
-    LAUNCHD --> RELOAD["Reload<br/>tokio runtime + CommandScopeGuard<br/>reload::run"]
-
-    CONN --> AGENT["Agent subcommand<br/>session_agent::dispatch"]
-    CONN --> RPC["Add / Refresh / List / Remove / Connect /<br/>Disconnect / Mode / Get<br/>-> PrivilegedClient"]
-
-    RELOAD -.->|"sudo self"| LAUNCHD
-    RELOAD --> DISCALL["disconnect_all_mine()"]
-    RELOAD --> AGENT
+    PARSE --> CONN["Connection<br/>connection_cli::dispatch"]
+    LAUNCHD --> RELOAD["Reload<br/>reload::run (tokio)"]
+    LAUNCHD --> AGENT["Agent<br/>session_agent::dispatch"]
+    CONN --> RPC["Add / Refresh / List / Remove / Connect /<br/>Disconnect / Mode / Config / Get<br/>-> PrivilegedClient"]
 ```
 
-`Status`, `Connection`, and the `Launchd` install/restart/uninstall commands
-are synchronous and skip the tokio runtime entirely. `Launchd Reload` creates
-a runtime and a `CommandScopeGuard` inside `launchd::dispatch`: it re-execs
-itself under `sudo` for the daemon-install step, calls `PrivilegedClient`
-directly to disconnect every one of the caller's connected connections, then
-re-renders and re-bootstraps the session agent.
-
-Name-or-id resolution (`resolve_id`, `src/connection_cli.rs`) tries parsing
-the argument as a `ConnectionId` first; if that fails, it searches
-`ListConnections{Mine}` for a matching `name`, then `ListConnections{Global}`
-if nothing owned matches, and errors on zero or on more than one match.
+Everything except `launchd reload` is synchronous. `reload` re-runs `launchd
+install` under `sudo`, disconnects the caller's connections through
+`PrivilegedClient`, and reinstalls the session agent. `resolve_id` tries the
+argument as a `ConnectionId`, then as a name among `Mine`, then `Global`
+(under `sudo`: all connections, preferring `SUDO_UID`'s), and errors on zero
+or several matches.
 
 ## Connection store and locking
 
@@ -268,7 +223,8 @@ flowchart TB
         ACTD["active/&lt;id&gt;.json<br/>exists only while connected"]
         LOCKD["locks/&lt;id&gt;.lock"]
         MARK["boot-reconcile.marker"]
-        NETLK["tunnel-operation.lock<br/>(machine-wide route/DNS mutation)"]
+        NETLK["tunnel-operation.lock"]
+        CUST["dns-custody/&lt;iface&gt;.json · watch<br/>dns-last-restore.json"]
     end
 
     ADD["AddConnection"] --> IDX
@@ -276,54 +232,41 @@ flowchart TB
     REFRESH["RefreshConnection"] --> IDX
     REFRESH --> LOCKD
     REFRESH --> CONND
-    REFRESH --> NETLK
+    REFRESH -->|"if up"| NETLK
     REMOVE["RemoveConnection"] --> IDX
     REMOVE --> LOCKD
     REMOVE -->|"delete"| CONND
-    MODE["SetConnectionMode"] --> LOCKD
+    MODE["SetConnectionMode /<br/>SetConnectionDnsDynamicStore"] --> LOCKD
     MODE --> CONND
     CONNECT["ConnectConnection /<br/>DisconnectConnection"] --> LOCKD
     CONNECT --> NETLK
     CONNECT --> ACTD
+    SWEEP["DNS custody sweep"] --> NETLK
+    SWEEP --> CUST
 ```
 
 Locking rule, enforced by `IndexLock`/`ConnectionLock` being required
-function parameters rather than convention: **index-then-per-id, never the
-reverse**. `AddConnection` holds `connections-index.lock` for the full
-duration of interface-name allocation and record creation.
-`RemoveConnection` takes the index lock, then the target's per-id lock, in
-that order, so it can never deadlock against a concurrent connect on the
-same id. `ConnectConnection`/`DisconnectConnection`/`SetConnectionMode` only
-ever take the per-id lock.
+parameters: **index-then-per-id, never the reverse**. `AddConnection` holds
+the index lock across interface-name allocation (`wg-<8 hex>`, derived from
+the id) and record creation. `RemoveConnection` takes the index lock, then
+the per-id lock, and refuses with `Busy` while the connection is up. The
+other per-connection requests take only the per-id lock.
 
-`RefreshConnection` takes the index lock, then the per-id lock (bounded to 2
-seconds, so a held index lock never waits long behind a running connect). The
-index lock makes the "no other record has this fingerprint" check atomic with
-writing the new record. For a connection that is up, the sequence is: check
-for duplicates, require admin authentication, disconnect using the old record
-(its `PreDown`/`PostDown` hooks live there), write the new record, release the
-index lock, then reconnect. The per-id lock is held throughout, so nothing
-else can connect or disconnect that id in between, but `Add` and `Remove` are
-not blocked during the reconnect. Reconnecting calls `connect` directly rather
-than going through a `ConnectConnection` request, so `user_disconnected` is
-left as it was. If the reconnect fails, the new record is already stored and
-the error says so.
-
-Interface names are derived deterministically from the id
-(`wg-<8 hex chars>`), not caller-supplied, and their uniqueness is checked
-under the index lock at add time. `tunnel-operation.lock` is the one lock
-that is genuinely machine-wide (it guards the previous network state a
-reconcile pass captures), so it still serializes `run_gotatun_up`/
-`run_gotatun_down` across every connection, even though each connection
-otherwise has its own lock.
+`RefreshConnection` takes the index lock, then the per-id lock (2 s), so the
+"no other record has this fingerprint" check is atomic with writing the new
+record. For a connection that is up: check duplicates, require admin
+authentication, disconnect with the old record (its `PreDown`/`PostDown`
+hooks live there), write the new record, release the index lock, reconnect.
+The reconnect calls `connect` directly, so `user_disconnected` stays as it
+was; if it fails, the error says the new record is already stored.
 
 ## Admin authentication
 
-Adding, removing, refreshing a connection to a changed config, or elevating a
-global connection from manual to automatic each require real macOS admin authentication, not just `wgd`-group
-membership, since those are the only operations that let new
-root-executed config content (including `PreUp`/`PostUp`/`PreDown`/
-`PostDown` hooks) into the store or make it run unattended at boot.
+Adding, removing, refreshing to a changed config, and switching a global
+connection from manual to automatic require real macOS admin
+authentication, not just `wgd`-group membership: these are the only
+operations that let new root-executed content (including hooks) into the
+store or make it run unattended at boot.
 
 ```mermaid
 sequenceDiagram
@@ -332,198 +275,130 @@ sequenceDiagram
     CLI->>D: AddConnection { auth_external_form: None }
     D->>D: is this actually a new/changed record?
     D-->>CLI: Error { code: "AuthRequired" }
-    CLI->>CLI: authz::client_authorize()<br/>(AuthorizationCopyRights, triggers Touch ID / password)
+    CLI->>CLI: authz::client_authorize()<br/>(AuthorizationCopyRights, Touch ID / password)
     CLI->>D: AddConnection { auth_external_form: Some(bytes) }
-    D->>D: authz::verify_external_form(bytes)<br/>(AuthorizationCreateFromExternalForm,<br/>re-check the right was actually granted)
+    D->>D: authz::verify_external_form(bytes)<br/>(no UI, re-check the right, destroy credentials)
     D-->>CLI: ConnectionId
 ```
 
-`RefreshConnection` follows the same two-phase protocol, but the daemon only
-asks for authentication when the new text fingerprints differently from the
-stored record, and it asks before disconnecting anything. A refresh whose
-fingerprint is unchanged needs no prompt; it only updates the recorded
-`source_path`. The CLI reads the source file as the invoking user and sends
-the text, and the daemon treats `source_path` purely as metadata, never
-opening it.
+`RefreshConnection` asks only when the new text fingerprints differently, and
+before disconnecting anything; otherwise it just updates `source_path`, which
+the daemon never opens. An identical resubmission of `add` never creates a
+record; a changed `name` or `start_mode` updates in place without a prompt,
+except the manual-to-automatic switch of a global connection. Connect,
+disconnect, every other mode change and the DNS opt-in proceed on ownership
+alone.
 
-An identical resubmission (same fingerprint, same `global`) never creates a
-new record. If it also carries a different `name` or `start_mode`, those
-fields update in place without going through this flow at all, unless the
-update is the one exception that still needs it: elevating a global
-connection from manual to automatic. `Connect`, `Disconnect`, and every
-other `SetConnectionMode` transition (per-user, or downgrading a global
-connection back to manual) proceed on ownership alone, the same way the
-macOS Network pane asks for admin credentials to add a VPN profile but not
-to connect one that's already configured.
-
-The custom right, `me.pansen.wgd.modify-connection`, requires an admin
-credential with a 60-second, non-shared lifetime and is registered in the
-system authorization database by `src/launchd.rs` at `wgd launchd install`
-time and at every privileged daemon startup, before either the socket or stdio
-transport handles requests. This upgrades the rule when a replaced binary next
-starts, without requiring a separate install or reload command. Registration
-requires root; if it fails, startup fails with repair guidance instead of
-serving mutations against an incompatible rule. The runtime two-phase check
-itself lives in `src/privileged/authz.rs`: `client_authorize()` runs in the
-CLI process, `verify_external_form()` runs in the daemon without allowing UI
-and destroys the credentials after successful verification. The short lifetime
-allows the same authorization session to survive the handoff; separate changes
-still use fresh sessions and require their own authentication. The built-in
-`authenticate-admin` rule has a zero timeout, which caused a second prompt
-when the daemon previously allowed interaction during verification.
-
-Replacing the binary does not change an already-running daemon; `wgd launchd reload`
-updates both the registered rule and the daemon immediately, while the next
-normal daemon startup updates the rule automatically. A non-interactive
-verification failure (`-60007`) reports that the credential may have expired or
-the rule may be outdated, with retry and reload guidance.
-The interactive regression check is
-`cargo test --lib authenticated_external_form_verifies_once_without_reprompting -- --ignored`:
-it should open one client prompt, verify the external form without another
-prompt, and reject reuse of the consumed credentials. A forced replacement
-that adds a changed configuration and removes a stale one should prompt once
-for each change (two prompts total).
+The right `me.pansen.wgd.modify-connection` (admin, non-shared, 60 s) is
+registered at `wgd launchd install` and at every daemon start, before any
+transport serves; a failed registration stops the daemon with repair
+guidance. The 60 s lifetime lets one authorization survive the handoff from
+CLI to daemon; the built-in `authenticate-admin` rule has a zero timeout and
+caused a second prompt. A non-interactive failure (`-60007`) points to an
+expired credential or an outdated rule and suggests `wgd launchd reload`.
+Interactive regression check: `cargo test --lib
+authenticated_external_form_verifies_once_without_reprompting -- --ignored`
+(one prompt, no second one, consumed credentials rejected).
 
 ## Boot and session reconciliation
 
-Two independent mechanisms bring connections up without a manual `connect`,
-matching the two connection kinds:
+- **Global connections** reconcile at daemon start, which after a reboot is
+  the first touch of `ctl.sock` (or the launchd start caused by the DNS
+  sentinel). A background thread, started once the socket is bound, sweeps
+  DNS left by dead helpers and then runs `reconcile_boot()`: skip if
+  `boot-reconcile.marker` already holds this boot's id (`sysctl
+  kern.boottime`), else connect every `global`, `Automatic`, not
+  `user_disconnected`, inactive connection. The marker is written only if
+  every candidate succeeded, so a transient failure is retried at the next
+  wake.
+- **Per-user connections** reconcile through the session agent (`wgd launchd
+  agent run`, a LaunchAgent with `RunAtLoad`+`KeepAlive`). It blocks
+  `SIGTERM` first, so a reinstall mid-reconcile cannot kill it without
+  teardown, connects every `Automatic` connection that is neither connected
+  nor `user_disconnected`, then waits in `sigwait(3)`. On logout it
+  disconnects what is connected (`SessionTeardown`) and exits. It reconciles
+  only once: a crashed helper stays down until the next login or an explicit
+  `connect`. Fast user switching is not covered.
 
-- Global connections reconcile at daemon start, not at boot: the daemon is
-  socket-activated on demand, so "daemon start" happens the first time
-  anything touches `ctl.sock` after a reboot. `connection_store::
-  reconcile_boot()` runs on a background thread as soon as the socket is
-  bound (not before, so N helper-startup handshakes don't delay every other
-  client). It reads the current boot id (`sysctl kern.boottime`) and skips
-  entirely if a marker file already records that id, so a restart of the
-  on-demand daemon within the same boot doesn't undo an admin's explicit
-  `disconnect`. Otherwise it connects every stored connection that is
-  `global`, `Automatic`, and not already active, logging and continuing past
-  any individual failure. The marker is only written when every candidate in
-  the pass succeeded, so a merely transient failure (DNS not up yet) is
-  retried on the daemon's next wake instead of being stuck down for the rest
-  of the boot.
-- Per-user connections reconcile for the session's lifetime. The session
-  agent (`wgd launchd agent run`, installed as a long-lived, per-user
-  LaunchAgent with `RunAtLoad`+`KeepAlive`) blocks `SIGTERM` (`pthread_sigmask`
-  via `SigSet::thread_block`) as the very first statement it runs, before
-  doing anything else, then calls `ListConnections{Mine}` and connects every
-  `Automatic` result. It then waits on the now-queued signal with a real
-  `sigwait(3)` call; on delivery (logout, or `launchctl bootout`), it calls
-  `ListConnections{Mine}` again and disconnects everything currently
-  connected before exiting, so a per-user tunnel never outlives the session
-  that started it. Blocking the signal before the initial reconcile matters:
-  reinstalling the agent bootstraps a fresh instance immediately, and an
-  early `SIGTERM` landing mid-reconcile under the default disposition would
-  otherwise kill it with no teardown at all. Fast user switching to a
-  different session is not covered: the switched-away session's agent is
-  never sent `SIGTERM`, so its tunnels stay up.
-
-Both reconcilers ultimately call the same `connection_ops::connect`/
-`disconnect` used by the RPC dispatch arms; the session agent just reaches it
-over the socket like any other client, since it runs as your user, not root.
+`wgd connection add|mode|connect|refresh` and `sudo wgd launchd install`
+install a missing session agent when a per-user `Automatic` connection needs
+it; `wgd status` warns when it is not loaded. Both reconcilers end in the same
+`connection_ops::connect`/`disconnect` as the RPCs.
 
 ## Inside the privileged service
 
 ```mermaid
 flowchart TB
+    AUTH["register_authorization_right(), ensure dirs"] --> ACT
     subgraph serve["privileged::serve"]
         ACT{"launchd socket<br/>activation?"}
         ACT -->|yes| FD["adopt inherited fd,<br/>chmod 0660, chown :wgd"]
         ACT -->|no| BIND["bind ctl.sock itself"]
         FD --> SPAWN
         BIND --> SPAWN
-        SPAWN["spawn reconcile_boot()<br/>background_work += 1"] --> LOOP
+        SPAWN["dns_watch::init(); background thread:<br/>DNS sweep, reconcile_boot()"] --> LOOP
     end
 
-    LOOP["socket::serve<br/>nonblocking accept loop, max 32 clients"]
+    LOOP["socket::serve<br/>nonblocking accept loop"]
     LOOP --> GPC["getpeereid() once per accepted socket"]
-    GPC --> PRP["process_request_payload"]
-    PRP --> VAL["PrivilegedRequest::validate"]
-    VAL --> DISP["dispatch(peer origin, request)"]
-
+    GPC --> DISP["validate, dispatch(peer origin, request)"]
     DISP --> IMM{"Connect / Disconnect /<br/>Refresh?"}
-    IMM -->|yes| WORK["spawn worker thread<br/>lock_connection_patient (30s)<br/>connection_ops::connect/disconnect"]
+    IMM -->|yes| WORK["worker thread<br/>lock_connection_patient (30s)"]
     WORK -.->|"mpsc channel"| LOOP
-    IMM -->|no| SYNC["handled inline on accept thread<br/>(Add/Remove/Mode: lock_connection, 2s bound)"]
+    IMM -->|no| SYNC["inline on the accept thread<br/>(lock_connection, 2s)"]
 
-    LOOP --> IDLE{"no clients AND<br/>background_work == 0?"}
-    IDLE -->|yes| EXIT["exit if: shutdown requested with no<br/>leases held, or idle timeout elapsed"]
+    LOOP --> IDLE{"no clients, background_work == 0,<br/>resident == 0?"}
+    IDLE -->|yes| EXIT["exit if shutdown requested with no<br/>leases, or idle timeout elapsed"]
 ```
 
-Peer credentials are captured once per accepted connection via macOS's
-`getpeereid()` (there is no `SO_PEERCRED` on macOS), not re-queried per
-request, since the uid is invariant for the socket's lifetime. Ownership
-rules are uniform across every op that touches a specific connection: a
-global record requires the caller be root; a per-user record requires the
-caller be its owner or root. The same rule also gates
-`WgShow`/`NetworkOverview`/`InterfaceActive` (kept from before the connection
-store, for `status`'s interface-detail lookups) whenever the interface name
-they were given happens to belong to a stored connection, closing a gap
-where any `wgd`-group member could act on a connection's interface once
-its name leaked via `ListConnections{Global}`.
+The uid from `getpeereid()` decides ownership: a global record requires
+root, a per-user record its owner or root. The same rule gates the older
+interface-keyed `WgShow`/`NetworkOverview`/`InterfaceActive` whenever the
+interface belongs to a stored connection. `background_work` keeps the daemon
+up during the startup sweep and boot reconcile (otherwise it could idle-exit
+before `active/<id>.json` is written); `resident` is held by the DNS custody
+watch. Limits: 32 clients, 1 MiB per request, 2 MiB per response, 10 s I/O
+per client. The wire format is newline-delimited JSON tagged by `kind`, with
+optional `{"log": ...}` frames before the response.
 
-`background_work` is an atomic counter, incremented while boot reconciliation
-(or any other background task) is running. Without it, the daemon's
-idle-exit check could fire mid-reconciliation with zero clients connected,
-killing the daemon right after a helper started but before its
-`ActiveConnectionState` was written, leaving a tunnel that is actually up
-reported as down until the next reconcile pass.
-
-There is a second transport, `stdio`, selected by config and spawned only via
-`sudo -n <exe> privileged --serve --stdio`. Because the caller has already
-proven root by the time that session exists, its peer origin is treated as
-uid 0 outright; the only open question is which per-user bucket to credit a
-`global: false` `AddConnection` to, resolved with a best-effort `$SUDO_UID`
-read that is explicitly not a security boundary.
+The `stdio` transport (`sudo -n <exe> privileged --serve --stdio`) treats its
+peer as uid 0, since the caller already proved root; a best-effort
+`$SUDO_UID` only picks the owner of a per-user `AddConnection`.
 
 ## Inside the helper
 
-One helper process per connected connection. It is spawned by
-`connection_ops::connect` (via `commands::run_gotatun_up`), daemonizes, and
-then owns that tunnel until its UAPI socket is removed or it is signalled.
+One helper per connected connection, spawned by `connection_ops::connect`
+via `commands::run_gotatun_up`. It daemonizes and owns the tunnel until its
+UAPI socket is removed or it is signalled.
 
 ```mermaid
 flowchart TB
-    START["maybe_run_from_env<br/>interface from argv, config from env (base64)"]
-    START --> DAEMONIZE["daemonize; child signals READY_OK/ERR<br/>over a UnixDatagram pair"]
-    DAEMONIZE --> LOGF["logging::init_file_sync<br/>/var/log/wgd/&lt;iface&gt;.log"]
-    LOGF --> SD["start_device"]
-
-    SD --> TUN["TunDevice::from_name -> utunN"]
-    SD --> UAPI["UapiServer::default_unix_socket<br/>/var/run/wireguard/&lt;iface&gt;.sock"]
-    SD --> DEV["DeviceBuilder: uapi + udp + ip"]
-    SD --> CFG["apply_wireguard_config: keys, peer, endpoint"]
+    START["maybe_run_from_env"] --> DAEMONIZE["daemonize; child signals READY_OK/ERR"]
+    DAEMONIZE --> LOGF["log to /var/log/wgd/&lt;iface&gt;.log"]
+    LOGF --> SD["start_device: utunN, UAPI socket,<br/>WireGuard config"]
     SD --> NET["configure_network_macos"]
-
-    NET --> ADDR["ifconfig: mtu, addresses, up, -rxcsum -txcsum"]
-    NET --> FP["macos_current_fingerprint"]
+    NET --> ADDR["ifconfig: mtu, addresses, up"]
     NET --> ROUTES["macos_desired_routes -> add_macos_route"]
-    NET --> DNS["configure_macos_dns"]
-
-    SD --> RD["RunningDevice { device, cleanup: CleanupState::Macos(Arc) }"]
-    RD --> QS["spawn_overview_query_server<br/>&lt;iface&gt;.wgd.query.sock"]
-    RD --> WAIT["wait_for_shutdown: 1s tick"]
-
-    WAIT -->|"control socket gone,<br/>SIGINT or SIGTERM"| TEAR["cleanup_network_macos:<br/>delete routes, restore DNS"]
-    TEAR --> STOP["device.stop() (5s timeout)"]
-    STOP --> STATUS["write &lt;iface&gt;.wgd.cleanup, remove pid/name/socket"]
+    NET --> DNS["shadow mode: custody record, then networksetup"]
+    NET --> KEY["DnsStoreKey::start (config has DNS)"]
+    SD --> QS["overview query server<br/>&lt;iface&gt;.wgd.query.sock"]
+    SD --> WAIT["wait_for_shutdown: 1s tick,<br/>reconcile every 3s"]
+    WAIT -->|"control socket gone,<br/>SIGINT or SIGTERM"| TEAR["cleanup_network_macos:<br/>remove the store key (2s), restore DNS,<br/>then delete routes"]
+    TEAR --> STOP["device.stop() (5s), write &lt;iface&gt;.wgd.cleanup,<br/>remove pid/name/socket"]
 ```
 
 Teardown is a handshake, not a kill. `run_gotatun_down` removes the UAPI
-socket, which the helper's tick loop reads as a shutdown request, then waits
-up to 15 seconds for the helper to write `ok` into its cleanup-status file,
-falling back to `SIGTERM` and a further 5 seconds. Only after a confirmed
-`ok` does it check that the `utunN` interface is really gone
-(`src/privileged/commands.rs`, `run_gotatun_down`). `PreDown`/`PostDown` hooks
-around this are best-effort: a broken hook logs and is skipped rather than
-stranding the caller with a connection they explicitly asked to remove.
+socket, waits up to 15 s for `ok` in the cleanup-status file, falls back to
+`SIGTERM` and 5 more seconds, and only then checks that `utunN` is gone.
+`PreDown`/`PostDown` hooks are best-effort: a broken hook logs and is
+skipped.
 
 ## Continuous reconciliation
 
-This is the part that makes a connected tunnel survive roaming. Every 3
-seconds the helper re-snapshots the network and, if anything moved,
-re-applies routes and DNS for its own connection.
+Every 3 s the helper re-snapshots the network and, if anything moved,
+re-applies routes and then DNS in one `spawn_blocking` call, awaited so ticks
+cannot overlap and teardown cannot race a change, and so shelling out never
+stalls the single-threaded runtime that moves packets.
 
 ```mermaid
 classDiagram
@@ -531,6 +406,7 @@ classDiagram
         +Mutex~MacosRoutingState~ routing
         +Mutex~MacosDnsState~ dns
         +MacosReconcileInputs reconcile
+        +Option~DnsStoreKey~ dns_store_key
     }
     class MacosRoutingState {
         +Vec~MacosRoute~ routes_added
@@ -541,162 +417,158 @@ classDiagram
         +MacosDnsFingerprint fingerprint
     }
     class MacosReconcileInputs {
-        +String interface
-        +IpAddr endpoint
-        +bool endpoint_is_ipv6
-        +bool endpoint_needs_pin
-        +Vec~String~ allowed_ips
-        +Vec~String~ dns_servers
-        +bool has_ipv4_address
-        +bool has_ipv6_address
+        +endpoint, allowed_ips, dns_servers
+        +Option~DnsCustodyIdentity~ custody
+        +StoreKeyMode dns_mode
     }
-    class MacosNetworkFingerprint {
-        +Vec~(IpAddr,u8)~ local_subnets
-        +Option~String~ endpoint_gateway
-    }
-    class MacosDnsFingerprint {
-        +Option~String~ primary_service
-        +Vec~String~ services
-        +Vec~(String,Option~Vec~String~~)~ observed
-    }
-    class MacosDnsServiceState {
-        +String service
-        +Option~Vec~String~~ dns_servers
-        +Option~Vec~String~~ search_domains
-    }
-
     MacosCleanupState *-- MacosRoutingState
     MacosCleanupState *-- MacosDnsState
     MacosCleanupState *-- MacosReconcileInputs
-    MacosRoutingState *-- MacosNetworkFingerprint
-    MacosDnsState *-- MacosDnsFingerprint
-    MacosDnsState *-- MacosDnsServiceState
 ```
 
-Both reconcilers follow the same shape: snapshot the environment into a
-fingerprint, compare it to the stored one, and act only on a difference. Both
-run on `spawn_blocking` via `run_macos_maintenance`, awaited so ticks cannot
-overlap and teardown cannot race a worker mid-change, and so shelling out to
-`ifconfig`/`scutil`/`networksetup` never stalls the single-threaded runtime
-that is also moving packets.
+**Routes:** `macos_desired_routes` is the endpoint pin (only when AllowedIPs
+would capture the endpoint) plus the AllowedIPs, minus anything inside a
+directly connected subnet, so a split tunnel never hijacks the LAN you are
+on. Because a prefix holds only one entry, two more rules are needed when
+roaming into a subnet the tunnel also routes: `add_macos_route` clears a
+stale entry only when a tunnel device owns it, and
+`macos_restore_shadowed_lan_route` re-adds the connected route whenever
+removing a tunnel route leaves a local subnet uncovered.
 
-Routes: `macos_desired_routes` is the endpoint pin (only when AllowedIPs
-would otherwise capture the endpoint) plus the AllowedIPs routes, minus
-anything that falls inside a directly-connected subnet. That subtraction is
-what keeps a split tunnel from hijacking the LAN you are actually on.
+**DNS, `networksetup` path:** `dns_decision` yields `Apply(targets)`,
+`RestoreAll` (a tunnel DNS server is inside a connected LAN) or `Hold` (no
+settled primary service). The I/O-free `plan_dns_actions` turns that into
+services to capture, apply, restore or drop; under the `PrimaryOnly` policy
+only the service owning global resolution gets tunnel DNS.
+`dns_reconcile_forced` covers a DHCP resolver on the LAN that shadows the
+tunnel DNS address, which no fingerprint sees. The custody record is
+rewritten before any service changes.
 
-The subtraction alone is not enough, because a prefix can only hold one
-entry. Joining a LAN the tunnel already routes (roaming into a subnet that is
-also in AllowedIPs) means the kernel cannot install that interface's
-connected route, and the tunnel route it lost out to is removed on the next
-reconcile, leaving the LAN with no route at all. Two rules close that gap.
-`add_macos_route` checks who holds a prefix before touching it, clearing a
-stale entry only when a tunnel device owns it and otherwise leaving the
-prefix alone and unowned, and `macos_restore_shadowed_lan_route` re-adds the
-connected route, scoped to its device, whenever removing a tunnel route
-leaves a local subnet uncovered.
+**DNS, active dynamic store mode:** only the LAN collision is re-evaluated,
+withdrawing or republishing the key; nothing on the physical services
+belongs to wgd.
 
-DNS: `plan_dns_actions` is deliberately I/O-free and therefore unit-testable.
-It takes the tunnel's DNS, the observed environment, the services currently
-owned, and the services that should be owned, and returns what to apply,
-restore, or drop. Under the active `PrimaryOnly` policy only the service
-owning global resolution gets tunnel DNS. `dns_reconcile_forced` handles the
-case a fingerprint cannot see: a DHCP-provided resolver on a LAN that shadows
-the tunnel's own DNS server address, where nothing observable changes but
-ownership still has to move.
+## Tunnel DNS
+
+`StoredConnection::dns_dynamic_store` chooses one of two paths; design,
+rollout and test results are in [dns-dynamic-store.md](dns-dynamic-store.md).
+
+- **Shadow mode (default):** `networksetup` on the primary service, which
+  writes persistent settings and therefore needs crash recovery (below). The
+  helper also publishes the dynamic store key with a probe match domain
+  (`wgd-shadow-<id>.inactive`) that answers no real query.
+- **Active mode** (`wgd connection config --dns-dynamic-store`, passed to the
+  helper as `WGD_DNS_DYNAMIC_STORE=1`): the key has the match domain `""`, a
+  domain-less resolver that sorts ahead of the network's default resolver,
+  and `networksetup` is never called.
+
+The key `State:/Network/Service/<id>/DNS` uses a UUID derived from the
+connection id. One owner thread per helper (`macos::dns_store_key`) holds a
+session-keys `SCDynamicStore` session and does every SC call: publish after
+the routes, withdraw on a LAN collision, republish when the key goes missing
+(notification plus a 30 s poll), remove at teardown. configd keeps the key in
+memory only and drops it with the session, so a dead helper or a reboot
+leaves nothing behind. Everyone else only reads the key: a plain `set` from
+another session would make it permanent.
+
+## DNS crash recovery
+
+Only for the `networksetup` path, where a helper killed without teardown
+leaves tunnel DNS in persistent settings:
+
+- **Custody record:** before changing a service's DNS, the helper writes
+  `dns-custody/<iface>.json` (connection id, helper pid and start time, tunnel
+  DNS, each service's original servers and search domains). Teardown deletes
+  it, or keeps only the services that failed. The directory is root-only and
+  created by the daemon.
+- **Sweep** (`dns_sweep`, under `tunnel-operation.lock`): for each record whose
+  helper is dead, a service still carrying the tunnel DNS gets its original
+  back, a service changed meanwhile is left alone, a service missing from the
+  current location is deferred; `ClearStray` handles DNS of a dead stored
+  connection without a record. Sweeps run at daemon start, at connect, when a
+  watched helper exits, from a 60 s retry loop after a failed restore, and
+  once as root in `wgd dns repair` and `wgd launchd purge`. The last restore
+  of the boot is shown by `wgd status`.
+- **Exit watch** (`dns_watch`): kqueue `EVFILT_PROC`/`NOTE_EXIT` on each
+  recorded helper; watches and the retry loop hold `resident`, so the daemon
+  does not idle-exit.
+- **Sentinel** `dns-custody/watch`: created by the daemon before spawning a
+  DNS-promoting helper and by the helper after each record, removed only by
+  the daemon. The plist's `KeepAlive`/`PathState` on it makes launchd start
+  the daemon, also at boot, so a helper that died while the daemon was idle
+  or before a reboot is still noticed.
+
+Known gap: a running daemon misses a record a helper writes on its own after
+connect ([dns-custody-late-record-watch.md](dns-custody-late-record-watch.md)).
 
 ## Status
 
-`wgd status` (`cmd_status` in `src/main.rs`) is read-only and pulls from
-two RPC calls plus, best-effort, per-connection detail.
+`wgd status` (`src/status.rs`) is read-only. `collect_status` builds a typed
+`StatusReport` and `render_status` renders it without I/O; `--json`,
+`wgd doctor` and the menu bar reuse both. As root it lists all connections,
+filtered by `SUDO_UID`.
 
 ```mermaid
 sequenceDiagram
-    participant S as cmd_status
-    participant PC as PrivilegedClient
+    participant S as collect_status
     participant D as privileged
     participant HP as helper
 
-    S->>PC: list_connections(Mine)
-    S->>PC: list_connections(Global)
-    S->>S: render the summary table<br/>(Id · Name · Global · Mode · Connected · Interface)
-    loop per connected connection
-        opt caller is root, or connection is per-user
-            S->>PC: wg_show(iface)
-            PC->>D: WgShow
-            D-->>S: text
-            S->>PC: network_overview(iface)
-            PC->>D: NetworkOverview
-            D->>HP: connect &lt;iface&gt;.wgd.query.sock
-            HP-->>D: freshly rendered route/DNS table
-            D-->>S: text
-        end
+    S->>D: ListConnections(Mine), ListConnections(Global)
+    loop per connected connection (global ones only as root)
+        S->>D: WgShow -> WgDevice
+        S->>D: NetworkOverview
+        D->>HP: &lt;iface&gt;.wgd.query.sock
+        HP-->>D: JSON: routes, tunnel DNS, dynamic store key,<br/>system resolver, other tunnels
+        D-->>S: NetworkOverview
     end
+    S->>D: ListDnsCustody (best effort)
 ```
 
-Detail calls for a **global** connection are only made when the caller is
-root; a non-admin user running `status` with a global VPN connected would
-otherwise get an `Auth` error printed to stderr for every such connection,
-since the daemon correctly denies those legacy calls to non-owners. Both
-detail fetches are best-effort regardless: a failure prints to stderr and
-never makes `status` fail.
-
-The menu bar app (`macos/WgdBar`) shows the same data through
-`menu_bar::snapshot`, which calls `collect_status`. It does not poll on a
-short interval. Daemon and helper post the Darwin notification
-`me.pansen.wgd.status-changed` (`src/status_notify.rs`) and the app fetches
-once per ping, debounced by 250 ms:
-
-- the daemon posts after a connect or disconnect in `connection_ops` (which
-  covers boot and session reconciliation too), after a successful Add or
-  Remove, and when `dns_watch` sees a helper exit;
-- the helper posts when a reconcile pass changed routes or DNS.
-
-The notification carries no data and is not authenticated; a forged ping
-costs one extra fetch over the authenticated socket. A 30-second fallback
-poll covers lost pings and a daemon that is not running. Because the app
-holds no connection between fetches, it does not keep the daemon from idling
-out.
+Detail fetches are best-effort; a failure goes to stderr and never fails
+`status`. The menu bar (`macos/WgdBar`, `menu_bar::snapshot`) fetches once
+per Darwin notification `me.pansen.wgd.status-changed` (`src/status_notify.rs`),
+debounced by 250 ms, with a 30 s fallback poll. The daemon posts after
+connect, disconnect, add, remove and a helper exit; the helper posts when a
+reconcile changed something. The ping carries no data, so a forged one only
+costs a fetch, and the app holds no connection that would keep the daemon up.
 
 ## Installation and lifecycle
 
 ```mermaid
 flowchart TB
-    MAKE["make install"] --> BUILD["cargo build --release<br/>-> /usr/local/bin/wgd"]
-    BUILD --> RELOAD["wgd launchd reload"]
-    RELOAD --> LI["sudo wgd launchd install"]
-    RELOAD --> DISC["connection disconnect --all (mine)"]
-    RELOAD --> AI["launchd agent install -f"]
-    BUILD --> ADD["connection add --file --name --force --start-mode automatic"]
-    ADD --> CONNECT["connection connect &lt;name&gt;"]
+    MAKE["make install"] --> BUILD["cargo fmt, cargo build --release"]
+    BUILD --> BIN{"Homebrew cask<br/>installed?"}
+    BIN -->|yes| CASK["overwrite the Caskroom binary,<br/>sudo /opt/homebrew/bin/wgd launchd install"]
+    BIN -->|no| COPY["sudo install -> /usr/local/bin/wgd"]
+    CASK --> RELOAD["wgd launchd reload:<br/>sudo launchd install, disconnect mine,<br/>reinstall session agent"]
+    COPY --> RELOAD
+    RELOAD --> ADD["connection add --force --start-mode automatic,<br/>connection connect, completion install"]
 
-    LI --> GRP["ensure_group_with_member: create 'wgd', add you"]
-    LI --> RIGHT["register me.pansen.wgd.modify-connection<br/>(admin, non-shared, 60s) in the authorization database"]
-    LI --> PL["render plist from etc/…privileged.plist<br/>@WGD_BIN@, @SOCK_PATH_GROUP@"]
-    PL --> BOOT["launchctl bootout, enable, bootstrap system/"]
-
-    AI --> APL["render etc/me.pansen.wgd.session-agent.plist<br/>@WGD_BIN@, @WGD_HOME@"]
-    APL --> ABOOT["launchctl bootout then bootstrap gui/&lt;uid&gt;<br/>RunAtLoad, KeepAlive, ExitTimeOut 120s"]
+    LI["sudo wgd launchd install"] --> STEPS["copy binary to /usr/local/bin/wgd if needed,<br/>wgd group, authorization right,<br/>render plist, bootstrap system/,<br/>reap stray daemons, reconnect Automatic"]
+    AI["launchd agent install"] --> ASTEPS["render session-agent plist,<br/>bootstrap gui/&lt;uid&gt;"]
 ```
 
-`launchd` handles the root daemon in the system domain; `session_agent`
-handles the per-user agent in the GUI domain. `reload` refuses to run as
-root and escalates only the daemon step, matching `session_agent`'s own
-`refuse_if_root` guard. `make install` runs `reload` before `connection add`
-so the freshly (re)installed session agent isn't immediately torn down and
-rebuilt by a second, redundant install right after bringing the connection
-up.
+`reload` refuses to run as root and escalates only the daemon step. `make
+install` runs it before `connection add` so the fresh session agent is not
+torn down again right after the connection comes up. Neither plist sets
+`ExitTimeOut`, so launchd's 5 s default applies at logout and shutdown.
+`launchd uninstall` and `purge` are described in
+[launchd-socket-activation.md](launchd-socket-activation.md).
 
 ## Where to start reading
 
 | Question | File |
 | --- | --- |
-| What commands exist and what do they take? | `src/cli.rs` |
+| What commands exist? | `src/cli.rs` |
 | What happens for a connect? | `src/connection_cli.rs`, `src/privileged/connection_ops.rs` |
-| What crosses the privilege boundary? | `src/privileged_api.rs` |
-| How does the client reach root? | `src/privileged_client/mod.rs` |
+| What crosses the privilege boundary? | `src/privileged_api.rs`, `src/privileged_client/` |
 | What does root actually run? | `src/privileged/commands.rs`, `src/trusted_exec.rs` |
-| How is a connection's identity and store layout defined? | `src/privileged/connection_store.rs` |
-| How does admin authentication work? | `src/privileged/authz.rs` |
-| How does per-user login/logout reconciliation work? | `src/session_agent.rs` |
-| How do routes and DNS stay correct? | `src/userspace_helper/macos/` |
+| Store layout and identity? | `src/privileged/connection_store.rs` |
+| Admin authentication? | `src/privileged/authz.rs` |
+| Login/logout reconciliation? | `src/session_agent.rs` |
+| Routes and DNS in the helper? | `src/userspace_helper/macos/` |
+| Dynamic store DNS? | `src/dns_dynamic_store.rs`, `src/userspace_helper/macos/dns_store_key.rs` |
+| DNS crash recovery? | `src/dns_custody.rs`, `src/privileged/dns_sweep.rs`, `src/privileged/dns_watch.rs` |
+| Status? | `src/status.rs`, `src/status_model.rs`, `src/status_render.rs` |
+| Install and daemon startup? | `src/launchd.rs`, `src/reload.rs` |

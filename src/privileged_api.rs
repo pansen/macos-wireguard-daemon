@@ -201,6 +201,10 @@ pub struct ConnectionSummary {
     /// `GetConnection`, never for `ListConnections`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    /// See `StoredConnection::dns_dynamic_store`. `#[serde(default)]` for
+    /// responses from a daemon that predates it, like `user_disconnected`.
+    #[serde(default)]
+    pub dns_dynamic_store: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -330,6 +334,13 @@ pub enum PrivilegedRequest {
         auth_external_form: Option<Vec<u8>>,
     },
 
+    /// Opt a connection in or out of tunnel DNS through the dynamic store
+    /// (phase 2 of `doc/dns-dynamic-store.md`). Applies at the next connect.
+    SetConnectionDnsDynamicStore {
+        id: ConnectionId,
+        enabled: bool,
+    },
+
     ListConnections {
         scope: ConnectionScope,
     },
@@ -355,7 +366,7 @@ pub enum PrivilegedResponse {
     NetworkOverview(Option<Box<NetworkOverview>>),
     Error { code: String, message: String },
     ConnectionId(ConnectionId),
-    Connection(ConnectionSummary),
+    Connection(Box<ConnectionSummary>),
     ConnectionList(Vec<ConnectionSummary>),
     DnsCustody(DnsCustodyStatus),
     Refreshed(RefreshOutcome),
@@ -505,6 +516,7 @@ impl PrivilegedRequest {
             Self::ConnectConnection { .. } => Ok(()),
             Self::DisconnectConnection { .. } => Ok(()),
             Self::SetConnectionMode { .. } => Ok(()),
+            Self::SetConnectionDnsDynamicStore { .. } => Ok(()),
             Self::ListConnections { .. } => Ok(()),
             Self::GetConnection { .. } => Ok(()),
             Self::ListDnsCustody => Ok(()),

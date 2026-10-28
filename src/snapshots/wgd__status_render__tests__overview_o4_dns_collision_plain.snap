@@ -11,6 +11,8 @@ Destination   | Via             | Family | Live  | MTU  | Status
 --------------+-----------------+--------+-------+------+-------
 100.64.0.0/24 | interface utun6 | IPv4   | utun6 | 1384 | owned
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 Tunnel DNS | Status
 -----------+----------------------------------------------------------
 55.56.57.2 | pulled back: 55.56.57.2 is inside local LAN 55.56.57.0/24
@@ -22,7 +24,12 @@ Bridge   | secondary | 8.8.8.8                | no    | empty        | not targe
 Ethernet | secondary | 55.56.57.2, 100.64.1.1 | yes   | 1.1.1.1      | owned; pending restore
 Wi-Fi    | primary   | 55.56.57.2, 100.64.1.1 | no    | empty        | stale tunnel DNS on LAN
 
-System resolver=55.56.57.2, 100.64.1.1 (matches tunnel DNS)
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+-------------------
+55.56.57.2      | matches tunnel DNS
+100.64.1.1      | matches tunnel DNS
 
 Other tunnels (foreign VPN / utun interfaces)
 

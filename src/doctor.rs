@@ -27,11 +27,12 @@ use crate::ui::RenderCtx;
 /// Report sections, in output order. The launchd status report has to run
 /// before anything connects to `ctl.sock`: connecting socket-activates the
 /// daemon and would falsify its `state = not running` check.
-const SECTIONS: [&str; 7] = [
+const SECTIONS: [&str; 8] = [
     "header",
     "launchd status",
     "dns per network service",
     "wgd status",
+    "dns dynamic store",
     "reachability",
     "launchd log (last 10m)",
     "/var/log/wgd tails",
@@ -169,6 +170,7 @@ fn build_report(privileged: bool, caller_in_wgd_group: Option<bool>) -> String {
                     Err(e) => format!("wgd status failed: {e:#}\n"),
                 }
             }
+            "dns dynamic store" => dynamic_store_section(connections.as_deref()),
             "reachability" => reachability_section(connections.as_deref()),
             "launchd log (last 10m)" if privileged => crate::logs::collect_launchd_logs(LOG_LINES),
             "/var/log/wgd tails" if privileged => crate::logs::collect_log_tails(LOG_LINES),
@@ -328,6 +330,36 @@ fn ping(host: &str) -> bool {
             }
         }
     }
+}
+
+/// Each DNS-promoting connection's phase 2 opt-in and dynamic store key, and
+/// the resolver configuration macOS built from all of them
+/// (`doc/dns-dynamic-store.md`). Only reads; the keys belong to the helpers.
+fn dynamic_store_section(connections: Option<&[ConnectionSummary]>) -> String {
+    let mut out = String::new();
+    let with_dns = connections
+        .unwrap_or_default()
+        .iter()
+        .filter(|conn| !conn.dns_servers.is_empty());
+    for conn in with_dns {
+        let present = match crate::dns_dynamic_store::key_present(conn.id) {
+            Ok(true) => "yes".to_string(),
+            Ok(false) => "no".to_string(),
+            Err(e) => format!("unknown ({e:#})"),
+        };
+        let _ = writeln!(
+            out,
+            "{} connected={} dns_dynamic_store={} key={} present={present}",
+            conn.label(),
+            conn.connected,
+            conn.dns_dynamic_store,
+            crate::dns_dynamic_store::dns_key(conn.id),
+        );
+    }
+
+    let _ = writeln!(out, "\nscutil --dns:");
+    out.push_str(&run_capture("scutil", &["--dns"]));
+    out
 }
 
 fn reachability_section(connections: Option<&[ConnectionSummary]>) -> String {
@@ -738,6 +770,7 @@ mod tests {
             peers,
             fingerprint: None,
             source_path: None,
+            dns_dynamic_store: false,
             created_at: 0,
             updated_at: 0,
         }

@@ -54,6 +54,10 @@ pub struct StoredConnection {
     /// `--mtu` given at add time, kept so a refresh can re-apply it to the
     /// new source text. Already baked into `raw_conf`/`config`.
     pub mtu_override: Option<u16>,
+    /// Publish the tunnel DNS through the dynamic store instead of
+    /// `networksetup` (phase 2 of `doc/dns-dynamic-store.md`). Read when the
+    /// helper is spawned, so a change applies at the next connect.
+    pub dns_dynamic_store: bool,
 }
 
 /// Connection lifecycle state that exists only while the connection is up.
@@ -114,6 +118,9 @@ struct StoredConnectionDisk {
     /// Absent in records written before refresh existed.
     #[serde(default)]
     mtu_override: Option<u16>,
+    /// Absent in records written before the opt-in existed: `networksetup`.
+    #[serde(default)]
+    dns_dynamic_store: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -246,6 +253,7 @@ fn to_disk(conn: &StoredConnection) -> StoredConnectionDisk {
         user_disconnected: conn.user_disconnected,
         source_path: conn.source_path.clone(),
         mtu_override: conn.mtu_override,
+        dns_dynamic_store: conn.dns_dynamic_store,
     }
 }
 
@@ -265,6 +273,7 @@ fn from_disk(disk: StoredConnectionDisk) -> Result<StoredConnection> {
         user_disconnected: disk.user_disconnected,
         source_path: disk.source_path,
         mtu_override: disk.mtu_override,
+        dns_dynamic_store: disk.dns_dynamic_store,
     })
 }
 
@@ -1076,6 +1085,7 @@ mod tests {
             user_disconnected: false,
             source_path: None,
             mtu_override: None,
+            dns_dynamic_store: false,
         }
     }
 

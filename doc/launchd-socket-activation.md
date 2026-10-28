@@ -1,421 +1,136 @@
 # launchd socket activation for the privileged service
 
-**Status:** proposed
-**Scope:** macOS privileged control service (`wgd privileged --serve`)
-**Author:** design note
+**Status:** implemented; the original proposal is in the git history.
+**Scope:** macOS privileged control service (`wgd privileged --serve`), its
+LaunchDaemon plist and how clients reach it
 
-## Problem
+## Why
 
-The privileged service is installed as a macOS LaunchDaemon (`make install/privileged`)
-that runs at boot as root. Today that daemon **binds the control socket itself**:
+A root daemon that binds its own socket creates it as root and patches mode
+and group afterwards. If that patch fails or races, the socket stays
+root-only and no `wgd`-group client can connect after boot. With socket
+activation launchd creates the socket from the plist before the process
+starts and passes the listening fd in. It also makes the daemon on-demand:
+launchd starts it on the first connect, and it exits again when idle.
 
-```rust
-// src/privileged/mod.rs  (self-bind branch)
-let listener = UnixListener::bind(&socket_path)?;
-let perms = Permissions::from_mode(0o660);
-set_permissions(&socket_path, perms)?;
-if let Some(gid) = group_gid { chown(&socket_path, None, Some(gid))?; }
-```
-
-The socket is created **as root**, then the mode and group are patched afterward.
-That sequence has a window — and several failure modes — in which the socket is
-left `root:wheel`/root-only, so an unprivileged client in the `wgd` group cannot
-connect after boot.
-
-macOS `launchd` supports **socket activation** (the equivalent of systemd socket
-activation): `launchd` creates the socket with a declared mode and group **before**
-the process starts and passes it in as an inherited file descriptor. This removes the
-chown-after-bind window entirely and is the recommended fix.
-
-## Current architecture (what exists today)
-
-### Socket contract — `src/config.rs`
+## Socket contract
 
 | Property | Value |
 |---|---|
-| Socket path | `/Library/Application Support/wgd/run/ctl.sock` (`privileged_socket_path()`) |
-| Socket dir | `/Library/Application Support/wgd/run` (`privileged_socket_dir()`), mode `0750` |
-| Socket file mode | `0660` |
-| Owner / group | `root` / `wgd` |
+| Socket path | `/Library/Application Support/wgd/run/ctl.sock` (`config::privileged_socket_path()`) |
+| Socket dir | `/Library/Application Support/wgd/run`, mode `0750`, group `wgd` |
+| Socket file | mode `0660`, `root:wgd` |
 
-Both the dir and the file are chowned to group `wgd` inside `serve()`.
+The file permissions are the whole group gate. The daemon reads the caller's
+uid with `getpeereid()` once per accepted socket and uses it for connection
+ownership; the gid is only logged.
 
-### Server — `src/privileged/mod.rs` `serve()`
+## The plist
 
-`serve()` chooses between an **activation-provided** listener and a
-**self-bound** listener:
+`etc/me.pansen.wgd.privileged.plist`, rendered by `wgd launchd install`
+(`src/launchd.rs`):
 
-```rust
-let activated = {
-    #[cfg(target_os = "macos")]
-    { launchd_activated_listener()? }   // launch_activate_socket("Listeners")
-    #[cfg(not(target_os = "macos"))]
-    { systemd_activated_listener()? }   // Linux: fd 3 via LISTEN_PID / LISTEN_FDS
-};
-let listener = match activated {
-    Some(listener) => listener,
-    None => {                           // self-bind: bind + chmod + chown
-        let listener = UnixListener::bind(&socket_path)?;
-        set_permissions(&socket_path, 0o660)?;
-        chown(&socket_path, group_gid)?;
-        listener
-    }
-};
+- `ProgramArguments`: `@WGD_BIN@ --debug privileged --serve --authorized-group
+  wgd --autostarted --idle-timeout-ms 60000`. `@WGD_BIN@` is replaced with the
+  trusted binary path, normally `/usr/local/bin/wgd`.
+- `Sockets` → `Listeners`: `SockPathName` as above and `SockPathMode` `432`
+  (0660 octal; plist `<integer>` is decimal). `SockPathGroup` needs an integer
+  gid, which is not known when the plist is written, so the template carries a
+  `@SOCK_PATH_GROUP@` marker comment that the installer replaces with
+  `<key>SockPathGroup</key><integer>GID</integer>`.
+- `RunAtLoad` `false`: launchd starts the daemon on the first connect.
+- `KeepAlive` → `PathState` on `/Library/Application Support/wgd/dns-custody/watch`:
+  while this sentinel exists, launchd keeps the daemon running, also at boot
+  (see "DNS custody keeps the daemon resident").
+- `EnvironmentVariables`: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so nothing
+  root runs is looked up in user-writable Homebrew directories, and
+  `WGD_LOG_COLOR=always`.
+- No `ExitTimeOut` (launchd's 5 s default; the daemon has no SIGTERM handler
+  and exits at once) and no `ThrottleInterval` (launchd's default, about 10 s
+  per `issues/dns-crash-recovery.md`).
+- Logs: `/var/log/wgd/privileged.{out,err}.log`.
+
+## Server startup (`privileged::serve`, `src/privileged/mod.rs`)
+
+1. Register the authorization right (refuse to start on failure), ensure the
+   directories, chown the socket dir to `wgd`.
+2. `launch_activate_socket("Listeners")`: a launchd job gets its fd (extra fds
+   are closed) and re-applies 0660 and the group in case the plist's gid is
+   stale. A `sudo`-spawned daemon gets nothing and binds itself, after probing
+   an existing socket file: a live listener means another daemon owns the
+   path, so it refuses to start; a stale file is unlinked.
+3. Start the DNS custody watch; on a background thread sweep DNS left by dead
+   helpers and run `reconcile_boot()`.
+4. Enter the accept loop.
+
+## Idle exit
+
+The daemon exits only with no clients, no background work, no DNS custody
+residency, and either a shutdown request with no lease left or the idle
+timeout (the plist's 60 s) passed since the last request. launchd starts it
+again on the next connect.
+
+## DNS custody keeps the daemon resident
+
+On the `networksetup` DNS path a dead helper must be noticed, so the daemon
+stays up while the sentinel `dns-custody/watch` exists (`KeepAlive`/`PathState`
+also starts it at boot) and while it watches a helper (`resident`, re-checked
+every 5 s). Details are in `doc/architecture.md`, "DNS crash recovery".
+Connections on the dynamic store path write no custody record and keep the
+daemon on-demand.
+
+## How clients connect (`src/privileged_client/transport.rs`)
+
+`connect_or_autostart()`:
+
+- `PermissionDenied`: fail at once; the caller is probably not in `wgd` yet
+  (log out and in after `wgd launchd install`).
+- `NotFound`/`ConnectionRefused` while the LaunchDaemon plist exists: launchd
+  owns socket and process, so the client only polls for up to
+  `privileged_autostart_timeout_ms` (5 s) and then suggests `sudo wgd launchd
+  restart`. It never starts a daemon via `sudo` here, because that one would
+  unlink launchd's socket and take over the path.
+- Without the plist (development): take a startup lock and start `sudo -n -b
+  <exe> privileged --serve --autostarted ...`, unless `privileged_autostart =
+  false`. The binary must be root-owned, so a Homebrew-prefix binary is never
+  started as root.
+
+`privileged_transport = stdio` runs `sudo -n <exe> privileged --serve --stdio`
+per command instead of using the socket.
+
+### Autostop modes
+
+`privileged_autostop_mode` controls a daemon the client started via `sudo`:
+
+| Mode | Behavior |
+|---|---|
+| `never` (default) | no idle timeout is passed; the daemon runs until stopped |
+| `command` | the client takes a lease (`LeaseAcquire`/`LeaseRelease`) for the duration of a command and sends `ShutdownIfIdle` afterwards |
+| `timeout` | the daemon gets `--idle-timeout-ms` from `privileged_autostop_timeout_ms` (default 30000) |
+
+The launchd daemon ignores these and uses the plist's arguments.
+
+## Install and lifecycle commands
+
+- `sudo wgd launchd install`: copy the binary to a trusted path if needed,
+  create the `wgd` group, register the authorization right, write the plist,
+  `bootout`/`enable`/`bootstrap system/`, reap `sudo`-started daemons launchd
+  does not track, wait up to 5 s for the socket (`bootstrap` returns before it
+  is ready), reconnect the invoking user's `Automatic` connections.
+- `sudo wgd launchd restart`: `launchctl kickstart -k system/me.pansen.wgd.privileged`.
+- `sudo wgd launchd uninstall`: disconnect, drop the DNS sentinel (so launchd
+  does not restart the daemon mid-`bootout`), boot out, remove the plist.
+- `wgd launchd reload` (as your user): `launchd install` via `sudo`,
+  disconnect your connections, reinstall the session agent.
+- `wgd launchd purge`: `uninstall` plus the session agent, a DNS sweep, state,
+  logs, the authorization right and the group.
+
+## Checks
+
+```bash
+stat -f '%Sp %Su %Sg' "/Library/Application Support/wgd/run/ctl.sock"   # srw-rw---- root wgd
+launchctl print system/me.pansen.wgd.privileged | grep -E 'state|exit timeout'
+wgd launchd status
 ```
 
-- `systemd_activated_listener()` is keyed on the systemd protocol (`LISTEN_PID`,
-  `LISTEN_FDS`, first fd at 3) and is used on Linux.
-- On macOS, `launchd_activated_listener()` retrieves the launchd-provided socket
-  via `launch_activate_socket("Listeners", …)`. A sudo-spawned daemon is not a
-  launchd job, so the call returns `None` and falls through to the self-bind
-  branch (which still chmods/chowns the socket it creates).
-
-### Authorization boundary — `src/privileged/mod.rs` `handle_client()`
-
-```rust
-let peer = {
-    #[cfg(target_os = "linux")]
-    { /* SO_PEERCRED → is_authorized(uid, gid, group) or reject */ }
-
-    #[cfg(not(target_os = "linux"))]
-    { let _ = authorized_group; (0u32, 0u32) }   // no check on macOS
-};
-```
-
-**On macOS there is no peer-credential check.** The socket's filesystem permissions
-(`0660` + group `wgd`) are the *entire* access-control boundary. This makes getting
-the socket mode/group right not just a usability fix but the security boundary itself.
-
-### Client — `src/privileged_client/transport.rs` `connect_or_autostart()`
-
-```
-try_connect_socket()
-  └─ Ok        → use it
-  └─ NotFound / ConnectionRefused / PermissionDenied
-       └─ autostart: sudo -n -b wgd privileged --serve --autostarted
-                          --authorized-group wgd [--idle-timeout-ms N]
-```
-
-The client is **transport-agnostic**: it only knows the socket path. It does not care
-who created the socket.
-
-### Current plist — `etc/me.pansen.wgd.privileged.plist`
-
-```xml
-<key>ProgramArguments</key>
-<array>
-  <string>/usr/local/bin/wgd</string>
-  <string>--debug</string>
-  <string>privileged</string>
-  <string>--serve</string>
-  <string>--authorized-group</string>
-  <string>wgd</string>
-</array>
-<key>RunAtLoad</key>  <true/>
-<key>KeepAlive</key>  <true/>   <!-- always-on root process -->
-```
-
-A persistent (`KeepAlive`) root daemon that self-binds the socket.
-
----
-
-## Design
-
-### Goal
-
-`launchd` creates `/Library/Application Support/wgd/run/ctl.sock` with `SockMode=0660` and
-`SockGroup=wgd` **atomically at creation**, and hands the listening fd to the
-daemon via `launch_activate_socket("Listeners", …)`. The daemon never chmods/chowns
-the socket in the activation path. The unprivileged client is unchanged.
-
-### Why this is the right fix
-
-- **Perms set at creation, not patched.** No window where the socket is root-only.
-- **It is the whole boundary on macOS.** With no `SO_PEERCRED` check, launchd-declared
-  group/mode is the authorization; declaring it in the plist is more trustworthy than
-  a runtime chown that can partially fail.
-- **Unifies boot-start and on-demand.** launchd can spawn the daemon lazily on first
-  connect and let it exit when idle — no always-on root process.
-- **No runtime `sudo` on installed machines.** Once the LaunchDaemon is loaded, the
-  client's connect succeeds (launchd spawns the daemon transparently), so the sudo
-  autostart branch never fires — no password prompts, no TTY dependency.
-- **Low blast radius.** `serve()` already branches activation vs self-bind; we add the
-  macOS arm. The client is untouched.
-
-### The two creation paths and how they stay compatible
-
-Both paths must converge on **one socket contract**: path `/Library/Application Support/wgd/run/ctl.sock`,
-mode `0660`, group `wgd`. They already share `config::privileged_socket_path()`;
-the plist's `SockPathName` / `SockMode` / `SockGroup` must match it exactly.
-
-| | **launchd (installed)** | **sudo (fallback)** |
-|---|---|---|
-| Who creates the socket | launchd, before process start | the daemon, via `bind()` |
-| Perms/group source | `SockMode` / `SockGroup` in plist | `set_permissions` + `chown` in `serve()` |
-| How daemon gets the listener | `launch_activate_socket("Listeners")` returns fd | self-bind branch |
-| Trigger | first client connect (or boot) | client's `sudo -n -b` autostart |
-
-**Detection is self-selecting.** `serve()` calls `launch_activate_socket` first:
-
-- A **launchd job** receives the fd → activation branch.
-- A **sudo-spawned process** is not a launchd job → the call fails (e.g. `ESRCH`) →
-  returns `None` → falls through to the existing self-bind+chown branch.
-
-The same binary with the same flags picks the right path automatically. No extra
-config to keep in sync.
-
-**Mutual exclusion in practice.** With on-demand activation the socket file always
-exists (launchd creates it at load), so the client's `try_connect_socket()` succeeds
-and `connect_or_autostart()` never enters the sudo branch on an installed machine. The
-sudo path remains the fallback for (a) dev machines where `make install` was not run,
-and (b) Linux.
-
-**Race to guard.** If the LaunchDaemon is installed *and* the client still reaches the
-sudo branch (e.g. the socket file was manually deleted), a sudo-spawned daemon would
-`remove_file` launchd's socket and `bind()` its own, orphaning launchd's fd.
-Mitigations, in order of preference:
-
-1. Rely on on-demand activation keeping the socket present (covers the normal case).
-2. Optional: on macOS, if the LaunchDaemon plist exists, have the client
-   `launchctl kickstart` the job instead of `sudo`-spawning.
-
-**Flag consistency.** Pass `--autostarted --idle-timeout-ms N` in *both* the plist and
-the sudo command so the daemon behaves identically regardless of who spawned it
-(idle-exit + lease-based `ShutdownIfIdle`).
-
-### Lifecycle: on-demand instead of always-on
-
-Switch from `KeepAlive=true` (always-on root process) to **socket activation +
-idle-timeout**:
-
-- launchd holds the socket; the daemon is spawned on first connect.
-- The daemon exits after `--idle-timeout-ms` of inactivity (lease-aware, via the
-  existing `ControlState`/`ShutdownIfIdle` machinery).
-- launchd re-spawns on the next connection.
-
-This fits the existing login-time autoconnect LaunchAgent (`install/autostart`): at
-login the autoconnect agent connects → launchd spawns the privileged daemon → after
-disconnect/idle the daemon exits → the socket persists for next time.
-
----
-
-## Implementation
-
-### 1. `src/privileged/mod.rs` — add the macOS activation branch
-
-Add a macOS-gated `launchd_activated_listener()` paralleling
-`systemd_activated_listener()`, and select it first in `serve()`.
-
-```rust
-/// On macOS, retrieve a launchd socket-activation listener for the `Listeners`
-/// socket declared in the LaunchDaemon plist. Returns `Ok(None)` when this process
-/// was not launched by launchd with that socket (e.g. a sudo-spawned daemon), so the
-/// caller falls through to the self-bind path.
-#[cfg(target_os = "macos")]
-fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
-    use std::ffi::CString;
-    use std::os::unix::io::FromRawFd;
-
-    let name = CString::new("Listeners").unwrap();
-    let mut fds: *mut libc::c_int = std::ptr::null_mut();
-    let mut count: libc::size_t = 0;
-
-    // SAFETY: launch_activate_socket writes a heap-allocated fd array we must free.
-    let ret = unsafe { libc::launch_activate_socket(name.as_ptr(), &mut fds, &mut count) };
-    if ret != 0 || fds.is_null() || count == 0 {
-        if !fds.is_null() {
-            unsafe { libc::free(fds as *mut libc::c_void) };
-        }
-        // Non-zero (commonly ESRCH when not launchd-managed) → not activated.
-        return Ok(None);
-    }
-
-    // We declare exactly one listener socket in the plist; take the first fd.
-    let fd = unsafe { *fds };
-    unsafe { libc::free(fds as *mut libc::c_void) };
-
-    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-    Ok(Some(listener))
-}
-```
-
-Wire it into the `match` in `serve()` (currently at `src/privileged/mod.rs:87`) so the
-detection order is **launchd (macOS) → systemd (Linux) → self-bind**:
-
-```rust
-let activated = {
-    #[cfg(target_os = "macos")]
-    { launchd_activated_listener()? }
-    #[cfg(not(target_os = "macos"))]
-    { systemd_activated_listener()? }
-};
-
-let listener = match activated {
-    Some(listener) => {
-        info!("privileged_service_socket_activation");
-        listener
-    }
-    None => {
-        // existing self-bind + chmod 0660 + chown(group) branch, unchanged
-    }
-};
-```
-
-Notes:
-
-- **launchd does not use fd 3 / `LISTEN_FDS`.** It uses the `launch_activate_socket`
-  C API keyed by the socket name (`"Listeners"`) from the plist. Do not try to reuse
-  the systemd fd-3 logic.
-- **`libc::launch_activate_socket` availability.** Verify it is exposed for the macOS
-  target via the already-present `nix::libc`. If it is not, add a minimal declaration:
-
-  ```rust
-  extern "C" {
-      fn launch_activate_socket(
-          name: *const libc::c_char,
-          fds: *mut *mut libc::c_int,
-          cnt: *mut libc::size_t,
-      ) -> libc::c_int;
-  }
-  ```
-
-- The dir chown earlier in `serve()` (lines ~79–85) is harmless and can remain; it is
-  redundant under activation (dir is pre-created `root:wgd` by the installer) and
-  still needed for the sudo self-bind path.
-- `launch_activate_socket` must be called **exactly once**; calling it again returns
-  the same fd already consumed.
-
-### 2. `etc/me.pansen.wgd.privileged.plist` — convert to socket activation
-
-```xml
-<?xml version="1.0" encoding="UTF-8" ?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>me.pansen.wgd.privileged</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/wgd</string>
-        <string>--debug</string>
-        <string>privileged</string>
-        <string>--serve</string>
-        <string>--authorized-group</string>
-        <string>wgd</string>
-        <string>--autostarted</string>
-        <string>--idle-timeout-ms</string>
-        <string>60000</string>
-    </array>
-
-    <key>Sockets</key>
-    <dict>
-        <key>Listeners</key>
-        <dict>
-            <key>SockPathName</key>
-            <string>/Library/Application Support/wgd/run/ctl.sock</string>
-            <key>SockType</key>
-            <string>stream</string>
-            <key>SockFamily</key>
-            <string>Unix</string>
-            <!-- 0660 octal = 432 decimal; plist <integer> is base-10. See gotchas. -->
-            <key>SockPathMode</key>
-            <integer>432</integer>
-            <key>SockPathGroup</key>
-            <string>wgd</string>
-        </dict>
-    </dict>
-
-    <!-- On-demand: launchd spawns on first connect, daemon exits on idle, launchd re-spawns. -->
-    <key>RunAtLoad</key>
-    <false/>
-
-    <key>StandardOutPath</key>
-    <string>/var/log/wgd/privileged.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/wgd/privileged.err.log</string>
-</dict>
-</plist>
-```
-
-Changes from current:
-
-- **Add the `Sockets` → `Listeners` dict** matching the socket contract exactly.
-- **Drop `KeepAlive`** and set `RunAtLoad=false` → pure on-demand. (Alternatively keep
-  `RunAtLoad=true` for boot warm-start; on-demand is recommended given the login-time
-  autoconnect agent.)
-- **Add `--autostarted --idle-timeout-ms 60000`** so the launchd-spawned daemon
-  matches the sudo-spawned daemon's idle-exit / lease behavior.
-
-> **Verify the key names and mode encoding on the target macOS version.** Apple's
-> `launchd.plist(5)` historically documents both `SockPathMode`/`SockPathGroup` and the
-> shorter `SockMode`/`SockGroup`. Confirm which the running launchd honors (see gotchas);
-> the value must end up `0660 root:wgd` on the created socket.
-
-### 3. `Makefile` — delegate daemon setup to the binary
-
-`install/privileged` now installs the binary and delegates all daemon setup to
-`wgd launchd install`:
-
-```make
-sudo install -m 0755 target/release/wgd /usr/local/bin/wgd
-sudo /usr/local/bin/wgd launchd install
-```
-
-`wgd launchd install` handles group creation, log dir setup, socket dir
-pre-creation, plist copy/chown, and launchctl bootstrap. Similarly,
-`wgd launchd restart` replaces the direct `launchctl kickstart`, and
-`wgd launchd uninstall` handles bootout/disable and plist removal.
-
-This centralizes the entire daemon lifecycle in the binary, keeping the
-Makefile simple and reducing duplication between install-time and upgrade
-flows.
-
-### 4. Unprivileged client — no change
-
-`src/privileged_client/transport.rs` connects to the same path. When launchd manages
-the socket, the connect succeeds and the sudo autostart branch is never reached.
-
-### 5. (Optional, follow-up) macOS peer-credential hardening
-
-Today macOS trusts any connector that can open the socket. As a separate change, add a
-peer check in `handle_client()` for macOS using `getpeereid()` / `LOCAL_PEERCRED`, so
-socket permissions are not the *only* boundary. Not required for this change; track
-separately.
-
----
-
-## Gotchas / verification checklist
-
-- [ ] **`SockMode` is decimal in plist XML.** `<integer>` is base-10, so `0660` octal =
-      `432`. Writing `<integer>0660</integer>` is wrong. After load, confirm with
-      `stat -f '%Sp %Sg %Su' "/Library/Application Support/wgd/run/ctl.sock"` → expect `srw-rw---- wgd root`.
-- [ ] **Key names.** Confirm `SockPathMode`/`SockPathGroup` vs `SockMode`/`SockGroup`
-      against `man launchd.plist` on the target OS; the effective result must be
-      `0660 root:wgd`.
-- [ ] **launchd respawn throttle (~10s minimum).** Too-short `--idle-timeout-ms` makes a
-      disconnect-then-reconnect within the throttle window add latency. Use ≥30–60s
-      (spec uses 60000ms).
-- [ ] **`/Library/Application Support/wgd/run` exists before first activation** (Makefile step 3).
-- [ ] **`launch_activate_socket` returns `None` cleanly** in a sudo-spawned daemon →
-      self-bind fallback still works.
-- [ ] **`libc::launch_activate_socket` links** on macOS (else add the `extern "C"`).
-
-## Test plan
-
-1. **Fresh install, on-demand:** `make install`. Confirm no daemon is running
-   (`launchctl print system/me.pansen.wgd.privileged` shows loaded, not running).
-   Run a client op that needs privilege → daemon spawns → op succeeds with no sudo
-   prompt. After `--idle-timeout-ms`, confirm the daemon exits and the socket persists.
-2. **Permissions:** `stat -f '%Sp %Sg %Su' "/Library/Application Support/wgd/run/ctl.sock"` → `srw-rw----`,
-   group `wgd`, owner `root`.
-3. **Group gating:** as a user **in** `wgd`, a client connects; a user **not** in
-   `wgd` is denied at connect (`PermissionDenied`).
-4. **sudo fallback intact:** `launchctl bootout system/me.pansen.wgd.privileged`,
-   remove the socket, run a client op from a TTY → sudo autostart self-binds the socket
-   `0660 root:wgd` → op succeeds. Confirms the activation `None` path.
-5. **Reboot:** reboot, log in (autoconnect agent fires) → privileged op works with no
-   manual sudo. This is the original bug; confirm it is fixed.
-6. **Linux unaffected:** build/run on Linux; `systemd_activated_listener()` /
-   self-bind paths behave as before (the new code is `#[cfg(target_os = "macos")]`).
+A user outside `wgd` gets `PermissionDenied` at connect.

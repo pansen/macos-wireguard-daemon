@@ -1,0 +1,41 @@
+---
+source: src/status_render.rs
+expression: "render_network_overview(&ov, &PLAIN)"
+---
+wgd network overview
+interface=utun6 endpoint=23.88.101.22 endpoint_pin=disabled gateway=none local_subnets=none
+
+Routes (AllowedIPs + endpoint pin, with what became of each)
+
+Destination | Via | Family | Live | MTU | Status
+------------+-----+--------+------+-----+------------------
+none        | -   | -      | -    | -   | no routes desired
+
+Tunnel DNS (from the config, and where wgd applies it)
+
+Tunnel DNS | Status
+-----------+-----------------------------------------
+100.64.1.1 | pending: dynamic store key not published
+
+Service | Role | Live DNS | Owned | Original DNS | Status
+--------+------+----------+-------+--------------+---------------------------------------------
+none    | -    | -        | no    | -            | not used: DNS goes through the dynamic store
+
+Dynamic store key | active
+------------------+----------------------------------------------------------------
+Key               | State:/Network/Service/1F0B2C3D-4E5F-8A6B-9C7D-0E1F2A3B4C5D/DNS
+Match domain      | "" (every query)
+State             | missing; the helper republishes it
+
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+-------------------
+100.64.1.1      | matches tunnel DNS
+
+Other tunnels (foreign VPN / utun interfaces)
+
+Interface | MTU | Addresses | Note
+----------+-----+-----------+-----------------
+none      | -   | -         | no other tunnels
+tailscaled=not detected

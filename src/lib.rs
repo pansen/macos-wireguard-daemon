@@ -12,6 +12,7 @@ pub mod cli;
 pub mod completion;
 pub mod config;
 pub mod dns_custody;
+pub mod dns_dynamic_store;
 pub mod doctor;
 // Also home to the `<ID>` completer `cli` attaches to its connection
 // positionals, so `cli` cannot compile without it.

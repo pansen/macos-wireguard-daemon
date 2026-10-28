@@ -11,7 +11,7 @@ use super::connection_store::{self, StoredConnection};
 use super::ControlState;
 use crate::status_notify::{self, Trigger};
 use crate::wireguard::connection_config;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Identifies the caller for authorization purposes. `Socket(uid)` is a real
 /// peer uid from `getpeereid()` on the accepted connection; `Stdio` means the
@@ -207,6 +207,10 @@ pub(super) fn dispatch(
             auth_external_form,
         )),
 
+        PrivilegedRequest::SetConnectionDnsDynamicStore { id, enabled } => {
+            DispatchOutcome::Immediate(handle_set_connection_dns_dynamic_store(origin, id, enabled))
+        }
+
         PrivilegedRequest::ListConnections { scope } => {
             DispatchOutcome::Immediate(handle_list_connections(origin, scope))
         }
@@ -329,6 +333,7 @@ fn handle_add_connection(
         user_disconnected: false,
         source_path,
         mtu_override,
+        dns_dynamic_store: false,
     };
     match connection_store::create(&index_lock, &stored) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
@@ -850,6 +855,39 @@ fn handle_set_connection_mode(
     }
 }
 
+/// Ownership alone is enough: the switch only changes how the owner's own
+/// tunnel DNS reaches the resolver, and runs nothing new as root.
+fn handle_set_connection_dns_dynamic_store(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    enabled: bool,
+) -> PrivilegedResponse {
+    let conn_lock = match connection_store::lock_connection(id) {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    let mut stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return not_found(),
+        Err(error) => return error_response(error),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return response;
+    }
+    if stored.dns_dynamic_store == enabled {
+        return PrivilegedResponse::Unit;
+    }
+    stored.dns_dynamic_store = enabled;
+    stored.updated_at = connection_store::now_unix();
+    match connection_store::update(&conn_lock, &stored) {
+        Ok(()) => {
+            info!(%id, enabled, "privileged_dns_dynamic_store_set");
+            PrivilegedResponse::Unit
+        }
+        Err(error) => error_response(error),
+    }
+}
+
 fn handle_list_connections(origin: PeerOrigin, scope: ConnectionScope) -> PrivilegedResponse {
     if matches!(scope, ConnectionScope::All) && !origin.is_root() {
         return auth_denied("listing all connections requires root");
@@ -908,7 +946,7 @@ fn handle_get_connection(origin: PeerOrigin, id: ConnectionId) -> PrivilegedResp
         return response;
     }
     let connected = connection_store::is_active(id).unwrap_or(false);
-    PrivilegedResponse::Connection(summarize(&stored, connected, true))
+    PrivilegedResponse::Connection(Box::new(summarize(&stored, connected, true)))
 }
 
 // ---- shared helpers ---------------------------------------------------------
@@ -1020,6 +1058,7 @@ fn summarize(
         } else {
             None
         },
+        dns_dynamic_store: conn.dns_dynamic_store,
         created_at: conn.created_at,
         updated_at: conn.updated_at,
     }
@@ -2379,6 +2418,69 @@ mod tests {
                 None,
             );
             assert!(matches!(response, PrivilegedResponse::Unit));
+        });
+    }
+
+    #[test]
+    fn set_dns_dynamic_store_persists_for_the_owner_without_auth() {
+        with_test_store("dns-store-owner", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .dns_dynamic_store
+            );
+
+            let on = handle_set_connection_dns_dynamic_store(PeerOrigin::Socket(501), id, true);
+            assert!(matches!(on, PrivilegedResponse::Unit));
+            assert!(
+                connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .dns_dynamic_store
+            );
+            let PrivilegedResponse::Connection(summary) =
+                handle_get_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("expected a Connection response");
+            };
+            assert!(summary.dns_dynamic_store);
+
+            let off = handle_set_connection_dns_dynamic_store(PeerOrigin::Socket(501), id, false);
+            assert!(matches!(off, PrivilegedResponse::Unit));
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .dns_dynamic_store
+            );
+        });
+    }
+
+    #[test]
+    fn set_dns_dynamic_store_is_denied_to_another_user() {
+        with_test_store("dns-store-other-user", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let response =
+                handle_set_connection_dns_dynamic_store(PeerOrigin::Socket(502), id, true);
+            assert_eq!(error_code(&response), "Auth");
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .dns_dynamic_store
+            );
         });
     }
 

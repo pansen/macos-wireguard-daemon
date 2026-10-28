@@ -150,6 +150,7 @@ mod tests {
             peers: Vec::new(),
             fingerprint: None,
             source_path: None,
+            dns_dynamic_store: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -175,6 +176,7 @@ mod tests {
 
     fn dns(unreachable: Option<DnsCollision>, status: DnsServiceStatus) -> DnsOverview {
         DnsOverview {
+            dynamic_store: None,
             tunnel_servers: vec!["10.66.77.2".to_string(), "100.64.1.1".to_string()],
             primary_service: Some("Wi-Fi".to_string()),
             dormant: unreachable.is_some(),

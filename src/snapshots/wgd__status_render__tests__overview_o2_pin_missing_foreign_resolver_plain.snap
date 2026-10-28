@@ -11,6 +11,8 @@ Destination  | Via | Family | Live   | MTU | Status
 -------------+-----+--------+--------+-----+---------------------------------------------------
 23.88.101.22 | -   | IPv4   | absent | -   | missing: no default gateway to pin the endpoint to
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 Tunnel DNS | Status
 -----------+----------------------------------
 100.64.1.1 | pending: not applied to Wi-Fi yet
@@ -19,7 +21,12 @@ Service | Role    | Live DNS | Owned | Original DNS | Status
 --------+---------+----------+-------+--------------+-----------------------
 Wi-Fi   | primary | 8.8.8.8  | yes   | empty        | owned; pending reapply
 
-! System resolver 1.1.1.1 is not the tunnel resolver; a foreign VPN or DHCP owns resolution
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+---------------
+1.1.1.1         | not tunnel DNS
+! the system resolver is not the tunnel resolver; a foreign VPN or DHCP owns resolution
 
 Other tunnels (foreign VPN / utun interfaces)
 

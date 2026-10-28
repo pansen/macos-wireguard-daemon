@@ -22,6 +22,8 @@ Routes (AllowedIPs + endpoint pin, with what became of each)
 10.98.0.0/16     | system                | IPv4   | ?                   | -    | owned: no longer desired, cleanup pending
 fd00::/8         | interface utun6       | IPv6   | absent              | -    | owned: no longer desired, cleanup pending
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 ⟨90m⟩Tunnel DNS | Status⟨0m⟩
 ⟨90m⟩-----------+-----------------⟨0m⟩
 100.64.1.1 | active via Wi-Fi
@@ -33,7 +35,11 @@ Ethernet           | secondary | 8.8.8.8    | yes   | 1.1.1.1, 1.0.0.1 | owned; 
 ⟨2m⟩USB 10/100 LAN     | secondary | 100.64.1.1 | no    | empty            | not targeted⟨0m⟩
 Wi-Fi              | primary   | 100.64.1.1 | yes   | 9.9.9.9          | tunnel DNS active
 
-System resolver=100.64.1.1 (matches tunnel DNS)
+System resolver (what macOS resolves with right now)
+
+⟨90m⟩System resolver | Status⟨0m⟩
+⟨90m⟩----------------+-------------------⟨0m⟩
+100.64.1.1      | matches tunnel DNS
 
 Other tunnels (foreign VPN / utun interfaces)
 

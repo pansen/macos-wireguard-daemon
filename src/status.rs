@@ -305,6 +305,7 @@ mod tests {
             peers: vec![],
             fingerprint: None,
             source_path: None,
+            dns_dynamic_store: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -328,6 +329,7 @@ mod tests {
             local_subnets: vec![],
             routes: vec![],
             dns: DnsOverview {
+                dynamic_store: None,
                 tunnel_servers: vec![],
                 primary_service: None,
                 unreachable: None,

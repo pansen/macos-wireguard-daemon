@@ -42,6 +42,18 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
         ConnectionCommand::Connect { id, debug } => cmd_connect(&id, debug),
         ConnectionCommand::Disconnect { id, all } => cmd_disconnect(id.as_deref(), all),
         ConnectionCommand::Mode { id, start_mode } => cmd_mode(&id, start_mode.into()),
+        ConnectionCommand::Config {
+            id,
+            dns_dynamic_store,
+            no_dns_dynamic_store,
+        } => {
+            let dns = match (dns_dynamic_store, no_dns_dynamic_store) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            cmd_config(&id, dns)
+        }
         ConnectionCommand::Get { id } => cmd_get(&id),
     }
 }
@@ -274,6 +286,14 @@ fn cmd_add(
             .into_iter()
             .filter(|conn| conn.id != id && conn.name.as_deref() == Some(name.as_str()))
             .collect();
+        // A changed .conf gets a new id; keep the DNS path the user chose.
+        if stale.iter().any(|conn| conn.dns_dynamic_store) {
+            client.set_connection_dns_dynamic_store(id, true)?;
+            println!(
+                "Kept dns-dynamic-store on for {}",
+                id.label(Some(name.as_str()))
+            );
+        }
         for conn in stale {
             println!(
                 "Removing stale connection {} (same name {name:?}, superseded by {})",
@@ -478,6 +498,41 @@ fn needs_session_agent(client: &PrivilegedClient, id: ConnectionId) -> bool {
         .is_ok_and(|conn| !conn.global && conn.start_mode == ConnectionStartMode::Automatic)
 }
 
+/// `dns` is `None` to only print the settings.
+fn cmd_config(id: &str, dns: Option<bool>) -> anyhow::Result<()> {
+    let client = PrivilegedClient::new();
+    let id = resolve_id(&client, id)?;
+    let Some(enabled) = dns else {
+        let conn = client.get_connection(id)?;
+        println!("{}", conn.label());
+        println!("  dns-dynamic-store: {}", on_off(conn.dns_dynamic_store));
+        return Ok(());
+    };
+    client.set_connection_dns_dynamic_store(id, enabled)?;
+    let conn = client.get_connection(id)?;
+    println!(
+        "Set dns-dynamic-store to {} for {}",
+        on_off(enabled),
+        conn.label()
+    );
+    if conn.connected {
+        let name = conn.name.clone().unwrap_or_else(|| conn.id.to_string());
+        println!(
+            "  takes effect at the next connect: wgd connection disconnect {name} && \
+             wgd connection connect {name}"
+        );
+    }
+    Ok(())
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 fn cmd_get(id: &str) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
@@ -498,6 +553,7 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     }
     println!("connected:   {}", conn.connected);
     println!("user_disconnected: {}", conn.user_disconnected);
+    println!("dns_dynamic_store: {}", conn.dns_dynamic_store);
     println!("addresses:   {}", conn.addresses.join(", "));
     println!("dns_servers: {}", conn.dns_servers.join(", "));
     println!(

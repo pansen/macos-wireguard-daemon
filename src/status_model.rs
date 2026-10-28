@@ -127,6 +127,34 @@ pub struct DnsOverview {
     /// DNS is pulled back or held, so no service carries the tunnel resolver.
     pub dormant: bool,
     pub services: Vec<DnsServiceRow>,
+    /// The tunnel's key in the SystemConfiguration dynamic store; `None`
+    /// without one (no tunnel DNS, or a helper from before the key existed).
+    #[serde(default)]
+    pub dynamic_store: Option<DynamicStoreKey>,
+}
+
+/// The tunnel's DNS key in the dynamic store (`doc/dns-dynamic-store.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DynamicStoreKey {
+    pub key: String,
+    pub mode: crate::dns_dynamic_store::StoreKeyMode,
+    /// `""` in active mode.
+    pub match_domain: String,
+    /// `false` while withdrawn because the tunnel DNS collides with a LAN.
+    pub wanted: bool,
+    /// Whether the key exists right now; `None` when the read failed.
+    pub present: Option<bool>,
+}
+
+impl DnsOverview {
+    /// The dynamic store key carries the tunnel's DNS (phase 2), not
+    /// `networksetup` on the primary service.
+    #[must_use]
+    pub fn via_dynamic_store(&self) -> bool {
+        self.dynamic_store
+            .as_ref()
+            .is_some_and(|key| key.mode == crate::dns_dynamic_store::StoreKeyMode::Active)
+    }
 }
 
 /// What became of a tunnel's DNS servers: the verdict of the "Tunnel DNS"
@@ -135,7 +163,8 @@ pub struct DnsOverview {
 pub enum TunnelDnsState {
     /// The tunnel sets no DNS servers.
     NoServers,
-    /// A service resolves through the tunnel DNS.
+    /// A service resolves through the tunnel DNS, or the active dynamic
+    /// store key is published.
     Active,
     /// A tunnel DNS server sits inside a directly connected LAN, so the
     /// reconciler took tunnel DNS off every service.
@@ -153,6 +182,17 @@ impl DnsOverview {
         }
         if let Some(collision) = &self.unreachable {
             return TunnelDnsState::PulledBack(collision.clone());
+        }
+        if let Some(key) = self
+            .dynamic_store
+            .as_ref()
+            .filter(|_| self.via_dynamic_store())
+        {
+            return if key.present == Some(true) {
+                TunnelDnsState::Active
+            } else {
+                TunnelDnsState::Pending
+            };
         }
         if self.dormant {
             return TunnelDnsState::Held;
@@ -228,4 +268,59 @@ pub struct ForeignTunnelRow {
     pub own: bool,
     /// Carries a 100.64.0.0/10 address, the Tailscale tailnet signature.
     pub cgnat: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns_dynamic_store::StoreKeyMode;
+
+    fn dns(mode: StoreKeyMode, present: Option<bool>) -> DnsOverview {
+        DnsOverview {
+            tunnel_servers: vec!["100.64.1.1".to_string()],
+            primary_service: None,
+            unreachable: None,
+            dormant: false,
+            services: vec![],
+            dynamic_store: Some(DynamicStoreKey {
+                key: "State:/Network/Service/X/DNS".to_string(),
+                mode,
+                match_domain: String::new(),
+                wanted: true,
+                present,
+            }),
+        }
+    }
+
+    #[test]
+    fn active_key_decides_tunnel_dns_state() {
+        let published = dns(StoreKeyMode::Active, Some(true));
+        assert_eq!(published.tunnel_dns_state(), TunnelDnsState::Active);
+        assert_eq!(
+            dns(StoreKeyMode::Active, Some(false)).tunnel_dns_state(),
+            TunnelDnsState::Pending
+        );
+        let collision = DnsCollision {
+            server: "100.64.1.1".to_string(),
+            local_subnet: "100.64.1.0/24".to_string(),
+        };
+        let pulled_back = DnsOverview {
+            unreachable: Some(collision.clone()),
+            ..published
+        };
+        assert_eq!(
+            pulled_back.tunnel_dns_state(),
+            TunnelDnsState::PulledBack(collision)
+        );
+    }
+
+    #[test]
+    fn shadow_key_leaves_tunnel_dns_state_to_networksetup() {
+        // No service carries the tunnel DNS, so a published shadow key must
+        // not make the tunnel DNS look active.
+        assert_eq!(
+            dns(StoreKeyMode::Shadow, Some(true)).tunnel_dns_state(),
+            TunnelDnsState::Pending
+        );
+    }
 }
