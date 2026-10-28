@@ -221,7 +221,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 .build()
                 .context("failed to create tokio runtime for userspace helper")?;
 
-            let running = match rt.block_on(start_device(interface)) {
+            let mut running = match rt.block_on(start_device(interface)) {
                 Ok(value) => value,
                 Err(e) => {
                     let _ = signal_parent(false);
@@ -269,7 +269,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             }
 
             let shutdown_started = std::time::Instant::now();
-            let wait_result = rt.block_on(wait_for_shutdown(&running));
+            let wait_result = rt.block_on(wait_for_shutdown(&mut running));
             info!(
                 interface = running.control_interface_name,
                 elapsed_ms = shutdown_started.elapsed().as_millis(),
@@ -413,7 +413,7 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
+async fn wait_for_shutdown(running: &mut RunningDevice) -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -426,6 +426,12 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
+            _ = running.device.wait() => {
+                warn!(interface = running.control_interface_name, trigger = "device_error", "userspace_helper_shutdown_requested");
+                // Return through the normal cleanup path to restore DNS/routes,
+                // stop the device and record the failure before exiting.
+                anyhow::bail!("gotatun device reported an unrecoverable error");
+            },
             _ = sigint.recv() => {
                 info!(interface = running.control_interface_name, trigger = "sigint", "userspace_helper_shutdown_requested");
                 break;
