@@ -11,6 +11,8 @@ Destination | Via | Family | Live | MTU | Status
 ------------+-----+--------+------+-----+------------------
 none        | -   | -      | -    | -   | no routes desired
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 Tunnel DNS | Status
 -----------+---------------------------------
 100.64.1.1 | held: no primary network service
@@ -20,7 +22,11 @@ Service  | Role      | Live DNS   | Owned | Original DNS | Status
 Ethernet | secondary | 100.64.1.1 | no    | empty        | not targeted
 Wi-Fi    | secondary | 100.64.1.1 | yes   | 9.9.9.9      | owned; held, no primary
 
-System resolver=none (DHCP/unset)
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+-----------
+none            | DHCP/unset
 
 Other tunnels (foreign VPN / utun interfaces)
 

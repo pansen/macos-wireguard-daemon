@@ -535,8 +535,8 @@ fn connection_id_from_env() -> Option<crate::privileged_api::ConnectionId> {
     }
 }
 
-/// Active when the daemon found this connection in the opt-in file
-/// (`crate::dns_dynamic_store::opt_in_path`). The key is derived from the
+/// Active when the connection is opted in (`StoredConnection::dns_dynamic_store`,
+/// passed by the daemon as `ACTIVE_ENV`). The key is derived from the
 /// connection id, so without one the helper stays on `networksetup`.
 #[cfg(unix)]
 fn dns_store_key_mode(has_connection_id: bool) -> crate::dns_dynamic_store::StoreKeyMode {

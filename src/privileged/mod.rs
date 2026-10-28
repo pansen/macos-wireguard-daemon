@@ -474,6 +474,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
         PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",
         PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
+        PrivilegedRequest::SetConnectionDnsDynamicStore { .. } => "SetConnectionDnsDynamicStore",
         PrivilegedRequest::ListConnections { .. } => "ListConnections",
         PrivilegedRequest::GetConnection { .. } => "GetConnection",
         PrivilegedRequest::ListDnsCustody => "ListDnsCustody",

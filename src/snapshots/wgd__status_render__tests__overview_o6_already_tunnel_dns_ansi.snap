@@ -11,6 +11,8 @@ Routes (AllowedIPs + endpoint pin, with what became of each)
 ⟨90m⟩------------+-----+--------+------+-----+------------------⟨0m⟩
 ⟨2m⟩none        | -   | -      | -    | -   | no routes desired⟨0m⟩
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 ⟨90m⟩Tunnel DNS | Status⟨0m⟩
 ⟨90m⟩-----------+-----------------⟨0m⟩
 100.64.1.1 | active via Wi-Fi
@@ -20,7 +22,11 @@ Routes (AllowedIPs + endpoint pin, with what became of each)
 ⟨2m⟩Ethernet | secondary | empty      | no    | empty        | not targeted⟨0m⟩
 Wi-Fi    | primary   | 100.64.1.1 | no    | empty        | already tunnel DNS
 
-System resolver=100.64.1.1 (matches tunnel DNS)
+System resolver (what macOS resolves with right now)
+
+⟨90m⟩System resolver | Status⟨0m⟩
+⟨90m⟩----------------+-------------------⟨0m⟩
+100.64.1.1      | matches tunnel DNS
 
 Other tunnels (foreign VPN / utun interfaces)
 

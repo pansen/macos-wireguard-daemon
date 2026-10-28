@@ -184,6 +184,7 @@ pub(super) fn connect(
             &stored.interface,
             &stored.raw_conf,
             None,
+            stored.dns_dynamic_store,
             debug_enabled,
         );
         // Success or not: watch the helper's record if it wrote one, and drop

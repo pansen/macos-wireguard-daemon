@@ -368,6 +368,29 @@ pub enum ConnectionCommand {
         start_mode: StartModeArg,
     },
 
+    /// Show or change a stored connection's settings
+    ///
+    /// Without a flag, prints the settings. --dns-dynamic-store publishes
+    /// the tunnel DNS through the SystemConfiguration dynamic store instead
+    /// of setting it on the primary network service with networksetup
+    /// (see doc/dns-dynamic-store.md). A change applies at the next connect.
+    #[command(verbatim_doc_comment)]
+    Config {
+        /// Connection id or name, as printed by `add` or `list`
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(
+            crate::connection_cli::complete_connection_id
+        ))]
+        id: String,
+
+        /// Resolve tunnel DNS through the dynamic store
+        #[arg(long, conflicts_with = "no_dns_dynamic_store")]
+        dns_dynamic_store: bool,
+
+        /// Resolve tunnel DNS through networksetup (the default)
+        #[arg(long)]
+        no_dns_dynamic_store: bool,
+    },
+
     /// Show full detail for one stored connection (owner or root only)
     Get {
         /// Connection id or name, as printed by `add` or `list`
@@ -766,6 +789,60 @@ mod tests {
             } => assert_eq!(id, "some-id"),
             _ => panic!("expected connection get command"),
         }
+    }
+
+    #[test]
+    fn parse_connection_config_flags() {
+        let parse = |args: &[&str]| -> (bool, bool) {
+            let cli = Cli::try_parse_from(args).expect("parse connection config");
+            match cli.command {
+                TopCommand::Connection {
+                    command:
+                        ConnectionCommand::Config {
+                            id,
+                            dns_dynamic_store,
+                            no_dns_dynamic_store,
+                        },
+                } => {
+                    assert_eq!(id, "andi_split");
+                    (dns_dynamic_store, no_dns_dynamic_store)
+                }
+                _ => panic!("expected connection config command"),
+            }
+        };
+        assert_eq!(
+            parse(&["wgd", "connection", "config", "andi_split"]),
+            (false, false)
+        );
+        assert_eq!(
+            parse(&[
+                "wgd",
+                "connection",
+                "config",
+                "--dns-dynamic-store",
+                "andi_split"
+            ]),
+            (true, false)
+        );
+        assert_eq!(
+            parse(&[
+                "wgd",
+                "connection",
+                "config",
+                "--no-dns-dynamic-store",
+                "andi_split"
+            ]),
+            (false, true)
+        );
+        assert!(Cli::try_parse_from([
+            "wgd",
+            "connection",
+            "config",
+            "--dns-dynamic-store",
+            "--no-dns-dynamic-store",
+            "andi_split",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -337,7 +337,7 @@ of a `scutil` co-process:
   mDNSResponder cache flushed.
 - The notification watch republished a key removed with `scutil` within 1 s
   (`trigger=notification`).
-- 6, 7 and 8 are open.
+- Chrome, 6, 7 and 8 are open (see "Open questions").
 
 ## Rollout
 
@@ -409,11 +409,11 @@ What the shadow phase measures, through log events:
 All helper events carry `mode` (`shadow` or `active`). Machines on macOS 14
 and 15 that run the shadow build cover Verification 8 for the lifecycle part.
 
-`wgd status` shows the key under the DNS tables ("Dynamic store key
-(shadow)=<key> match domain <domain>: published", or withdrawn, missing,
+`wgd status` shows the key as a table under the DNS tables, one row each for
+the key, the match domain and its state (published, or withdrawn, missing,
 unreadable), read through the helper's overview. `wgd doctor` has a section
-"dns dynamic store" with the opt-in file, every DNS-promoting connection's key
-and whether it exists, and the full `scutil --dns`.
+"dns dynamic store" with every DNS-promoting connection's opt-in, its key and
+whether it exists, and the full `scutil --dns`.
 
 What the shadow phase cannot measure: resolver ordering against the default
 resolver, browser behaviour, search-domain interaction and fallback between
@@ -422,17 +422,25 @@ query, so these need phase 2.
 
 ### Phase 2: opt-in
 
-The switch is a root-only file, `/Library/Application Support/wgd/dns-dynamic-store`:
-one connection id per line, `#` starts a comment, edited by hand with sudo.
-There is no API or CLI for it on purpose: it exists only until phase 3, and a
-root-owned file adds no authorization surface. The file must be root-owned
-and not group/other writable (the same check as the runtime dir); otherwise
-the daemon logs `privileged_dns_dynamic_store_opt_in_unreadable` and the
-connection stays in shadow mode.
+The switch is a per-connection setting in the stored connection record
+(`dns_dynamic_store`, off by default):
 
-The daemon reads the file each time it spawns a helper and, for a listed
-connection, sets `WGD_DNS_DYNAMIC_STORE=1` (`privileged_dns_via_dynamic_store`).
-A change takes effect at the next connect. The helper then:
+```
+wgd connection config <id or name>                          # show
+wgd connection config --dns-dynamic-store <id or name>      # on
+wgd connection config --no-dns-dynamic-store <id or name>   # off
+```
+
+The request is `SetConnectionDnsDynamicStore` and is authorized by ownership
+alone, like a per-user `SetConnectionMode`: it only changes how the owner's
+tunnel DNS reaches the resolver and runs nothing new as root. The daemon logs
+`privileged_dns_dynamic_store_set`. `wgd connection add --force`, which gives
+a changed `.conf` a new connection id, carries the setting over from the
+same-named record it replaces; `refresh` keeps the record and so the setting.
+
+When the daemon spawns the helper of an opted-in connection it sets
+`WGD_DNS_DYNAMIC_STORE=1` (`privileged_dns_via_dynamic_store`). A change takes
+effect at the next connect. The helper then:
 
 - publishes the target shape (`SupplementalMatchDomains [""]`) through the same
   owner thread, with the same lifecycle and log events (`mode = active`);
@@ -466,7 +474,24 @@ The dynamic store becomes the only path for new connections; "Migration" and
 
 ## Open questions
 
-- Ordering and fallback among domain-less resolvers (Verification 3 and 6).
+- Chrome (Verification 3). Chrome can resolve with its own DNS client (the
+  built-in async resolver, or "Secure DNS" against a DoH provider) instead of
+  the system resolver, which is the browser risk under "Risks". Test with
+  Secure DNS off and on, open a tunnel-only name and check
+  `chrome://net-internals/#dns`.
+- Ordering and fallback among domain-less resolvers (Verification 6). Needs a
+  second connection with `DNS =` that both opt in; also the mixed case of
+  "Known gaps of phase 2", one connection on each path.
+- configd restart (Verification 7): whether the notification watch or only
+  the 30 s poll republishes the key after `sudo killall configd`. Disruptive,
+  so only when nothing else depends on the network.
+- macOS 14 and 15 (Verification 8): only 27.2 is tested. The cask allows 14.
+- A crashed helper is not reconnected. On 2026-10-28, after `kill -9` of the
+  helper, the tunnel stayed down for more than 30 s until a manual
+  `wgd connection connect`: the session agent connects `Automatic`
+  connections only once at its own start (`src/session_agent.rs`). Not
+  caused by the dynamic store, but in active mode a crash now leaves no
+  stale DNS, so the tunnel being down is the only thing left to repair.
 - Search-domain interaction (see "Search domains").
 - Whether `flush_resolver_cache` is still needed after a key change, or
   whether mDNSResponder picks up the new configuration on its own.

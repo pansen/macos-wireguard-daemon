@@ -305,6 +305,7 @@ mod tests {
             peers: vec![],
             fingerprint: None,
             source_path: None,
+            dns_dynamic_store: false,
             created_at: 0,
             updated_at: 0,
         }

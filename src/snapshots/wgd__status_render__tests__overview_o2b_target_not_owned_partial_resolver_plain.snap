@@ -11,6 +11,8 @@ Destination | Via | Family | Live | MTU | Status
 ------------+-----+--------+------+-----+------------------
 none        | -   | -      | -    | -   | no routes desired
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 Tunnel DNS | Status
 -----------+----------------------------------
 100.64.1.1 | pending: not applied to Wi-Fi yet
@@ -19,7 +21,13 @@ Service | Role    | Live DNS | Owned | Original DNS | Status
 --------+---------+----------+-------+--------------+------------------
 Wi-Fi   | primary | 8.8.8.8  | no    | empty        | target; not owned
 
-! System resolver 100.64.1.1, 1.1.1.1 is only partly tunnel DNS; another resolver is also active
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+-------------------
+100.64.1.1      | matches tunnel DNS
+1.1.1.1         | not tunnel DNS
+! the system resolver is only partly tunnel DNS; another resolver is also active
 
 Other tunnels (foreign VPN / utun interfaces)
 

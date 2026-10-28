@@ -153,6 +153,7 @@ wgd connection get <id-or-name>
 wgd connection connect <id-or-name> [--gotatun-debug]
 wgd connection disconnect <id-or-name> | -a/--all
 wgd connection mode <id-or-name> <manual|automatic>
+wgd connection config <id-or-name> [--dns-dynamic-store | --no-dns-dynamic-store]
 wgd connection refresh <id-or-name> [--file <path>]
 wgd connection remove <id-or-name>
 wgd launchd agent {install,status,uninstall}

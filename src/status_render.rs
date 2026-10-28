@@ -141,14 +141,27 @@ pub fn render_network_overview(ov: &NetworkOverview, ctx: &RenderCtx) -> String 
         "Routes (AllowedIPs + endpoint pin, with what became of each)".to_string(),
     );
     route_table(&ov.routes).render(ctx, &mut out);
-    tunnel_dns_table(&ov.dns).render(ctx, &mut out);
-    dns_table(ov).render(ctx, &mut out);
     out.push('\n');
 
+    line(
+        &mut out,
+        "Tunnel DNS (from the config, and where wgd applies it)".to_string(),
+    );
+    tunnel_dns_table(&ov.dns).render(ctx, &mut out);
+    dns_table(ov).render(ctx, &mut out);
     if let Some(key) = &ov.dns.dynamic_store {
-        dynamic_store_note(key).render(ctx, &mut out);
+        dynamic_store_table(key).render(ctx, &mut out);
     }
-    system_resolver_note(ov).render(ctx, &mut out);
+    out.push('\n');
+
+    line(
+        &mut out,
+        "System resolver (what macOS resolves with right now)".to_string(),
+    );
+    system_resolver_table(ov).render(ctx, &mut out);
+    if let Some(note) = system_resolver_warning(ov) {
+        note.render(ctx, &mut out);
+    }
     out.push('\n');
 
     line(
@@ -348,24 +361,45 @@ pub fn tunnel_dns_status(dns: &DnsOverview, state: &TunnelDnsState) -> String {
 }
 
 /// The tunnel's dynamic store key: what it is and whether it is where its
-/// owner wants it (published, or withdrawn on a LAN collision).
-fn dynamic_store_note(key: &DynamicStoreKey) -> Note {
+/// owner wants it (published, or withdrawn on a LAN collision). One row per
+/// field, because the key and the shadow match domain are too long to share
+/// a line. A shadow key answers no real query, so its rows are muted unless
+/// something is wrong with it.
+fn dynamic_store_table(key: &DynamicStoreKey) -> Table {
+    let mut table = Table::new(&["Dynamic store key", key.mode.as_str()]);
     let domain = match key.mode {
-        StoreKeyMode::Shadow => format!("match domain {}", key.match_domain),
-        StoreKeyMode::Active => "match domain \"\" (every query)".to_string(),
+        StoreKeyMode::Shadow => key.match_domain.clone(),
+        StoreKeyMode::Active => "\"\" (every query)".to_string(),
     };
-    let head = format!(
-        "Dynamic store key ({})={} {domain}",
-        key.mode.as_str(),
-        key.key
-    );
-    match (key.wanted, key.present) {
-        (true, Some(true)) => Note::info(format!("{head}: published")),
-        (false, Some(false)) => Note::info(format!("{head}: withdrawn (LAN collision)")),
-        (true, Some(false)) => Note::warn(format!("{head}: missing; the helper republishes it")),
-        (false, Some(true)) => Note::warn(format!("{head}: still present although withdrawn")),
-        (_, None) => Note::warn(format!("{head}: could not be read")),
+    let (state, ok) = match (key.wanted, key.present) {
+        (true, Some(true)) => ("published", true),
+        (false, Some(false)) => ("withdrawn (LAN collision)", true),
+        (true, Some(false)) => ("missing; the helper republishes it", false),
+        (false, Some(true)) => ("still present although withdrawn", false),
+        (_, None) => ("could not be read", false),
+    };
+    let muted = ok && key.mode == StoreKeyMode::Shadow;
+    let rows = [
+        ("Key", Span::plain(key.key.clone())),
+        ("Match domain", Span::plain(domain)),
+        (
+            "State",
+            if ok {
+                Span::plain(state)
+            } else {
+                Span::styled(state, Role::Warn)
+            },
+        ),
+    ];
+    for (label, value) in rows {
+        let row_cells = vec![Span::plain(label), value];
+        if muted {
+            table.muted_row(row_cells);
+        } else {
+            table.row(row_cells);
+        }
     }
+    table
 }
 
 /// DNS rows, muted when not in effect: the whole block when it is dormant,
@@ -380,14 +414,13 @@ fn dns_table(ov: &NetworkOverview) -> Table {
         "Status",
     ]);
     if ov.dns.services.is_empty() {
-        table.muted_row(cells(strs(&[
-            "none",
-            "-",
-            "-",
-            "no",
-            "-",
-            "no services observed",
-        ])));
+        // In active mode the helper never looks at the services.
+        let status = if ov.dns.via_dynamic_store() {
+            "not used: DNS goes through the dynamic store"
+        } else {
+            "no services observed"
+        };
+        table.muted_row(cells(strs(&["none", "-", "-", "no", "-", status])));
         return table;
     }
     let servers = |list: &Option<Vec<String>>| {
@@ -425,20 +458,34 @@ fn dns_status_text(status: DnsServiceStatus) -> &'static str {
     }
 }
 
-/// The effective system resolver: a plain line while it is unset or the
-/// tunnel's, a warning when another resolver is (also) in charge.
-fn system_resolver_note(ov: &NetworkOverview) -> Note {
-    let servers = format_list(&ov.system_resolver.servers);
+/// The effective system resolver, one row per server like the tunnel DNS
+/// table. Servers that are not tunnel DNS are marked.
+fn system_resolver_table(ov: &NetworkOverview) -> Table {
+    let mut table = Table::new(&["System resolver", "Status"]);
+    if ov.system_resolver.state == ResolverState::Unset {
+        table.muted_row(cells(strs(&["none", "DHCP/unset"])));
+        return table;
+    }
+    for server in &ov.system_resolver.servers {
+        let status = if ov.dns.tunnel_servers.contains(server) {
+            Span::plain("matches tunnel DNS")
+        } else {
+            Span::styled("not tunnel DNS", Role::Warn)
+        };
+        table.row(vec![Span::plain(server.clone()), status]);
+    }
+    table
+}
+
+/// Under the resolver table when another resolver is (also) in charge.
+fn system_resolver_warning(ov: &NetworkOverview) -> Option<Note> {
     match ov.system_resolver.state {
-        ResolverState::Unset => Note::info("System resolver=none (DHCP/unset)"),
-        ResolverState::MatchesTunnel => {
-            Note::info(format!("System resolver={servers} (matches tunnel DNS)"))
-        }
-        ResolverState::PartiallyTunnel => Note::warn(format!(
-            "System resolver {servers} is only partly tunnel DNS; another resolver is also active"
+        ResolverState::Unset | ResolverState::MatchesTunnel => None,
+        ResolverState::PartiallyTunnel => Some(Note::warn(
+            "the system resolver is only partly tunnel DNS; another resolver is also active",
         )),
-        ResolverState::Foreign => Note::warn(format!(
-            "System resolver {servers} is not the tunnel resolver; a foreign VPN or DHCP owns resolution"
+        ResolverState::Foreign => Some(Note::warn(
+            "the system resolver is not the tunnel resolver; a foreign VPN or DHCP owns resolution",
         )),
     }
 }
@@ -1000,10 +1047,9 @@ mod tests {
 
     /// Phase 2: the active key carries the tunnel DNS, no service is a target.
     fn o8() -> NetworkOverview {
-        use DnsServiceStatus::*;
+        // The helper reports no services in active mode, as on a real
+        // machine: it never looks at them.
         let mut ov = overview();
-        ov.dns.primary_service = Some("Wi-Fi".to_string());
-        ov.dns.services = vec![service("Wi-Fi", true, None, false, None, NotTargeted)];
         ov.dns.dynamic_store = Some(store_key(StoreKeyMode::Active, true, Some(true)));
         ov.system_resolver = resolver(&["100.64.1.1"], ResolverState::MatchesTunnel);
         ov

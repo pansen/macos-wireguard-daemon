@@ -11,16 +11,27 @@ Destination | Via | Family | Live | MTU | Status
 ------------+-----+--------+------+-----+------------------
 none        | -   | -      | -    | -   | no routes desired
 
+Tunnel DNS (from the config, and where wgd applies it)
+
 Tunnel DNS | Status
 -----------+-----------------------------------------
 100.64.1.1 | pending: dynamic store key not published
 
-Service | Role    | Live DNS | Owned | Original DNS | Status
---------+---------+----------+-------+--------------+-------------
-Wi-Fi   | primary | empty    | no    | empty        | not targeted
+Service | Role | Live DNS | Owned | Original DNS | Status
+--------+------+----------+-------+--------------+---------------------------------------------
+none    | -    | -        | no    | -            | not used: DNS goes through the dynamic store
 
-! Dynamic store key (active)=State:/Network/Service/1F0B2C3D-4E5F-8A6B-9C7D-0E1F2A3B4C5D/DNS match domain "" (every query): missing; the helper republishes it
-System resolver=100.64.1.1 (matches tunnel DNS)
+Dynamic store key | active
+------------------+----------------------------------------------------------------
+Key               | State:/Network/Service/1F0B2C3D-4E5F-8A6B-9C7D-0E1F2A3B4C5D/DNS
+Match domain      | "" (every query)
+State             | missing; the helper republishes it
+
+System resolver (what macOS resolves with right now)
+
+System resolver | Status
+----------------+-------------------
+100.64.1.1      | matches tunnel DNS
 
 Other tunnels (foreign VPN / utun interfaces)
 

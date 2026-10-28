@@ -386,6 +386,11 @@ impl PrivilegedClient {
         .map(|_| ())
     }
 
+    pub fn set_connection_dns_dynamic_store(&self, id: ConnectionId, enabled: bool) -> Result<()> {
+        self.send(PrivilegedRequest::SetConnectionDnsDynamicStore { id, enabled })
+            .map(|_| ())
+    }
+
     pub fn list_connections(&self, scope: ConnectionScope) -> Result<Vec<ConnectionSummary>> {
         match self.send(PrivilegedRequest::ListConnections { scope })? {
             PrivilegedResponse::ConnectionList(list) => Ok(list),
@@ -406,7 +411,7 @@ impl PrivilegedClient {
 
     pub fn get_connection(&self, id: ConnectionId) -> Result<ConnectionSummary> {
         match self.send(PrivilegedRequest::GetConnection { id })? {
-            PrivilegedResponse::Connection(summary) => Ok(summary),
+            PrivilegedResponse::Connection(summary) => Ok(*summary),
             _ => Err(AppError::Other(
                 "invalid privileged response for GetConnection".into(),
             )),

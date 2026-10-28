@@ -332,41 +332,16 @@ fn ping(host: &str) -> bool {
     }
 }
 
-/// The phase 2 opt-in file, each DNS-promoting connection's dynamic store
-/// key and the resolver configuration macOS built from all of them
+/// Each DNS-promoting connection's phase 2 opt-in and dynamic store key, and
+/// the resolver configuration macOS built from all of them
 /// (`doc/dns-dynamic-store.md`). Only reads; the keys belong to the helpers.
 fn dynamic_store_section(connections: Option<&[ConnectionSummary]>) -> String {
     let mut out = String::new();
-    let path = crate::dns_dynamic_store::opt_in_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let _ = writeln!(out, "opt-in file {}:", path.display());
-            for line in text.lines() {
-                let _ = writeln!(out, "  {line}");
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = writeln!(
-                out,
-                "opt-in file {}: absent (every connection in shadow mode)",
-                path.display()
-            );
-        }
-        Err(e) => {
-            let _ = writeln!(out, "opt-in file {}: {e}", path.display());
-        }
-    }
-
     let with_dns = connections
         .unwrap_or_default()
         .iter()
         .filter(|conn| !conn.dns_servers.is_empty());
     for conn in with_dns {
-        let opted_in = match crate::dns_dynamic_store::opted_in(conn.id) {
-            Ok(true) => "yes".to_string(),
-            Ok(false) => "no".to_string(),
-            Err(e) => format!("unknown ({e})"),
-        };
         let present = match crate::dns_dynamic_store::key_present(conn.id) {
             Ok(true) => "yes".to_string(),
             Ok(false) => "no".to_string(),
@@ -374,9 +349,10 @@ fn dynamic_store_section(connections: Option<&[ConnectionSummary]>) -> String {
         };
         let _ = writeln!(
             out,
-            "{} connected={} opted_in={opted_in} key={} present={present}",
+            "{} connected={} dns_dynamic_store={} key={} present={present}",
             conn.label(),
             conn.connected,
+            conn.dns_dynamic_store,
             crate::dns_dynamic_store::dns_key(conn.id),
         );
     }
@@ -794,6 +770,7 @@ mod tests {
             peers,
             fingerprint: None,
             source_path: None,
+            dns_dynamic_store: false,
             created_at: 0,
             updated_at: 0,
         }
