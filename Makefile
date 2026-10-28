@@ -5,6 +5,11 @@
 WGD_PROFILE ?= $(HOME)/private/.wireguard/andi_split.conf
 CONNECTION_NAME ?= andi_split
 WGD_BIN ?= /usr/local/bin/wgd
+# The Homebrew cask's `wgd` link and the staged binary it points to. Set only
+# when the cask is installed; `make install` then replaces that binary instead
+# of putting a second, unmanaged copy next to it.
+BREW_WGD ?= /opt/homebrew/bin/wgd
+BREW_WGD_STAGED := $(if $(findstring /Caskroom/,$(realpath $(BREW_WGD))),$(realpath $(BREW_WGD)))
 # The installed binary, or the freshly compiled one once purge removed it.
 WGD ?= $(or $(wildcard $(WGD_BIN)),target/release/wgd)
 
@@ -22,8 +27,16 @@ build.release: fmt
 
 .PHONY: install.binary
 install.binary:
-	@# Binary copy is a dev stand-in for the future Homebrew bottle.
+ifneq ($(BREW_WGD_STAGED),)
+	@# Cask installed: overwrite its staged binary, then let `launchd install`
+	@# copy it to $(WGD_BIN) exactly as the cask's installer step does, so
+	@# Homebrew's link, the trusted copy and the daemon run the same build.
+	@# `brew reinstall --cask macos-wireguard-daemon` restores the release.
+	install -m 0755 target/release/wgd $(BREW_WGD_STAGED)
+	sudo $(BREW_WGD) launchd install
+else
 	sudo install -m 0755 target/release/wgd $(WGD_BIN)
+endif
 
 .PHONY: install.privileged
 install.privileged: install.binary
