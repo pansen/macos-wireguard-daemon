@@ -170,12 +170,19 @@ pub fn dns_custody_dir() -> PathBuf {
     privileged_runtime_dir().join("dns-custody")
 }
 
+/// File name of the sentinel inside `dns-custody/`; see
+/// [`dns_custody_watch_path`].
+pub const DNS_CUSTODY_WATCH_FILE: &str = "watch";
+
 /// Sentinel inside `dns-custody/`: while it exists launchd keeps the
 /// privileged daemon running (`KeepAlive`/`PathState` in the daemon plist), so
-/// a helper crash or a power loss is always noticed by someone.
+/// a helper crash or a power loss is always noticed by someone. The daemon
+/// creates it at connect and the helper creates it whenever it writes a record
+/// (it may promote DNS long after the daemon idled out); only the daemon
+/// removes it, once no record needs watching.
 #[must_use]
 pub fn dns_custody_watch_path() -> PathBuf {
-    dns_custody_dir().join("watch")
+    dns_custody_dir().join(DNS_CUSTODY_WATCH_FILE)
 }
 
 /// Create `dns-custody/` as `root:wheel 0700` if missing and validate it like

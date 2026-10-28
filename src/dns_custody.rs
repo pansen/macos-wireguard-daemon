@@ -102,21 +102,53 @@ pub fn read_record(path: &Path) -> io::Result<RecordRead> {
 
 /// `dns-custody/<interface>.json`. Rejects names that could leave the directory.
 pub fn record_path(interface: &str) -> io::Result<PathBuf> {
+    record_path_in(&crate::config::dns_custody_dir(), interface)
+}
+
+fn record_path_in(dir: &Path, interface: &str) -> io::Result<PathBuf> {
     if interface.is_empty() || interface.contains('/') || interface.starts_with('.') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid interface name for a DNS custody record",
         ));
     }
-    Ok(crate::config::dns_custody_dir().join(format!("{interface}.json")))
+    Ok(dir.join(format!("{interface}.json")))
 }
 
 /// Write the record durably. The directory must already exist: only the
 /// privileged daemon creates it.
 pub fn write_record(record: &DnsCustodyRecord) -> io::Result<()> {
-    let path = record_path(&record.interface)?;
+    write_record_in(&crate::config::dns_custody_dir(), record)
+}
+
+fn write_record_in(dir: &Path, record: &DnsCustodyRecord) -> io::Result<()> {
+    let path = record_path_in(dir, &record.interface)?;
     let json = serde_json::to_vec(record).map_err(io::Error::other)?;
     crate::state_file::write_atomic(&path, &json)
+}
+
+/// Make sure the `watch` sentinel exists, so launchd starts (or keeps) the
+/// privileged daemon to watch this helper. Only the helper calls this, and only
+/// *after* [`write_record`] succeeded; the daemon's sweep rewrites records via
+/// `write_record` alone, so `wgd dns repair` and purge, which remove the
+/// sentinel first, cannot bring it back.
+///
+/// The order matters: a daemon that launchd starts because of the sentinel runs
+/// its startup sweep and `settle_locked` at once, and if it found no record yet
+/// it would delete the sentinel again. This covers a helper that only promotes
+/// DNS late in its life (e.g. roaming from a colliding LAN to a hotspot after
+/// `connect` settled the sentinel away and the daemon idled out). Best effort,
+/// like the record itself: the caller only logs a failure.
+pub fn ensure_watch_sentinel() -> io::Result<()> {
+    ensure_watch_sentinel_in(&crate::config::dns_custody_dir())
+}
+
+fn ensure_watch_sentinel_in(dir: &Path) -> io::Result<()> {
+    let watch = dir.join(crate::config::DNS_CUSTODY_WATCH_FILE);
+    if watch.exists() {
+        return Ok(());
+    }
+    crate::state_file::write_atomic(&watch, b"")
 }
 
 pub fn remove_record(interface: &str) -> io::Result<()> {
@@ -191,5 +223,43 @@ mod tests {
         assert!(record_path("wg-1ce3a4a1")
             .unwrap()
             .ends_with("dns-custody/wg-1ce3a4a1.json"));
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wgd-dns-custody-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_record_does_not_create_the_watch_sentinel() {
+        let dir = temp_dir();
+        let record = sample();
+
+        write_record_in(&dir, &record).unwrap();
+
+        let record_file = dir.join("wg-1ce3a4a1.json");
+        assert_eq!(
+            read_record(&record_file).unwrap(),
+            RecordRead::Record(record)
+        );
+        assert!(!dir.join(crate::config::DNS_CUSTODY_WATCH_FILE).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_watch_sentinel_creates_it_and_is_idempotent() {
+        let dir = temp_dir();
+        let watch = dir.join(crate::config::DNS_CUSTODY_WATCH_FILE);
+
+        ensure_watch_sentinel_in(&dir).unwrap();
+        assert!(watch.exists());
+        ensure_watch_sentinel_in(&dir).unwrap();
+        assert!(watch.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

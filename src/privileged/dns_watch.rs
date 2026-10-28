@@ -5,7 +5,9 @@
 //! 1. While the daemon runs, a kqueue `EVFILT_PROC`/`NOTE_EXIT` watch per live
 //!    custody record runs the single-record sweep the moment its helper exits.
 //! 2. The `dns-custody/watch` sentinel makes launchd keep the daemon alive
-//!    (and start it at boot) while custody is pending.
+//!    (and start it at boot) while custody is pending. Both sides create it
+//!    (the daemon at connect, the helper with each record it writes); only the
+//!    daemon removes it.
 //! 3. A retry loop re-runs the sweep every minute while a restore keeps
 //!    failing, instead of letting the daemon idle-exit.
 //!
@@ -15,6 +17,7 @@
 //! daemon that stays up for the whole life of a tunnel must not do.
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -299,7 +302,11 @@ fn handle_exit(pid: u32, helper: WatchedHelper) {
 }
 
 /// Create the sentinel before a helper that will promote DNS is spawned.
-/// Caller holds the system network mutation lock.
+/// Caller holds the system network mutation lock. The helper also creates the
+/// sentinel itself whenever it writes a record
+/// ([`crate::dns_custody::ensure_watch_sentinel`], without this lock); the
+/// daemon is the only one that removes it, in [`settle_locked`] and the
+/// one-shot sweep.
 pub(super) fn create_sentinel_locked() {
     if let Err(error) =
         crate::state_file::write_atomic(&crate::config::dns_custody_watch_path(), b"")
@@ -321,7 +328,7 @@ pub(super) struct CustodyState {
 /// whose helper is live, and keep retrying records that could not be restored.
 /// Caller holds the system network mutation lock.
 pub(super) fn settle_locked() -> CustodyState {
-    let states = match dns_sweep::read_record_states(&Scope::All) {
+    let mut states = match dns_sweep::read_record_states(&Scope::All) {
         Ok(states) => states,
         Err(error) => {
             // Cannot tell what is pending: leave the sentinel as it is.
@@ -337,10 +344,55 @@ pub(super) fn settle_locked() -> CustodyState {
             .flat_map(|(_, s)| s.record.services.iter().map(|svc| svc.service.clone()))
             .collect()
     });
+    let (mut custody, mut statuses) = classify_all(&states, &listed);
+
+    let sentinel = crate::config::dns_custody_watch_path();
+    if dns_sweep::sentinel_wanted(&statuses) {
+        if !sentinel.exists() {
+            create_sentinel_locked();
+        }
+    } else {
+        if let Err(error) = crate::state_file::remove_durable(&sentinel) {
+            warn!(error = %error, "privileged_dns_custody_sentinel_failed");
+        }
+        // The helper does not take our lock and writes its record before it
+        // checks for the sentinel, while we delete the sentinel before this
+        // re-scan. So either the re-scan sees a record that appeared since the
+        // first scan (the listing above takes 100 ms or more), or the helper
+        // saw the sentinel gone and creates it again. Without the re-scan its
+        // fresh sentinel could be deleted here and the record left unwatched.
+        match dns_sweep::read_record_states(&Scope::All) {
+            Ok(after) if custody_changed(&states, &after) => {
+                states = after;
+                (custody, statuses) = classify_all(&states, &listed);
+                if dns_sweep::sentinel_wanted(&statuses) {
+                    create_sentinel_locked();
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Cannot tell whether a helper slipped in: a spare sentinel
+                // only keeps the daemon around, a missing one loses a watch.
+                warn!(error = %error, "privileged_dns_custody_scan_failed");
+                create_sentinel_locked();
+            }
+        }
+    }
+    if custody.restorable > 0 {
+        ensure_retry_loop();
+    }
+    custody
+}
+
+/// Classify every record, and watch the ones whose helper is live.
+fn classify_all(
+    states: &[(PathBuf, dns_sweep::RecordState)],
+    listed: &[String],
+) -> (CustodyState, Vec<RecordStatus>) {
     let mut custody = CustodyState::default();
     let mut statuses = Vec::with_capacity(states.len());
-    for (_, state) in &states {
-        let status = dns_sweep::classify_record(state.helper_live, &state.record.services, &listed);
+    for (_, state) in states {
+        let status = dns_sweep::classify_record(state.helper_live, &state.record.services, listed);
         match status {
             RecordStatus::Live => {
                 custody.live += 1;
@@ -351,19 +403,20 @@ pub(super) fn settle_locked() -> CustodyState {
         }
         statuses.push(status);
     }
+    (custody, statuses)
+}
 
-    let sentinel = crate::config::dns_custody_watch_path();
-    if dns_sweep::sentinel_wanted(&statuses) {
-        if !sentinel.exists() {
-            create_sentinel_locked();
-        }
-    } else if let Err(error) = crate::state_file::remove_durable(&sentinel) {
-        warn!(error = %error, "privileged_dns_custody_sentinel_failed");
-    }
-    if custody.restorable > 0 {
-        ensure_retry_loop();
-    }
-    custody
+/// Whether `after` holds a record that `before` did not: a new file, or a
+/// rewrite by a different helper (same interface, so same path).
+fn custody_changed(
+    before: &[(PathBuf, dns_sweep::RecordState)],
+    after: &[(PathBuf, dns_sweep::RecordState)],
+) -> bool {
+    after.iter().any(|(path, state)| {
+        !before
+            .iter()
+            .any(|(known, old)| known == path && old.record == state.record)
+    })
 }
 
 /// While a restore keeps failing the sentinel stays and launchd would restart
@@ -458,5 +511,40 @@ mod tests {
         assert_eq!(hold.load(Ordering::SeqCst), 1);
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    fn state(interface: &str, pid: u32) -> (PathBuf, dns_sweep::RecordState) {
+        let record = DnsCustodyRecord {
+            version: crate::dns_custody::DNS_CUSTODY_VERSION,
+            connection_id: ConnectionId::new(),
+            interface: interface.into(),
+            helper_pid: pid,
+            helper_start: ProcessStart { sec: 1, usec: 2 },
+            tunnel_dns: vec!["10.0.0.1".into()],
+            services: Vec::new(),
+        };
+        (
+            PathBuf::from(format!("{interface}.json")),
+            dns_sweep::RecordState {
+                record,
+                helper_live: true,
+            },
+        )
+    }
+
+    #[test]
+    fn custody_changed_sees_new_and_rewritten_records_only() {
+        let known = vec![state("wg-a", 1)];
+        assert!(!custody_changed(&known, &known));
+        assert!(!custody_changed(&known, &[]));
+
+        let mut grown = known.clone();
+        grown.push(state("wg-b", 2));
+        assert!(custody_changed(&known, &grown));
+
+        // Same interface, different helper instance.
+        let mut rewritten = known.clone();
+        rewritten[0].1.record.helper_pid = 9;
+        assert!(custody_changed(&known, &rewritten));
     }
 }

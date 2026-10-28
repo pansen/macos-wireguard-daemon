@@ -77,7 +77,13 @@ pub(super) fn persist_dns_custody(
             .iter()
             .map(crate::dns_custody::DnsCustodyService::from)
             .collect();
+        // Record first, sentinel second: a daemon launchd starts because of the
+        // sentinel sweeps and settles at once, and would delete the sentinel
+        // again if it found no record yet. This is what wakes the daemon when
+        // DNS is promoted late (roaming onto a hotspot after the daemon settled
+        // the sentinel away and idled out).
         crate::dns_custody::write_record(&identity.record(&inputs.dns_servers, owned))
+            .and_then(|()| crate::dns_custody::ensure_watch_sentinel())
     };
     if let Err(error) = result {
         warn!(

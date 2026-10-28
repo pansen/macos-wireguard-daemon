@@ -60,6 +60,9 @@
         </dict>
     </dict>
 
+    <!-- `ExitTimeOut` is intentionally omitted to use launchd's 5s default;
+         please see: issues/shutdown-teardown.md. -->
+
     <key>StandardOutPath</key>
     <string>/var/log/wgd/privileged.out.log</string>
     <key>StandardErrorPath</key>

@@ -26,10 +26,8 @@
     <key>KeepAlive</key>
     <true />
 
-    <!-- Default is 20s; tearing down several connections serially (each with
-         its own PreDown/PostDown hooks) at logout can take longer. -->
-    <key>ExitTimeOut</key>
-    <integer>120</integer>
+    <!-- `ExitTimeOut` is intentionally omitted to use launchd's 5s default;
+         please see: issues/shutdown-teardown.md. -->
 
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>   <!-- only in a real GUI login session -->
