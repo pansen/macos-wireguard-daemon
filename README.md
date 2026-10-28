@@ -62,11 +62,14 @@ From source:
 make install WGD_PROFILE=/path/to/your.conf CONNECTION_NAME=home
 ```
 
-This builds the release binary into `/usr/local/bin/wgd`, runs
-`wgd launchd reload` (see below), adds your config as a per-user connection
-named `CONNECTION_NAME` (`--force --start-mode automatic`), connects it, and
-installs bash completion. Re-running it after editing the config is safe: an
-unmodified file is a no-op, a changed one replaces the old record.
+This builds and installs `/usr/local/bin/wgd`, runs `wgd launchd reload` (see
+below), adds your config as a per-user connection named `CONNECTION_NAME`
+(`--force --start-mode automatic`), connects it, and installs bash
+completion. With the Homebrew cask installed, it replaces the cask's binary
+instead of installing a second copy; `brew reinstall --cask
+macos-wireguard-daemon` restores the release. Re-running it after editing the
+config is safe: an unmodified file is a no-op, a changed one replaces the old
+record.
 
 Access to the privileged daemon is limited to a dedicated `wgd` group, which
 the install creates and adds you to (a re-login may be needed for the
@@ -95,28 +98,22 @@ both back and reconnect, run as your normal user:
 wgd launchd reload     # make reload does the same
 ```
 
-It re-registers the privileged daemon (escalating via `sudo` for that step),
-disconnects your connected connections, and reinstalls the session agent,
-which then reconnects your automatic connections. It logs at debug level by
-default; `-s` keeps only the step headers.
-
-`sudo wgd launchd restart` only restarts the daemon with its existing
-registration. It leaves the session agent alone and does not reconnect
-anything.
+It re-registers the daemon (via `sudo`), disconnects your connections, and
+reinstalls the session agent, which reconnects your automatic ones; `-s`
+keeps only the step headers. `sudo wgd launchd restart` only restarts the
+daemon and reconnects nothing.
 
 ### Uninstall
 
-`make uninstall` (or `sudo /usr/local/bin/wgd launchd uninstall` plus
-`wgd launchd agent uninstall`) stops the daemon and session agent. Run
-`wgd dns repair` afterwards if a helper was killed and left tunnel DNS behind.
-Stored connections stay.
+`make uninstall` (or `sudo /usr/local/bin/wgd launchd uninstall` plus `wgd
+launchd agent uninstall`, then `wgd dns repair`) disconnects all tunnels and
+unregisters the daemon and the session agent; stored connections, binary,
+group and logs stay. `brew uninstall` does the same for the daemon.
 
-`wgd launchd purge` removes everything else except the binary: it unregisters
-both services, restores DNS, and deletes the state directory (including the
-connection store), the logs, the authorization right, and the `wgd` group. It
-also lists session-agent plists that other users still have in their home
-directories. `brew uninstall --zap macos-wireguard-daemon` runs it and then
-removes the binary; `make purge` does the same for a source install.
+`wgd launchd purge` also restores DNS and deletes the connection store, the
+logs, the authorization right and the `wgd` group, and lists session-agent
+plists other users still have. `brew uninstall --zap macos-wireguard-daemon`
+and `make purge` run it and then remove the binary.
 
 ## Connections
 
@@ -134,17 +131,12 @@ opaque id (you can also refer to it by the name you gave it). Two kinds:
   up at login and tears them down at logout (not on fast user switching to a
   different session; that case isn't handled yet).
 
-A per-user automatic connection only comes up at login if its owner's session
-agent is active. `wgd connection add --start-mode automatic`, `connection mode
-<id> automatic`, `connection connect`, and `connection refresh` therefore check
-the agent afterwards and install it when it is missing or not loaded. So does
-`sudo wgd launchd install` (or a Homebrew upgrade) for the user who ran it. If
-you switched the agent off in System Settings -> General -> Login Items, wgd
-does not turn it back on: it prints a warning, and `wgd launchd agent install
---force` re-enables it if that is what you want. `wgd status` prints the same
-warning to stderr, and `wgd doctor` reports the session agent as `FAIL`, while
-a per-user automatic connection depends on an agent that is not loaded. Neither
-changes anything.
+A per-user automatic connection needs its owner's session agent.
+`connection add --start-mode automatic`, `connection mode <id> automatic`,
+`connection connect`, `connection refresh` and `sudo wgd launchd install`
+install it when it is missing. If you switched it off in System Settings ->
+General -> Login Items, wgd only warns (`wgd status`; `wgd doctor` reports
+`FAIL`); `wgd launchd agent install --force` turns it back on.
 
 ```bash
 wgd connection add --file <path> [--global] [--name <label>] [--mtu <n>] [--start-mode manual|automatic] [--force]
@@ -159,32 +151,24 @@ wgd connection remove <id-or-name>
 wgd launchd agent {install,status,uninstall}
 ```
 
-Adding, removing, or refreshing a connection to a changed config, and elevating a global connection's mode
-from manual to automatic, each require real macOS admin authentication
-(password or Touch ID): those are the only operations that let new
-root-executed config content into the store, or make it run unattended at
-every future boot. That content can include `PreUp`/`PostUp`/`PreDown`/
-`PostDown` hooks from the `.conf`, which run as root on every connect and
-disconnect. Connecting, disconnecting, or downgrading a connection you
-already added only requires being its owner (or root for a global one), the
-same way the macOS Network pane asks for admin credentials to add a VPN
-profile but not to connect one that's already configured.
+Adding, removing, refreshing to a changed config, and switching a global
+connection from manual to automatic require macOS admin authentication
+(password or Touch ID): only these let new root-executed content, such as
+`PreUp`/`PostUp`/`PreDown`/`PostDown` hooks, into the store or make it run
+unattended at boot. Everything else only requires owning the connection (or
+root for a global one), like the macOS Network pane, which asks for admin
+credentials to add a VPN profile but not to connect it.
 
-`--mtu` only applies at `add` time; the value is remembered and applied again
-on `refresh`. Changing it means re-adding the connection (`--force` to replace
-a same-named record instead of creating a second one).
+`--mtu` only applies at `add` time and is applied again on `refresh`;
+changing it means re-adding (`--force` replaces a same-named record).
 
-`refresh` re-reads the `.conf` a connection was added from and applies the
-changes in place, keeping its id, name, and start mode. `add` records the
-file's absolute path (symlinks are kept, so a retargeted symlink is followed), and `connection get` shows it as `source:`; pass
-`--file` to refresh from a different file (which then becomes the recorded
-path), or if the connection was added by an older version that did not record
-one. `wgd` reads the file as you and sends the text to the daemon, which never
-opens the path itself. If the file's content is unchanged, nothing happens and
-no prompt appears. If it changed, you get the admin-authentication prompt, and
-a connection that is currently up is disconnected and reconnected on the new
-config. `refresh` refuses a config that is identical to another connection you
-already have.
+`refresh` re-reads the `.conf` the connection was added from (shown as
+`source:` by `connection get`; symlinks are followed) and keeps id, name and
+start mode. `--file` refreshes from another file, which then becomes the
+source. `wgd` reads the file as you; the daemon never opens it. An unchanged
+file is a no-op; a changed one asks for admin authentication and reconnects a
+running connection. `refresh` refuses a config identical to another of your
+connections.
 
 ## What it does while you forget about it
 
@@ -196,38 +180,64 @@ already have.
 - Reconciles **DNS** as well as it can, so lookups for your internal names
   keep resolving through the tunnel as the network underneath changes.
 
+### DNS
+
+By default, `wgd` sets a tunnel's `DNS =` servers on your primary network
+service with `networksetup`, re-applies them when the network changes,
+pulls them back while a tunnel DNS server sits inside your current LAN, and
+restores the previous setting on disconnect. A killed helper leaves them
+behind; the daemon restores them when it notices or at the next boot, and
+`wgd dns repair` does it on demand.
+
+Per connection, the tunnel DNS can instead go through the macOS
+SystemConfiguration dynamic store:
+
+```bash
+wgd connection config <id-or-name>                          # show the setting
+wgd connection config --dns-dynamic-store <id-or-name>      # opt in
+wgd connection config --no-dns-dynamic-store <id-or-name>   # back to networksetup (default)
+```
+
+`wgd` then adds its own resolver and never changes your network services'
+DNS. The resolver lives only as long as the tunnel's helper, so a crash or a
+reboot leaves nothing to repair. The change applies at the next connect. The
+mode is new and so far tested on macOS 27.2 only; queries an app binds to one
+interface bypass it, which matters for full tunnels. Details and open
+questions: [doc/dns-dynamic-store.md](doc/dns-dynamic-store.md).
+
 ## Troubleshooting
 
 ```bash
-wgd status [--dns]                 # connections, wg show, routes, DNS custody notes
+wgd status [--dns | --json]        # connections, wg show, routes, DNS, DNS custody notes
 wgd launchd status                 # daemon state, socket permissions, group, helper pids
 wgd logs [-f] [-n N] [--launchd] [--all] [<connection>]
 wgd doctor [--report <file>]       # status, launchd status and logs in one report
-wgd dns repair                     # restore DNS a killed helper left behind
+wgd dns repair                     # restore DNS a killed helper left behind (networksetup mode)
 ```
 
-`wgd status --dns` adds the live DNS servers of every network service. A
-healthy system shows no tunnel DNS unless a tunnel is up.
+For each connected connection, `wgd status` shows routes, "Tunnel DNS"
+(where each server is applied, plus the dynamic store key; without the
+option it is a muted `shadow` probe) and "System resolver" (what macOS uses
+right now). `--dns` adds every network service's DNS servers; `--json`
+prints the report as JSON.
 
-`wgd launchd status`, `wgd logs`, `wgd doctor` and `wgd dns repair` need root
-and ask for your password through `sudo` themselves; run them as your normal
-user. They do not query the daemon: connecting to its socket would start it
-and hide the very state you want to see.
+`wgd launchd status`, `wgd logs`, `wgd doctor` and `wgd dns repair` ask for
+`sudo` themselves; run them as your normal user. `launchd status` and
+`doctor` read launchd's view of the daemon before contacting it, since a
+connect would start it and hide the state you want to see.
 
 `wgd logs` prints the last 150 lines (`-n`) of `/var/log/wgd/*.log`: the
-daemon's `privileged.{out,err}.log` and one `<interface>.log` per connection
-helper, plus its previous session in `<interface>.1.log`. Each helper start
-rotates the current log, replacing the previous session. Pass a connection
-name, id or interface (`wg-1ce3a4a1`) to filter to its current log.
-Logs of connections untouched for 24 hours are skipped unless you pass
-`--all`. `--launchd` shows what launchd logged about wgd in the last 10
-minutes, which is where a daemon that fails to start shows up. `-f` follows.
+daemon's `privileged.{out,err}.log` and one `<interface>.log` per helper,
+plus the previous session in `<interface>.1.log`. A connection name, id or
+interface filters to one helper; logs untouched for 24 hours need `--all`.
+`--launchd` shows launchd's last 10 minutes about wgd, where a daemon that
+fails to start shows up. The session agent logs to
+`~/Library/Logs/wgd-session-agent.{out,err}.log`.
 
-`wgd doctor` runs the status, launchd status and log sections in a fixed order, then pings the DNS
-servers and endpoints of your connected connections and 1.1.1.1 as an
-internet control. A peer endpoint that does not answer ping is only
-informational, since many drop ICMP. If you decline `sudo`, the sections that
-need root say `skipped (needs sudo)` and the rest still runs.
+`wgd doctor` combines launchd status, DNS per service, `wgd status`, the
+dynamic store keys with `scutil --dns`, reachability (pings to tunnel DNS,
+host routes, endpoints and 1.1.1.1; an endpoint without ICMP is only
+informational) and the logs. Without `sudo` the log sections are skipped.
 
 To file a bug report, attach the output of:
 
@@ -235,13 +245,13 @@ To file a bug report, attach the output of:
 wgd doctor --report wgd-report.txt
 ```
 
-The file is created with mode 0600 and refuses to overwrite an existing one.
-It is redacted: private and preshared keys are removed, public IPs keep only
-their first and last octet, public keys and hostnames keep only their ends.
-Private and tunnel address ranges stay readable so routes and DNS can still
-be debugged. The terminal output is not redacted. Read the report before you
-post it; hostnames on an uncommon TLD are only masked when they follow
-`endpoint`.
+The file is created with mode 0600 and never overwrites one. It is
+redacted: private and preshared keys become `<redacted>`, public IPs keep
+their first and last octet, public keys and hostnames their ends; private and
+tunnel ranges stay readable. The terminal output is not redacted. Read the
+report before posting it: hostnames on an uncommon TLD are only masked after
+`endpoint`, and service names, connection names, your user name and search
+domains stay in.
 
 ## How it works
 
@@ -263,12 +273,11 @@ helper actually talk to each other, see [doc/architecture.md](doc/architecture.m
 ## Configuration
 
 `wgd` reads optional defaults from `$XDG_CONFIG_HOME/wgd/config.toml`
-(typically `~/.config/wgd/config.toml`), under a `[general]` table. The
-file is optional; without it, sensible defaults apply. It covers the
-privileged daemon's transport (socket or stdio), its autostart/autostop
-behavior, and the group used for socket permissions. It has nothing to do
-with connections themselves, which live entirely in the privileged store and
-are managed through `wgd connection`.
+(typically `~/.config/wgd/config.toml`), under `[general]`: the transport to
+the daemon (socket or stdio) and how a daemon the CLI starts itself via
+`sudo` is started and stopped (`privileged_*` keys in `src/config.rs`). The
+launchd daemon ignores them ([doc/launchd-socket-activation.md](doc/launchd-socket-activation.md)).
+Connections live only in the privileged store.
 
 ## Running alongside the WireGuard app
 
@@ -279,7 +288,8 @@ first.
 
 ## Requirements
 
-- macOS on Apple Silicon.
+- macOS 14 (Sonoma) or later on Apple Silicon; the Homebrew cask enforces
+  both.
 - A stable Rust toolchain to build from source.
 - `sudo` access for the install and privileged operations.
 

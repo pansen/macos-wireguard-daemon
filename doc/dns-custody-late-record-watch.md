@@ -4,27 +4,32 @@
 **Scope:** privileged daemon custody watch (`src/privileged/dns_watch.rs`), userspace helper custody record (`src/userspace_helper/macos/dns.rs`, `src/dns_custody.rs`)
 **Related:** `issues/dns-crash-recovery.md` (the custody watch this extends), `issues/shutdown-teardown.md`
 
-Line numbers below are as of `1c0202c`.
+Line numbers below are as of `60c4c8f`.
 
 ## Problem
 
 The daemon only learns about a custody record when it runs `settle_locked`
-(`src/privileged/dns_watch.rs:330`). That is the only place that calls
+(`src/privileged/dns_watch.rs:372`). That is the only place that calls
 `watch_record` (`dns_watch.rs:239`), which registers the kqueue
 `EVFILT_PROC`/`NOTE_EXIT` watch on the helper's pid. `settle_locked` runs:
 
-- after a connect (`src/privileged/connection_ops.rs:191`),
-- after every sweep: the startup sweep (`src/privileged/mod.rs:196`), the exit
-  watch of an already watched helper (`handle_exit`, `dns_watch.rs:269`) and
-  the retry loop (`ensure_retry_loop`, `dns_watch.rs:424`).
+- after a connect (`src/privileged/connection_ops.rs:192`),
+- after every sweep (`run_sweep`, `src/privileged/dns_sweep.rs:213`): the
+  startup sweep (`src/privileged/mod.rs:196`), the exit watch of an already
+  watched helper (`handle_exit`, `dns_watch.rs:269`) and the retry loop
+  (`ensure_retry_loop`, `dns_watch.rs:466`, started from `settle_locked`).
 
 Nothing runs it when a helper writes a record on its own. Since `1c0202c` the
 helper creates the `watch` sentinel after writing a record
 (`dns_custody::ensure_watch_sentinel`, `src/dns_custody.rs:142`, called from
-`persist_dns_custody`, `src/userspace_helper/macos/dns.rs:63`). That wakes a
+`persist_dns_custody`, `src/userspace_helper/macos/dns.rs:64`). That wakes a
 daemon that is not running: launchd starts it, the startup sweep settles, and
 the record gets its watch. It does nothing when the daemon is already running
 and the sentinel already exists.
+
+Only the default `networksetup` path is affected; connections on the dynamic
+store path write no custody record (`doc/dns-dynamic-store.md`, which also
+makes this proposal moot in its phase 3).
 
 ### Scenario
 
