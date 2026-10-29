@@ -12,6 +12,18 @@ BREW_WGD ?= /opt/homebrew/bin/wgd
 BREW_WGD_STAGED := $(if $(findstring /Caskroom/,$(realpath $(BREW_WGD))),$(realpath $(BREW_WGD)))
 # The installed binary, or the freshly compiled one once purge removed it.
 WGD ?= $(or $(wildcard $(WGD_BIN)),target/release/wgd)
+# Where `make install` puts the menu bar app; the cask installs it here too,
+# so a dev install replaces the release copy instead of adding a second one.
+BAR_APP ?= /Applications/WgdBar.app
+
+# Version label build.rs bakes into the binary (and macos/WgdBar inherits).
+# Builds off `main` that are not on a tag get the commit count since the
+# latest tag appended, e.g. `v0.3.1-12`, so dev installs are distinguishable.
+GIT_LAST_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null)
+GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
+GIT_COMMITS_SINCE_TAG := $(if $(GIT_LAST_TAG),$(shell git rev-list --count $(GIT_LAST_TAG)..HEAD 2>/dev/null))
+export WGD_GIT_TAG ?= $(GIT_LAST_TAG)$(if $(filter-out main,$(GIT_BRANCH)),$(if $(filter-out 0,$(GIT_COMMITS_SINCE_TAG)),-$(GIT_COMMITS_SINCE_TAG)))
+export WGD_GIT_COMMIT ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null)
 
 .PHONY: hooks
 hooks:
@@ -71,6 +83,18 @@ install.completion:
 	@# src/completion.rs for why it uses `eval` and keeps symlinked dotfiles.
 	$(WGD) completion install
 
+.PHONY: install.bar
+install.bar: bar
+	@# The flyout's version label is compiled into the app, not read from the
+	@# daemon, so the app needs rebuilding alongside the CLI. Quit the running
+	@# instance first so `open` starts the new build. The local build is
+	@# ad-hoc signed; `brew reinstall --cask macos-wireguard-daemon` restores
+	@# the release app.
+	$(MAKE) -C macos/WgdBar stop
+	rm -rf $(BAR_APP)
+	cp -R target/WgdBar.app $(BAR_APP)
+	open $(BAR_APP)
+
 .PHONY: install
 install: build.release install.binary
 	@# `wgd launchd reload` registers the privileged daemon (escalating on its own),
@@ -82,6 +106,7 @@ install: build.release install.binary
 	$(WGD_BIN) launchd reload
 	$(MAKE) install.connection
 	$(MAKE) install.completion
+	$(MAKE) install.bar
 
 
 .PHONY: reload
