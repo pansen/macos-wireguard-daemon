@@ -213,6 +213,29 @@ pub(super) fn macos_route_destination(route: &MacosRoute) -> Option<(IpAddr, u8)
 /// queries stay bare, since a `/32` asks for a masked net entry and misses the
 /// mask-less host routes the endpoint pin installs.
 pub(super) fn macos_route_table_entry(destination: (IpAddr, u8)) -> Option<MacosRouteEntry> {
+    macos_route_lookup(destination).filter(|entry| entry.destination == destination)
+}
+
+/// The device the kernel would send traffic for `destination` through right
+/// now, whichever route (exact or broader) wins the lookup.
+///
+/// The default route counts here, unlike for [`parse_macos_route_get`]: a
+/// prefix whose own route is gone falls back to it, and where it leads is the
+/// answer.
+pub(super) fn macos_route_egress_interface(destination: (IpAddr, u8)) -> Option<String> {
+    parse_macos_route_get_interface(&macos_route_get_output(destination)?)
+}
+
+/// What `route -n get` answers for the prefix: the winning entry, which is only
+/// the exact entry when its own destination matches (see
+/// [`macos_route_table_entry`]).
+fn macos_route_lookup(destination: (IpAddr, u8)) -> Option<MacosRouteEntry> {
+    let text = macos_route_get_output(destination)?;
+    parse_macos_route_get(&text, destination.0.is_ipv6())
+}
+
+/// The text of `route -n get` for the prefix, `None` when the lookup fails.
+fn macos_route_get_output(destination: (IpAddr, u8)) -> Option<String> {
     let (ip, prefix) = destination;
     let is_ipv6 = ip.is_ipv6();
     let network = macos_network_base(ip, prefix);
@@ -231,8 +254,18 @@ pub(super) fn macos_route_table_entry(destination: (IpAddr, u8)) -> Option<Macos
     if !output.status.success() {
         return None;
     }
-    let entry = parse_macos_route_get(&String::from_utf8_lossy(&output.stdout), is_ipv6)?;
-    (entry.destination == destination).then_some(entry)
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The `interface:` of a `route -n get` reply, whichever route answered,
+/// including the default route (which [`parse_macos_route_get`] deliberately
+/// does not report as an entry).
+pub(super) fn parse_macos_route_get_interface(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(str::trim)
+        .filter(|interface| !interface.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse the `key: value` block `route -n get` prints for one lookup, plus the
@@ -575,5 +608,58 @@ mod tests {
             macos_route_destination(&bare),
             Some(subnet("23.88.101.22/32"))
         );
+    }
+
+    #[test]
+    fn egress_interface_is_read_from_any_route_get_reply() {
+        // Captured from `route -n get 1.1.1.1` on macOS 27.2: a prefix without
+        // a route of its own is answered by the default route.
+        let default_v4 = "   route to: 1.1.1.1\n\
+                          destination: default\n\
+                          \x20      mask: default\n\
+                          \x20   gateway: 10.66.77.1\n\
+                          \x20 interface: en0\n\
+                          \x20     flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n\
+                          \x20recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire\n\
+                          \x20      0         0         0         0         0         0      1500         0 \n";
+        // The same shape for IPv6 (no IPv6 default route to capture here).
+        let default_v6 = "   route to: 2001:4860:4860::8888\n\
+                          destination: default\n\
+                          \x20      mask: default\n\
+                          \x20   gateway: fe80::1%en0\n\
+                          \x20 interface: en0\n\
+                          \x20     flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+        // Captured from `route -n get 192.168.188.1` while a tunnel held it.
+        let host = "   route to: 192.168.188.1\n\
+                    destination: 192.168.188.1\n\
+                    \x20      mask: 255.255.255.255\n\
+                    \x20 interface: utun4\n\
+                    \x20     flags: <UP,DONE,STATIC,PRCLONING>\n";
+
+        assert_eq!(
+            parse_macos_route_get_interface(default_v4),
+            Some("en0".to_string())
+        );
+        assert_eq!(
+            parse_macos_route_get_interface(default_v6),
+            Some("en0".to_string())
+        );
+        assert_eq!(
+            parse_macos_route_get_interface(host),
+            Some("utun4".to_string())
+        );
+
+        // The entry parser keeps refusing the default route as an exact entry;
+        // that is why the egress lookup has a reader of its own.
+        assert_eq!(parse_macos_route_get(default_v4, false), None);
+        assert_eq!(parse_macos_route_get(default_v6, true), None);
+        assert!(parse_macos_route_get(host, false).is_some());
+
+        assert_eq!(parse_macos_route_get_interface(""), None);
+        assert_eq!(
+            parse_macos_route_get_interface("route: not in table\n"),
+            None
+        );
+        assert_eq!(parse_macos_route_get_interface("  interface:   \n"), None);
     }
 }

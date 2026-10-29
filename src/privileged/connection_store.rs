@@ -15,6 +15,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use super::managed_pids::{self, ProcessStart};
+use crate::bypass_links::{self, BypassLink, LinkReport};
 use crate::config;
 use crate::error::{AppError, Result};
 pub use crate::privileged_api::{ConnectionId, ConnectionStartMode};
@@ -58,6 +59,29 @@ pub struct StoredConnection {
     /// `networksetup` (phase 2 of `doc/dns-dynamic-store.md`). Read when the
     /// helper is spawned, so a change applies at the next connect.
     pub dns_dynamic_store: bool,
+    /// LAN bypass links (`doc/lan-bypass-links.md`), canonical. Not part of
+    /// the `.conf`, so a refresh keeps them. Validated against AllowedIPs when
+    /// set and again at every connect; read when the helper is spawned, so a
+    /// change applies at the next connect.
+    pub bypass_links: Vec<BypassLink>,
+}
+
+impl StoredConnection {
+    /// AllowedIPs of all peers (connect accepts exactly one).
+    #[must_use]
+    pub fn allowed_ips(&self) -> Vec<IpNet> {
+        self.config
+            .peers
+            .iter()
+            .flat_map(|peer| peer.allowed_ips.iter().copied())
+            .collect()
+    }
+
+    /// The stored bypass links checked against the current AllowedIPs.
+    #[must_use]
+    pub fn bypass_link_report(&self) -> LinkReport {
+        bypass_links::validate_links(&self.bypass_links, &self.allowed_ips())
+    }
 }
 
 /// Connection lifecycle state that exists only while the connection is up.
@@ -121,6 +145,9 @@ struct StoredConnectionDisk {
     /// Absent in records written before the opt-in existed: `networksetup`.
     #[serde(default)]
     dns_dynamic_store: bool,
+    /// Absent in records written before bypass links existed: none.
+    #[serde(default)]
+    bypass_links: Vec<BypassLink>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,6 +281,7 @@ fn to_disk(conn: &StoredConnection) -> StoredConnectionDisk {
         source_path: conn.source_path.clone(),
         mtu_override: conn.mtu_override,
         dns_dynamic_store: conn.dns_dynamic_store,
+        bypass_links: conn.bypass_links.clone(),
     }
 }
 
@@ -274,6 +302,7 @@ fn from_disk(disk: StoredConnectionDisk) -> Result<StoredConnection> {
         source_path: disk.source_path,
         mtu_override: disk.mtu_override,
         dns_dynamic_store: disk.dns_dynamic_store,
+        bypass_links: disk.bypass_links,
     })
 }
 
@@ -1086,7 +1115,36 @@ mod tests {
             source_path: None,
             mtu_override: None,
             dns_dynamic_store: false,
+            bypass_links: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bypass_links_roundtrip_and_old_records_load_without_them() {
+        let root = temp_root("bypass-links");
+        let id = ConnectionId::new();
+        let mut conn = sample(id, false, Some(501));
+        conn.bypass_links = vec![BypassLink::new(
+            "10.66.77.0/24".parse().unwrap(),
+            vec!["192.168.188.1/32".parse().unwrap()],
+        )];
+        save_in(&root, &conn).unwrap();
+        let loaded = load_in(&root, id).unwrap().unwrap();
+        assert_eq!(loaded.bypass_links, conn.bypass_links);
+
+        // A record written before the field existed has no such key at all.
+        let path = stored_path_in(&root, id);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            json["bypass_links"][0]["bypass"][0],
+            serde_json::json!("192.168.188.1/32")
+        );
+        json.as_object_mut().unwrap().remove("bypass_links");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let loaded = load_in(&root, id).unwrap().unwrap();
+        assert!(loaded.bypass_links.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

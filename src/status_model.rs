@@ -105,6 +105,24 @@ pub enum RouteOutcome {
     ExcludedLocalSubnet {
         subnet: String,
     },
+    /// Kept off the tunnel by a bypass link (`doc/lan-bypass-links.md`) while
+    /// the host is attached to `anchor`. `device` carries the anchor network
+    /// (also in the row's `Direct` via). `egress` is set only when the kernel
+    /// sends the prefix through another interface than `device`, for example
+    /// when Ethernet and Wi-Fi are up on different networks.
+    ExcludedLinked {
+        anchor: String,
+        #[serde(default)]
+        device: Option<String>,
+        #[serde(default)]
+        egress: Option<String>,
+    },
+    /// A bypass link is active for the prefix, but the kernel still sends it
+    /// into the tunnel (or the tunnel still holds the route and the kernel
+    /// does not say otherwise): removing the route is pending or failed.
+    LinkedStillTunneled {
+        anchor: String,
+    },
     Owned,
     OwnedAbsentFromKernel,
     OwnedKernelDisagrees,

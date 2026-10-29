@@ -7,9 +7,11 @@ use super::foreign::macos_global_resolvers;
 use super::foreign::tailscaled_socket_present;
 use super::foreign::MacosForeignSnapshot;
 use super::route_table::macos_route_destination;
+use super::route_table::macos_route_egress_interface;
 use super::route_table::macos_route_table_entry;
 use super::route_table::MacosRouteEntry;
 use super::routes::macos_allowed_routes;
+use super::routes::macos_route_excluded_by_link;
 use super::routes::macos_route_excluded_by_local_subnet;
 use super::system::macos_connected_subnet_device;
 use super::system::macos_connected_subnets_by_device;
@@ -148,6 +150,7 @@ pub(super) fn build_macos_network_overview(state: &MacosCleanupState) -> Network
         &dns_fingerprint,
         &foreign,
         &|route| macos_route_destination(route).and_then(macos_route_table_entry),
+        &|route| macos_route_destination(route).and_then(macos_route_egress_interface),
     );
     overview.dns.dynamic_store = state.dns_store_key.as_ref().map(|key| key.overview());
     overview
@@ -229,8 +232,10 @@ pub(in crate::userspace_helper) fn spawn_overview_query_server(
 }
 
 /// Gather the typed overview from already-collected host state. `probe`
-/// answers the route-table lookup for a destination (injected so tests need no
-/// live routing table).
+/// answers the route-table lookup for a destination and `egress` the interface
+/// the kernel would send it through (injected so tests need no live routing
+/// table).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn assemble_macos_network_overview(
     inputs: &MacosReconcileInputs,
     routes: &[MacosRoute],
@@ -239,6 +244,7 @@ pub(super) fn assemble_macos_network_overview(
     dns_fingerprint: &MacosDnsFingerprint,
     foreign: &MacosForeignSnapshot,
     probe: &dyn Fn(&MacosRoute) -> Option<MacosRouteEntry>,
+    egress: &dyn Fn(&MacosRoute) -> Option<String>,
 ) -> NetworkOverview {
     let dns_collision =
         macos_dns_server_in_local_subnet(&inputs.dns_servers, &route_fingerprint.local_subnets)
@@ -256,7 +262,7 @@ pub(super) fn assemble_macos_network_overview(
             .iter()
             .map(|(ip, prefix)| format!("{ip}/{prefix}"))
             .collect(),
-        routes: macos_route_overview_rows(inputs, route_fingerprint, routes, probe),
+        routes: macos_route_overview_rows(inputs, route_fingerprint, routes, probe, egress),
         dns: macos_dns_overview(inputs, owned_dns, dns_fingerprint, dns_collision),
         // Effective system resolver: what macOS actually resolves through right now,
         // independent of per-service config. Flags the case that stranded a whole
@@ -329,13 +335,15 @@ pub(super) fn macos_ip_family(is_ipv6: bool) -> IpFamily {
 /// that LAN, one a foreign route-table entry keeps off the tunnel, or an
 /// "owned" route the kernel has since dropped.
 ///
-/// `probe` answers the route-table lookup for a destination (injected so tests
-/// need no live routing table).
+/// `probe` answers the route-table lookup for a destination and `egress` the
+/// interface the kernel would send it through, whichever route wins (injected
+/// so tests need no live routing table).
 pub(super) fn macos_route_overview_rows(
     inputs: &MacosReconcileInputs,
     fingerprint: &MacosNetworkFingerprint,
     owned: &[MacosRoute],
     probe: &dyn Fn(&MacosRoute) -> Option<MacosRouteEntry>,
+    egress: &dyn Fn(&MacosRoute) -> Option<String>,
 ) -> Vec<RouteRow> {
     let mut rows = Vec::new();
 
@@ -383,6 +391,42 @@ pub(super) fn macos_route_overview_rows(
                     subnet: format!("{}/{}", subnet.0, subnet.1),
                 },
             )
+        } else if let Some(exclusion) =
+            macos_route_excluded_by_link(route, &fingerprint.local_subnets, &inputs.bypass_links)
+        {
+            let device = macos_connected_subnet_device(exclusion.subnet, &inputs.interface);
+            // With the tunnel route gone the prefix falls back to the default
+            // route, which may sit on another interface than the anchor's
+            // (phase 4 of the spec fixes that). The kernel's answer decides
+            // whether the prefix really left the tunnel.
+            match macos_link_egress(
+                device.as_deref(),
+                &inputs.interface,
+                owned.contains(route),
+                egress(route),
+            ) {
+                LinkEgress::StillTunneled => (
+                    RouteVia::Interface {
+                        name: inputs.interface.clone(),
+                    },
+                    RouteOutcome::LinkedStillTunneled {
+                        anchor: exclusion.anchor.to_string(),
+                    },
+                ),
+                outcome => (
+                    RouteVia::Direct {
+                        device: device.clone(),
+                    },
+                    RouteOutcome::ExcludedLinked {
+                        anchor: exclusion.anchor.to_string(),
+                        device,
+                        egress: match outcome {
+                            LinkEgress::Elsewhere(interface) => Some(interface),
+                            _ => None,
+                        },
+                    },
+                ),
+            }
         } else if owned.contains(route) {
             let kernel_agrees = entry
                 .as_ref()
@@ -458,6 +502,39 @@ pub(super) fn macos_route_overview_rows(
     }
 
     rows
+}
+
+/// Where the kernel sends a prefix an active link should have taken off the
+/// tunnel.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LinkEgress {
+    /// Through the tunnel still: the route is not gone yet, or deleting it
+    /// failed.
+    StillTunneled,
+    /// Through this interface, which is not the anchor's device.
+    Elsewhere(String),
+    /// Through the anchor's device, or the lookup does not say.
+    Expected,
+}
+
+/// Classify the kernel's `actual` egress interface for a bypassed prefix. The
+/// lookup wins over our bookkeeping, which may lag a kernel change. Only when
+/// the lookup gives no answer does a route we still hold count as "still
+/// tunneled".
+pub(super) fn macos_link_egress(
+    device: Option<&str>,
+    tunnel_interface: &str,
+    still_owned: bool,
+    actual: Option<String>,
+) -> LinkEgress {
+    match actual {
+        Some(actual) if actual == tunnel_interface => LinkEgress::StillTunneled,
+        None if still_owned => LinkEgress::StillTunneled,
+        Some(actual) if device.is_some_and(|device| device != actual) => {
+            LinkEgress::Elsewhere(actual)
+        }
+        _ => LinkEgress::Expected,
+    }
 }
 
 pub(super) fn macos_dns_overview(
@@ -546,6 +623,126 @@ mod tests {
     use crate::userspace_helper::macos::MacosNetworkFingerprint;
     use crate::userspace_helper::macos::MacosRoute;
 
+    fn no_egress(_: &MacosRoute) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn route_overview_reports_a_linked_prefix_as_excluded() {
+        let mut inputs = split_inputs();
+        inputs.allowed_ips = vec!["10.66.77.0/24".to_string(), "192.168.188.1/32".to_string()];
+        inputs.bypass_links = vec![crate::bypass_links::BypassLink::new(
+            "10.66.77.0/24".parse().unwrap(),
+            vec!["192.168.188.1/32".parse().unwrap()],
+        )];
+        let home = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("10.66.77.0/24")],
+            endpoint_gateway: None,
+        };
+        let rows = macos_route_overview_rows(&inputs, &home, &[], &|_| None, &no_egress);
+        let row = |destination: &str| rows.iter().find(|row| row.destination == destination);
+        assert!(matches!(
+            row("10.66.77.0/24").unwrap().outcome,
+            RouteOutcome::ExcludedLocalSubnet { .. }
+        ));
+        let linked = row("192.168.188.1/32").unwrap();
+        assert!(matches!(
+            &linked.outcome,
+            RouteOutcome::ExcludedLinked { anchor, egress: None, .. } if anchor == "10.66.77.0/24"
+        ));
+        assert!(matches!(linked.via, RouteVia::Direct { .. }));
+
+        // Away from the anchor the link is inactive and the row is an
+        // ordinary route again.
+        let away = MacosNetworkFingerprint::default();
+        let rows = macos_route_overview_rows(&inputs, &away, &[], &|_| None, &no_egress);
+        let row = rows
+            .iter()
+            .find(|row| row.destination == "192.168.188.1/32")
+            .unwrap();
+        assert_eq!(row.outcome, RouteOutcome::ReconcilePending);
+    }
+
+    #[test]
+    fn linked_prefix_still_routed_through_the_tunnel_is_not_reported_as_excluded() {
+        let mut inputs = split_inputs();
+        inputs.allowed_ips = vec!["10.66.77.0/24".to_string(), "192.168.188.1/32".to_string()];
+        inputs.bypass_links = vec![crate::bypass_links::BypassLink::new(
+            "10.66.77.0/24".parse().unwrap(),
+            vec!["192.168.188.1/32".parse().unwrap()],
+        )];
+        let home = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("10.66.77.0/24")],
+            endpoint_gateway: None,
+        };
+        let row_for = |owned: &[MacosRoute], egress: &dyn Fn(&MacosRoute) -> Option<String>| {
+            macos_route_overview_rows(&inputs, &home, owned, &|_| None, egress)
+                .into_iter()
+                .find(|row| row.destination == "192.168.188.1/32")
+                .unwrap()
+        };
+        let tunnel_route = MacosRoute {
+            is_ipv6: false,
+            destination: "192.168.188.1/32".to_string(),
+            interface: Some("utun6".to_string()),
+            gateway: None,
+        };
+        let is_excluded =
+            |row: &RouteRow| matches!(row.outcome, RouteOutcome::ExcludedLinked { .. });
+
+        // The kernel still sends it into our tunnel: removal is pending or
+        // failed, whatever our own bookkeeping says.
+        let row = row_for(&[], &|_| Some("utun6".to_string()));
+        assert!(!is_excluded(&row), "{:?}", row.outcome);
+        assert!(matches!(
+            row.outcome,
+            RouteOutcome::LinkedStillTunneled { .. }
+        ));
+        // Still on our books and the lookup gives no answer: same.
+        let row = row_for(std::slice::from_ref(&tunnel_route), &|_| None);
+        assert!(matches!(
+            row.outcome,
+            RouteOutcome::LinkedStillTunneled { .. }
+        ));
+        // The default route is where it went: excluded, as it should be.
+        let row = row_for(&[], &|_| Some("en0".to_string()));
+        assert!(is_excluded(&row), "{:?}", row.outcome);
+        // On our books but the kernel already sends it to en0: the kernel wins.
+        let row = row_for(std::slice::from_ref(&tunnel_route), &|_| {
+            Some("en0".to_string())
+        });
+        assert!(is_excluded(&row), "{:?}", row.outcome);
+    }
+
+    #[test]
+    fn link_egress_classifies_the_kernels_answer() {
+        let classify = |device: Option<&str>, owned: bool, actual: Option<&str>| {
+            macos_link_egress(device, "utun6", owned, actual.map(str::to_string))
+        };
+        use LinkEgress::*;
+        // Another interface than the anchor's is named, whatever it is.
+        assert_eq!(
+            classify(Some("en0"), false, Some("en1")),
+            Elsewhere("en1".into())
+        );
+        assert_eq!(
+            classify(Some("en0"), false, Some("utun3")),
+            Elsewhere("utun3".into())
+        );
+        // The anchor's device, or an unknown device or answer: nothing to say.
+        assert_eq!(classify(Some("en0"), false, Some("en0")), Expected);
+        assert_eq!(classify(None, false, Some("en1")), Expected);
+        assert_eq!(classify(Some("en0"), false, None), Expected);
+        // Our own tunnel is the answer: still tunneled, with or without a
+        // device and whether or not we still list the route.
+        assert_eq!(classify(Some("en0"), false, Some("utun6")), StillTunneled);
+        assert_eq!(classify(None, true, Some("utun6")), StillTunneled);
+        // No answer, but we still hold the route: assume it is in the kernel.
+        assert_eq!(classify(Some("en0"), true, None), StillTunneled);
+        // The kernel's answer wins over our bookkeeping.
+        assert_eq!(classify(Some("en0"), true, Some("en0")), Expected);
+    }
+
     #[test]
     fn route_overview_reports_every_allowed_ip_with_its_outcome() {
         let mut inputs = split_inputs();
@@ -584,7 +781,7 @@ mod tests {
             _ => None,
         };
 
-        let rows = macos_route_overview_rows(&inputs, &fingerprint, &owned, &probe);
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &owned, &probe, &no_egress);
         let row = |destination: &str| -> &RouteRow {
             rows.iter()
                 .find(|row| row.destination == destination)
@@ -646,7 +843,7 @@ mod tests {
             interface: None,
             gateway: Some("192.168.1.1".to_string()),
         }];
-        let rows = macos_route_overview_rows(&inputs, &fingerprint, &pinned, &probe);
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &pinned, &probe, &no_egress);
         assert_eq!(rows[0].destination, "23.88.101.22");
         assert_eq!(
             rows[0].via,
@@ -664,7 +861,7 @@ mod tests {
         );
         assert_eq!(rows[0].outcome, RouteOutcome::EndpointPinned);
 
-        let rows = macos_route_overview_rows(&inputs, &fingerprint, &[], &probe);
+        let rows = macos_route_overview_rows(&inputs, &fingerprint, &[], &probe, &no_egress);
         assert_eq!(rows[0].via, RouteVia::None);
         assert_eq!(rows[0].outcome, RouteOutcome::EndpointPinMissing);
     }

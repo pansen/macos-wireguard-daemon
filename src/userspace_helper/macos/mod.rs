@@ -90,6 +90,10 @@ pub(super) struct MacosReconcileInputs {
     /// `networksetup` path (capture, custody, reconcile) is skipped.
     /// `Shadow`: `networksetup` as always, plus an inert probe key.
     dns_mode: crate::dns_dynamic_store::StoreKeyMode,
+    /// Validated by the daemon (`doc/lan-bypass-links.md`); static for the
+    /// life of the helper. Whether a link is active follows from the
+    /// fingerprint's `local_subnets`, so the fingerprint needs no field.
+    bypass_links: Vec<crate::bypass_links::BypassLink>,
 }
 
 /// A snapshot of the host network environment relevant to tunnel routing.
@@ -284,6 +288,7 @@ pub(super) fn configure_network_macos(
     connection_id: Option<crate::privileged_api::ConnectionId>,
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
     dns_mode: crate::dns_dynamic_store::StoreKeyMode,
+    bypass_links: Vec<crate::bypass_links::BypassLink>,
 ) -> anyhow::Result<MacosCleanupState> {
     let has_ipv4_address = config
         .addresses
@@ -310,6 +315,7 @@ pub(super) fn configure_network_macos(
         has_ipv6_address,
         custody,
         dns_mode,
+        bypass_links,
     };
     log_macos_network_diagnostics("before_connect", &inputs);
 

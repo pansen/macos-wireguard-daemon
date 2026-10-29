@@ -373,7 +373,18 @@ pub enum ConnectionCommand {
     /// Without a flag, prints the settings. --dns-dynamic-store publishes
     /// the tunnel DNS through the SystemConfiguration dynamic store instead
     /// of setting it on the primary network service with networksetup
-    /// (see doc/dns-dynamic-store.md). A change applies at the next connect.
+    /// (see doc/dns-dynamic-store.md).
+    ///
+    /// --link ANCHOR=PREFIX[,PREFIX...] keeps the prefixes off the tunnel
+    /// while the Mac is attached to the ANCHOR network, for hosts that sit
+    /// behind a NAT in that network, for example
+    /// --link 10.66.77.0/24=192.168.188.1/32 (see doc/lan-bypass-links.md).
+    /// ANCHOR and each PREFIX must be AllowedIPs entries of the connection,
+    /// and the ANCHOR is the LAN that is kept off the tunnel anyway. Narrower
+    /// entries inside a PREFIX leave the tunnel with it. Repeat
+    /// --link for several networks; the given links replace all earlier ones.
+    ///
+    /// A change applies at the next connect.
     #[command(verbatim_doc_comment)]
     Config {
         /// Connection id or name, as printed by `add` or `list`
@@ -389,6 +400,21 @@ pub enum ConnectionCommand {
         /// Resolve tunnel DNS through networksetup (the default)
         #[arg(long)]
         no_dns_dynamic_store: bool,
+
+        /// Keep PREFIX(es) off the tunnel while attached to ANCHOR; replaces all links
+        #[arg(
+            long = "link",
+            value_name = "ANCHOR=PREFIX[,PREFIX...]",
+            conflicts_with = "no_links",
+            add = clap_complete::engine::ArgValueCompleter::new(
+                crate::connection_cli::complete_bypass_link
+            )
+        )]
+        link: Vec<String>,
+
+        /// Remove all links
+        #[arg(long)]
+        no_links: bool,
     },
 
     /// Show full detail for one stored connection (owner or root only)
@@ -802,6 +828,7 @@ mod tests {
                             id,
                             dns_dynamic_store,
                             no_dns_dynamic_store,
+                            ..
                         },
                 } => {
                     assert_eq!(id, "andi_split");
@@ -841,6 +868,57 @@ mod tests {
             "--dns-dynamic-store",
             "--no-dns-dynamic-store",
             "andi_split",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parse_connection_config_link_flags() {
+        let parse = |args: &[&str]| -> Result<(Vec<String>, bool), clap::Error> {
+            let cli = Cli::try_parse_from(args)?;
+            match cli.command {
+                TopCommand::Connection {
+                    command: ConnectionCommand::Config { link, no_links, .. },
+                } => Ok((link, no_links)),
+                _ => panic!("expected connection config command"),
+            }
+        };
+        assert_eq!(
+            parse(&["wgd", "connection", "config", "home"]).unwrap(),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            parse(&[
+                "wgd",
+                "connection",
+                "config",
+                "home",
+                "--link",
+                "10.66.77.0/24=192.168.188.1/32,192.168.188.50/32",
+                "--link",
+                "172.16.5.0/24=192.168.9.1/32",
+            ])
+            .unwrap(),
+            (
+                vec![
+                    "10.66.77.0/24=192.168.188.1/32,192.168.188.50/32".to_string(),
+                    "172.16.5.0/24=192.168.9.1/32".to_string(),
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            parse(&["wgd", "connection", "config", "home", "--no-links"]).unwrap(),
+            (Vec::new(), true)
+        );
+        assert!(parse(&[
+            "wgd",
+            "connection",
+            "config",
+            "home",
+            "--link",
+            "10.66.77.0/24=192.168.188.1/32",
+            "--no-links",
         ])
         .is_err());
     }

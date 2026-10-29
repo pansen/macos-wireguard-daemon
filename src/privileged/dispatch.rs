@@ -1,8 +1,9 @@
+use crate::bypass_links::BypassLink;
 use crate::error::AppError;
 use crate::privileged_api::{
-    ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
-    DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest, PrivilegedResponse,
-    RefreshOutcome,
+    BypassLinkSummary, ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode,
+    ConnectionSummary, DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest,
+    PrivilegedResponse, RefreshOutcome,
 };
 
 use super::authz;
@@ -211,6 +212,10 @@ pub(super) fn dispatch(
             DispatchOutcome::Immediate(handle_set_connection_dns_dynamic_store(origin, id, enabled))
         }
 
+        PrivilegedRequest::SetConnectionBypassLinks { id, links } => {
+            DispatchOutcome::Immediate(handle_set_connection_bypass_links(origin, id, links))
+        }
+
         PrivilegedRequest::ListConnections { scope } => {
             DispatchOutcome::Immediate(handle_list_connections(origin, scope))
         }
@@ -334,6 +339,7 @@ fn handle_add_connection(
         source_path,
         mtu_override,
         dns_dynamic_store: false,
+        bypass_links: Vec::new(),
     };
     match connection_store::create(&index_lock, &stored) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
@@ -537,6 +543,7 @@ fn refresh_connection(
         return PrivilegedResponse::Refreshed(RefreshOutcome {
             changed: false,
             reconnected: false,
+            links_removed: Vec::new(),
         });
     }
 
@@ -588,6 +595,14 @@ fn refresh_connection(
     if source_path.is_some() {
         stored.source_path = source_path;
     }
+    // Links the new AllowedIPs no longer support go in the same update as the
+    // config, so a record never holds links its config contradicts.
+    let pruned = crate::bypass_links::prune_links(&stored.bypass_links, &stored.allowed_ips());
+    stored.bypass_links = pruned.links;
+    let links_removed: Vec<String> = pruned.removed.iter().map(ToString::to_string).collect();
+    for line in &links_removed {
+        info!(%id, removed = %line, "privileged_bypass_link_pruned");
+    }
     stored.updated_at = connection_store::now_unix();
     if let Err(error) = connection_store::update(&conn_lock, &stored) {
         return error_response(error);
@@ -601,7 +616,12 @@ fn refresh_connection(
             return PrivilegedResponse::Error {
                 code: "Other".into(),
                 message: format!(
-                    "the connection record was updated, but reconnecting failed (the connection is down): {error}"
+                    "the connection record was updated{}, but reconnecting failed (the connection is down): {error}",
+                    if links_removed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (links dropped: {})", links_removed.join("; "))
+                    }
                 ),
             };
         }
@@ -609,6 +629,7 @@ fn refresh_connection(
     PrivilegedResponse::Refreshed(RefreshOutcome {
         changed: true,
         reconnected: was_active,
+        links_removed,
     })
 }
 
@@ -888,6 +909,51 @@ fn handle_set_connection_dns_dynamic_store(
     }
 }
 
+/// Ownership alone is enough, like the DNS switch: a link only decides which
+/// of the owner's own AllowedIPs routes stay off the tunnel and runs nothing
+/// as root. The links are validated against the stored AllowedIPs here, so a
+/// typo is a hard error at `connection config` time instead of a silent no-op
+/// at connect.
+fn handle_set_connection_bypass_links(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    links: Vec<BypassLink>,
+) -> PrivilegedResponse {
+    let conn_lock = match connection_store::lock_connection(id) {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    let mut stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return not_found(),
+        Err(error) => return error_response(error),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return response;
+    }
+    let links = match crate::bypass_links::validate_links_strict(&links, &stored.allowed_ips()) {
+        Ok(links) => links,
+        Err(error) => {
+            return PrivilegedResponse::Error {
+                code: "InvalidLink".into(),
+                message: error.to_string(),
+            }
+        }
+    };
+    if stored.bypass_links == links {
+        return PrivilegedResponse::Unit;
+    }
+    stored.bypass_links = links;
+    stored.updated_at = connection_store::now_unix();
+    match connection_store::update(&conn_lock, &stored) {
+        Ok(()) => {
+            info!(%id, links = stored.bypass_links.len(), "privileged_bypass_links_set");
+            PrivilegedResponse::Unit
+        }
+        Err(error) => error_response(error),
+    }
+}
+
 fn handle_list_connections(origin: PeerOrigin, scope: ConnectionScope) -> PrivilegedResponse {
     if matches!(scope, ConnectionScope::All) && !origin.is_root() {
         return auth_denied("listing all connections requires root");
@@ -1008,6 +1074,18 @@ fn require_admin_auth(
     }
 }
 
+/// The stored links, each marked invalid with its reason when the current
+/// AllowedIPs no longer support it.
+fn bypass_link_summaries(conn: &StoredConnection) -> Vec<BypassLinkSummary> {
+    crate::bypass_links::check_links(&conn.bypass_links, &conn.allowed_ips())
+        .into_iter()
+        .map(|(link, verdict)| BypassLinkSummary {
+            link,
+            invalid: verdict.err().map(|error| error.to_string()),
+        })
+        .collect()
+}
+
 fn summarize(
     conn: &StoredConnection,
     connected: bool,
@@ -1059,6 +1137,7 @@ fn summarize(
             None
         },
         dns_dynamic_store: conn.dns_dynamic_store,
+        bypass_links: bypass_link_summaries(conn),
         created_at: conn.created_at,
         updated_at: conn.updated_at,
     }
@@ -1299,7 +1378,8 @@ mod tests {
                 outcome,
                 RefreshOutcome {
                     changed: false,
-                    reconnected: false
+                    reconnected: false,
+                    links_removed: Vec::new(),
                 }
             );
             let after = connection_store::load(id).unwrap().unwrap();
@@ -1349,7 +1429,8 @@ mod tests {
                 outcome,
                 RefreshOutcome {
                     changed: true,
-                    reconnected: false
+                    reconnected: false,
+                    links_removed: Vec::new(),
                 }
             );
 
@@ -2481,6 +2562,150 @@ mod tests {
                     .unwrap()
                     .dns_dynamic_store
             );
+        });
+    }
+
+    fn split_conf(allowed_ips: &str) -> String {
+        SAMPLE_CONF.replace("0.0.0.0/0", allowed_ips)
+    }
+
+    fn home_link() -> BypassLink {
+        BypassLink::new(
+            "10.66.77.0/24".parse().unwrap(),
+            vec!["192.168.188.1/32".parse().unwrap()],
+        )
+    }
+
+    #[test]
+    fn set_bypass_links_persists_validates_and_is_pruned_by_refresh() {
+        with_test_store("bypass-links", || {
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32");
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                &conf,
+                false,
+                valid_auth(),
+            ));
+
+            // Host bits are cleared before storing.
+            let sloppy = BypassLink::new(
+                "10.66.77.9/24".parse().unwrap(),
+                vec!["192.168.188.1/32".parse().unwrap()],
+            );
+            let ok = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![sloppy]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // A prefix outside AllowedIPs is a hard error and changes nothing.
+            let typo = BypassLink::new(
+                "10.66.77.0/24".parse().unwrap(),
+                vec!["192.168.188.2/32".parse().unwrap()],
+            );
+            let rejected =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![typo]);
+            assert_eq!(error_code(&rejected), "InvalidLink");
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // The summary reports the link as valid.
+            let PrivilegedResponse::Connection(summary) =
+                handle_get_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("expected a Connection response");
+            };
+            assert_eq!(summary.bypass_links.len(), 1);
+            assert_eq!(summary.bypass_links[0].link, home_link());
+            assert!(summary.bypass_links[0].invalid.is_none());
+
+            // A refresh that drops the prefix prunes the link in the same
+            // update and says so.
+            let dropped = split_conf("10.66.77.0/24");
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &dropped,
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.changed);
+            assert_eq!(
+                outcome.links_removed.len(),
+                2,
+                "{:?}",
+                outcome.links_removed
+            );
+            assert!(outcome.links_removed[0].contains("dropped prefix 192.168.188.1/32"));
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert!(stored.bypass_links.is_empty());
+            let PrivilegedResponse::Connection(summary) =
+                handle_get_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("expected a Connection response");
+            };
+            assert!(summary.bypass_links.is_empty());
+
+            // A refresh that keeps the AllowedIPs keeps the links.
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32, 100.64.1.0/24");
+            let ok = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &conf,
+                None,
+                valid_auth(),
+            ));
+            let ok =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![home_link()]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            let again = split_conf("10.66.77.0/24, 192.168.188.1/32, 100.64.2.0/24");
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &again,
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.links_removed.is_empty());
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // An empty list clears the links.
+            let cleared = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![]);
+            assert!(matches!(cleared, PrivilegedResponse::Unit));
+            assert!(connection_store::load(id)
+                .unwrap()
+                .unwrap()
+                .bypass_links
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn set_bypass_links_is_denied_to_another_user() {
+        with_test_store("bypass-links-other-user", || {
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32");
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                &conf,
+                false,
+                valid_auth(),
+            ));
+            let response =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(502), id, vec![home_link()]);
+            assert_eq!(error_code(&response), "Auth");
+            assert!(connection_store::load(id)
+                .unwrap()
+                .unwrap()
+                .bypass_links
+                .is_empty());
         });
     }
 

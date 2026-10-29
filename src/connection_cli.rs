@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 
+use crate::bypass_links::BypassLink;
 use crate::cli::{ConnectionCommand, StartModeArg};
 use crate::error::AppError;
 use crate::privileged_api::{
-    ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
+    BypassLinkSummary, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
 };
 use crate::privileged_client::PrivilegedClient;
 
@@ -46,13 +47,23 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
             id,
             dns_dynamic_store,
             no_dns_dynamic_store,
+            link,
+            no_links,
         } => {
             let dns = match (dns_dynamic_store, no_dns_dynamic_store) {
                 (true, _) => Some(true),
                 (_, true) => Some(false),
                 _ => None,
             };
-            cmd_config(&id, dns)
+            // `--link` replaces the full set, `--no-links` clears it.
+            let links = if no_links {
+                Some(Vec::new())
+            } else if link.is_empty() {
+                None
+            } else {
+                Some(link)
+            };
+            cmd_config(&id, dns, links)
         }
         ConnectionCommand::Get { id } => cmd_get(&id),
     }
@@ -147,6 +158,28 @@ fn label_for(client: &PrivilegedClient, id: ConnectionId) -> String {
 /// lives here rather than on the client's default.
 const COMPLETION_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// The daemon client every completion lookup uses, or `None` when completing
+/// must not talk to the daemon at all.
+///
+/// The stdio transport reaches the daemon by running
+/// `sudo wgd privileged --serve --stdio` for *every* request, which would put
+/// a password prompt behind every <TAB>. `without_autostart` does not cover
+/// it: it only gates the socket transport's own spawn-a-daemon fallback. So
+/// don't complete at all under stdio.
+fn completion_client() -> Option<PrivilegedClient> {
+    if !matches!(
+        crate::config::load_config().general.privileged_transport,
+        crate::config::PrivilegedTransport::Socket
+    ) {
+        return None;
+    }
+    Some(
+        PrivilegedClient::new()
+            .without_autostart()
+            .with_request_timeout(COMPLETION_TIMEOUT),
+    )
+}
+
 /// Completion candidates for the `<ID>` positional of `remove`/`connect`/
 /// `disconnect`/`mode`/`get`/`refresh`: every connection the caller can name, offered
 /// both by id and by `--name`, since `resolve_id` accepts either.
@@ -167,20 +200,9 @@ pub fn complete_connection_id(
     let Some(current) = current.to_str() else {
         return Vec::new();
     };
-    // The stdio transport reaches the daemon by running
-    // `sudo wgd privileged --serve --stdio` for *every* request, which
-    // would put a password prompt behind every <TAB>. `without_autostart`
-    // below does not cover it: it only gates the socket transport's own
-    // spawn-a-daemon fallback. So don't complete at all under stdio.
-    if !matches!(
-        crate::config::load_config().general.privileged_transport,
-        crate::config::PrivilegedTransport::Socket
-    ) {
+    let Some(client) = completion_client() else {
         return Vec::new();
-    }
-    let client = PrivilegedClient::new()
-        .without_autostart()
-        .with_request_timeout(COMPLETION_TIMEOUT);
+    };
     let mine = client
         .list_connections(ConnectionScope::Mine)
         .unwrap_or_default();
@@ -224,6 +246,119 @@ pub fn complete_connection_id(
         }
     }
     candidates
+}
+
+/// Completion candidates for the value of `connection config --link`
+/// (`<anchor>=<prefix>[,<prefix>...]`), taken from the AllowedIPs of the
+/// connection named on the same command line, or from every connection the
+/// caller can name when `<ID>` has not been typed yet (`wgd connection config
+/// --link <TAB>`). Same failure behaviour as [`complete_connection_id`]:
+/// anything that goes wrong is "no candidates".
+///
+/// `ArgValueCompleter` only receives the value being completed, so the
+/// connection is recovered from the words the shell passed to the binary
+/// (everything after the first `--`, as `clap_complete::CompleteEnv` reads
+/// them; in bash, [`crate::completion::WgdBash`] rejoins words cut at `=` and
+/// `:` before calling the binary).
+pub fn complete_bypass_link(
+    current: &std::ffi::OsStr,
+) -> Vec<clap_complete::engine::CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let words: Vec<String> = completion_words()
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    let Some(client) = completion_client() else {
+        return Vec::new();
+    };
+    let target = config_target_from_words(&words);
+    let connections = connections_for_link_completion(&client, target.as_deref());
+    let allowed_sets = connections.iter().map(|conn| {
+        conn.peers
+            .iter()
+            .flat_map(|peer| peer.allowed_ips.iter())
+            .filter_map(|entry| entry.parse().ok())
+            .collect()
+    });
+    link_candidates_for_connections(current, allowed_sets)
+        .into_iter()
+        .map(clap_complete::engine::CompletionCandidate::new)
+        .collect()
+}
+
+fn connections_for_link_completion(
+    client: &PrivilegedClient,
+    target: Option<&str>,
+) -> Vec<crate::privileged_api::ConnectionSummary> {
+    if let Some(name) = target {
+        return resolve_id(client, name)
+            .ok()
+            .and_then(|id| client.get_connection(id).ok())
+            .into_iter()
+            .collect();
+    }
+    let mine = client
+        .list_connections(ConnectionScope::Mine)
+        .unwrap_or_default();
+    let global = client
+        .list_connections(ConnectionScope::Global)
+        .unwrap_or_default();
+    mine.into_iter().chain(global).collect()
+}
+
+fn link_candidates_for_connections(
+    current: &str,
+    allowed_sets: impl IntoIterator<Item = Vec<ipnet::IpNet>>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for allowed in allowed_sets {
+        for candidate in crate::bypass_links::link_completions(current, &allowed) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+/// The words of the command line being completed: what follows the first `--`
+/// in our own arguments, where every shell's registration script puts them.
+fn completion_words() -> Vec<std::ffi::OsString> {
+    let mut args = std::env::args_os();
+    args.by_ref().find(|arg| arg == "--");
+    args.collect()
+}
+
+/// The `<ID>` of `wgd connection config <ID> ...` among the words of a command
+/// line, which may be incomplete and may have the options before or after it.
+/// The first word is the binary. `--link` takes a value, `--link=VALUE` is one
+/// word (the bash registration joins words bash cut at `=` and `:` before it
+/// calls us, see `completion::WgdBash`).
+fn config_target_from_words(words: &[String]) -> Option<String> {
+    let mut words = words.iter().skip(1);
+    let mut stage = 0;
+    while let Some(word) = words.next() {
+        if word == "--link" {
+            words.next();
+        } else if word.starts_with('-') {
+            continue;
+        } else if stage == 0 {
+            if word != "connection" {
+                return None;
+            }
+            stage = 1;
+        } else if stage == 1 {
+            if word != "config" {
+                return None;
+            }
+            stage = 2;
+        } else {
+            return Some(word.clone());
+        }
+    }
+    None
 }
 
 /// Read a `.conf` as the invoking user and return its text with its
@@ -294,6 +429,16 @@ fn cmd_add(
                 id.label(Some(name.as_str()))
             );
         }
+        // Same for LAN bypass links, pruned to what the new AllowedIPs still
+        // support (as `refresh` does); what goes is reported, not an error.
+        if let Some(conn) = stale.iter().find(|conn| !conn.bypass_links.is_empty()) {
+            if let Err(error) = carry_over_links(&client, id, conn) {
+                eprintln!(
+                    "warning: could not keep the links of {}: {error}",
+                    conn.label()
+                );
+            }
+        }
         for conn in stale {
             println!(
                 "Removing stale connection {} (same name {name:?}, superseded by {})",
@@ -307,6 +452,37 @@ fn cmd_add(
     // reconnects `Automatic` records right away and would race that cleanup.
     if !global && start_mode == ConnectionStartMode::Automatic {
         crate::session_agent::ensure_for_automatic(&client);
+    }
+    Ok(())
+}
+
+/// Move the bypass links of the superseded `old` record to the connection
+/// `id` that replaced it, keeping what the new AllowedIPs still support and
+/// reporting the rest.
+fn carry_over_links(
+    client: &PrivilegedClient,
+    id: ConnectionId,
+    old: &ConnectionSummary,
+) -> anyhow::Result<()> {
+    let new = client.get_connection(id)?;
+    let allowed: Vec<ipnet::IpNet> = new
+        .peers
+        .iter()
+        .flat_map(|peer| peer.allowed_ips.iter())
+        .filter_map(|entry| entry.parse().ok())
+        .collect();
+    let links: Vec<BypassLink> = old
+        .bypass_links
+        .iter()
+        .map(|summary| summary.link.clone())
+        .collect();
+    let pruned = crate::bypass_links::prune_links(&links, &allowed);
+    if !pruned.links.is_empty() {
+        client.set_connection_bypass_links(id, pruned.links)?;
+        println!("Kept links for {}", new.label());
+    }
+    for removed in &pruned.removed {
+        println!("  removed {removed}");
     }
     Ok(())
 }
@@ -413,6 +589,9 @@ fn cmd_refresh(id: &str, file: Option<&str>) -> anyhow::Result<()> {
         (true, false) => println!("Updated {label}"),
         (true, true) => println!("Updated and reconnected {label}"),
     }
+    for line in &outcome.links_removed {
+        println!("  removed {line}");
+    }
     if needs_session_agent(&client, id) {
         crate::session_agent::ensure_for_automatic(&client);
     }
@@ -498,23 +677,46 @@ fn needs_session_agent(client: &PrivilegedClient, id: ConnectionId) -> bool {
         .is_ok_and(|conn| !conn.global && conn.start_mode == ConnectionStartMode::Automatic)
 }
 
-/// `dns` is `None` to only print the settings.
-fn cmd_config(id: &str, dns: Option<bool>) -> anyhow::Result<()> {
+/// `dns` and `links` are `None` to leave the setting alone; with both `None`
+/// the settings are only printed. `links` holds the raw `--link` values and
+/// replaces the stored set.
+fn cmd_config(id: &str, dns: Option<bool>, links: Option<Vec<String>>) -> anyhow::Result<()> {
+    // Parse before any daemon call, so a typo changes nothing.
+    let links = links.map(|specs| parse_links(&specs)).transpose()?;
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
-    let Some(enabled) = dns else {
+    if dns.is_none() && links.is_none() {
         let conn = client.get_connection(id)?;
         println!("{}", conn.label());
         println!("  dns-dynamic-store: {}", on_off(conn.dns_dynamic_store));
+        for line in format_bypass_links("links", &conn.bypass_links) {
+            println!("  {line}");
+        }
         return Ok(());
-    };
-    client.set_connection_dns_dynamic_store(id, enabled)?;
+    }
+    // Links first: the daemon may reject them, and that must not leave the DNS
+    // switch half applied.
+    let links_set = links.is_some();
+    if let Some(links) = links {
+        client.set_connection_bypass_links(id, links)?;
+    }
+    if let Some(enabled) = dns {
+        client.set_connection_dns_dynamic_store(id, enabled)?;
+    }
     let conn = client.get_connection(id)?;
-    println!(
-        "Set dns-dynamic-store to {} for {}",
-        on_off(enabled),
-        conn.label()
-    );
+    if let Some(enabled) = dns {
+        println!(
+            "Set dns-dynamic-store to {} for {}",
+            on_off(enabled),
+            conn.label()
+        );
+    }
+    if links_set {
+        println!("Set links for {}", conn.label());
+        for line in format_bypass_links("links", &conn.bypass_links) {
+            println!("  {line}");
+        }
+    }
     if conn.connected {
         let name = conn.name.clone().unwrap_or_else(|| conn.id.to_string());
         println!(
@@ -523,6 +725,40 @@ fn cmd_config(id: &str, dns: Option<bool>) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse the `--link` values into canonical links. Host bits that had to be
+/// cleared are reported once here; the daemon validates the links against
+/// AllowedIPs.
+fn parse_links(specs: &[String]) -> anyhow::Result<Vec<BypassLink>> {
+    let mut links = Vec::new();
+    for spec in specs {
+        let (link, cleared) = crate::bypass_links::parse_link_spec(spec)?;
+        for change in cleared {
+            eprintln!(
+                "note: {} has host bits set, using {}",
+                change.given, change.canonical
+            );
+        }
+        links.push(link);
+    }
+    Ok(links)
+}
+
+/// The "links" lines of `connection config` and `connection get`, with the
+/// validation state against the current AllowedIPs.
+fn format_bypass_links(label: &str, links: &[BypassLinkSummary]) -> Vec<String> {
+    if links.is_empty() {
+        return vec![format!("{label}: none")];
+    }
+    let mut lines = vec![format!("{label}:")];
+    for summary in links {
+        lines.push(match &summary.invalid {
+            None => format!("  {}  ok", summary.link.spec()),
+            Some(reason) => format!("  {}  ignored at connect: {reason}", summary.link.spec()),
+        });
+    }
+    lines
 }
 
 fn on_off(enabled: bool) -> &'static str {
@@ -554,6 +790,9 @@ fn cmd_get(id: &str) -> anyhow::Result<()> {
     println!("connected:   {}", conn.connected);
     println!("user_disconnected: {}", conn.user_disconnected);
     println!("dns_dynamic_store: {}", conn.dns_dynamic_store);
+    for line in format_bypass_links("bypass_links", &conn.bypass_links) {
+        println!("{line}");
+    }
     println!("addresses:   {}", conn.addresses.join(", "));
     println!("dns_servers: {}", conn.dns_servers.join(", "));
     println!(
@@ -694,5 +933,61 @@ mod dns_custody_note_tests {
         let missing = dir.join("missing.conf");
         assert!(read_conf(missing.to_str().unwrap()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split(' ').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn config_target_is_found_before_and_after_the_options() {
+        let target = |line: &str| config_target_from_words(&words(line));
+        let home = Some("home".to_string());
+        // `--link` and its value are two words, `--link=VALUE` is one.
+        assert_eq!(target("wgd connection config home --link 10."), home);
+        assert_eq!(
+            target("wgd connection config --link 10.66.77.0/24= home"),
+            home
+        );
+        assert_eq!(
+            target("wgd connection config --dns-dynamic-store home --link "),
+            home
+        );
+        assert_eq!(target("wgd -v connection config home --link=10."), home);
+        assert_eq!(
+            target("wgd connection config home --link 10.66.77.0/24=1 --link 1"),
+            home
+        );
+        // Not typed yet, or another command.
+        assert_eq!(target("wgd connection config --link 10."), None);
+        assert_eq!(target("wgd connection config"), None);
+        assert_eq!(target("wgd connection get home"), None);
+        assert_eq!(target("wgd status home"), None);
+    }
+
+    #[test]
+    fn link_candidates_without_target_collect_across_connections_per_connection() {
+        let nets = |entries: &[&str]| -> Vec<ipnet::IpNet> {
+            entries.iter().map(|entry| entry.parse().unwrap()).collect()
+        };
+        let home = nets(&["10.66.77.0/24", "192.168.188.1/32"]);
+        let office = nets(&["10.66.77.0/24", "172.16.0.0/24"]);
+
+        // Without `=`, anchors from all connections are offered once in order.
+        assert_eq!(
+            link_candidates_for_connections("", [home.clone(), office.clone()]),
+            vec!["10.66.77.0/24=", "192.168.188.1/32=", "172.16.0.0/24=",]
+        );
+
+        // After `=`, only connections that actually contain the anchor
+        // contribute prefixes from their own AllowedIPs.
+        assert_eq!(
+            link_candidates_for_connections("192.168.188.1/32=", [home.clone(), office.clone()]),
+            vec!["192.168.188.1/32=10.66.77.0/24"]
+        );
+        assert_eq!(
+            link_candidates_for_connections("172.16.0.0/24=", [home, office]),
+            vec!["172.16.0.0/24=10.66.77.0/24"]
+        );
     }
 }

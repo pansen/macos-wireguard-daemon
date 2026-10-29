@@ -8,6 +8,7 @@
 pub const BUILD_LABEL: &str = env!("WGD_BUILD_LABEL");
 
 // Provider-agnostic infrastructure
+pub mod bypass_links;
 pub mod cli;
 pub mod completion;
 pub mod config;

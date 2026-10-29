@@ -213,6 +213,7 @@ pub(super) fn run_gotatun_up(
     config_content: &str,
     mtu_override: Option<u16>,
     dns_dynamic_store: bool,
+    bypass_links: &[crate::bypass_links::BypassLink],
     debug_enabled: bool,
 ) -> Result<()> {
     use base64::Engine;
@@ -257,6 +258,17 @@ pub(super) fn run_gotatun_up(
     if dns_dynamic_store {
         info!(%connection_id, "privileged_dns_via_dynamic_store");
         command.env(crate::dns_dynamic_store::ACTIVE_ENV, "1");
+    }
+    // `doc/lan-bypass-links.md`: only links that validate reach the helper.
+    if !bypass_links.is_empty() {
+        info!(%connection_id, links = bypass_links.len(), "privileged_bypass_links_passed");
+        command.env(
+            crate::bypass_links::ENV,
+            crate::bypass_links::to_env_value(bypass_links),
+        );
+    } else {
+        // Never inherit links from the daemon's own environment.
+        command.env_remove(crate::bypass_links::ENV);
     }
     if let Some(mtu) = mtu_override {
         command.env("WGD_GOTATUN_MTU_OVERRIDE", mtu.to_string());
