@@ -165,7 +165,9 @@ dropped, and a link goes entirely when its anchor no longer validates or no
 prefix is left. The refresh output lists what was removed (and so does the
 daemon log, `privileged_bypass_link_pruned`). `add --force`, which replaces a
 connection under a new id, carries the links over with the same pruning and
-reports the same way.
+reports the same way. If carrying them over fails, the command stops before
+it removes the old record, so the links are not lost; running it again
+returns the same new id and retries.
 
 Connect checks the stored links again as a safety net (a record written by an
 older version, a hand-edited store). A link that does not validate is ignored,

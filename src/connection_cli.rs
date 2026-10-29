@@ -431,13 +431,16 @@ fn cmd_add(
         }
         // Same for LAN bypass links, pruned to what the new AllowedIPs still
         // support (as `refresh` does); what goes is reported, not an error.
+        // A failure stops before the stale record is removed, so its links
+        // are not lost; re-running the same command returns the same id and
+        // tries again.
         if let Some(conn) = stale.iter().find(|conn| !conn.bypass_links.is_empty()) {
-            if let Err(error) = carry_over_links(&client, id, conn) {
-                eprintln!(
-                    "warning: could not keep the links of {}: {error}",
+            carry_over_links(&client, id, conn).with_context(|| {
+                format!(
+                    "could not keep the links of {}; it was not removed, run the command again",
                     conn.label()
-                );
-            }
+                )
+            })?;
         }
         for conn in stale {
             println!(
