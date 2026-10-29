@@ -305,56 +305,130 @@ pub(in crate::userspace_helper) fn macos_reconcile_routes(state: &MacosCleanupSt
                 return false;
             }
         };
-    if fingerprint == routing.fingerprint {
+    // An unchanged network normally means nothing to do. After a failed add or
+    // delete it means "try the failed operations again": nothing else would.
+    let retry = fingerprint == routing.fingerprint;
+    if retry && routing.failing.is_empty() {
         return false;
     }
 
-    let previous = routing.fingerprint.clone();
-    info!(
-        interface = inputs.interface,
-        old_gateway = ?previous.endpoint_gateway,
-        new_gateway = ?fingerprint.endpoint_gateway,
-        old_local_subnets = %format_subnets(&previous.local_subnets),
-        new_local_subnets = %format_subnets(&fingerprint.local_subnets),
-        "userspace_helper_network_change_detected"
-    );
+    if retry {
+        debug!(
+            interface = inputs.interface,
+            failing = routing.failing.len(),
+            "userspace_helper_route_reconcile_retry"
+        );
+    } else {
+        let previous = routing.fingerprint.clone();
+        info!(
+            interface = inputs.interface,
+            old_gateway = ?previous.endpoint_gateway,
+            new_gateway = ?fingerprint.endpoint_gateway,
+            old_local_subnets = %format_subnets(&previous.local_subnets),
+            new_local_subnets = %format_subnets(&fingerprint.local_subnets),
+            "userspace_helper_network_change_detected"
+        );
+    }
 
     let desired = macos_desired_routes(inputs, &fingerprint);
-    let current = routing.routes_added.clone();
     debug!(
         interface = inputs.interface,
-        previous_routes = ?current,
+        previous_routes = ?routing.routes_added,
         desired_routes = ?desired,
         endpoint_pin = inputs.endpoint_needs_pin,
         "userspace_helper_route_reconcile_plan"
     );
-    log_macos_network_diagnostics("before_route_reconcile", inputs);
+    if !retry {
+        log_macos_network_diagnostics("before_route_reconcile", inputs);
+    }
+    let applied = macos_apply_route_plan(
+        &mut routing,
+        desired,
+        retry,
+        &del_macos_route,
+        &add_macos_route,
+        &|route| {
+            // Joining a LAN the tunnel already routed costs that LAN its
+            // connected route; dropping ours is only half the repair.
+            macos_restore_shadowed_lan_route(route, &fingerprint.local_subnets, &inputs.interface)
+        },
+    );
+    routing.fingerprint = fingerprint.clone();
+
+    if retry && applied.added + applied.removed == 0 {
+        // Still failing, nothing new to report: stay quiet.
+        return false;
+    }
+    info!(
+        interface = inputs.interface,
+        routes_added = applied.added,
+        routes_removed = applied.removed,
+        errors = applied.errors,
+        "userspace_helper_reconcile_applied"
+    );
+    true
+}
+
+use super::{MacosRouteFailure, MacosRouteOperation, MacosRoutingState};
+
+/// What one pass of [`macos_apply_route_plan`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct RouteApplied {
+    pub(super) added: usize,
+    pub(super) removed: usize,
+    pub(super) errors: usize,
+}
+
+/// Bring the routes this tunnel owns (`routing.routes_added`) in line with
+/// `desired`, and record in `routing.failing` the operations that failed.
+///
+/// A route whose delete failed stays owned: it is still in the kernel, so the
+/// next pass and teardown must try it again. A route whose add failed is not
+/// owned, but it is remembered. On a `retry_only` pass (the network did not
+/// change, so only the failures are being retried) just those adds and the
+/// replacements waiting for a failed delete are attempted. The other desired
+/// routes that are not installed were skipped on purpose (a physical
+/// interface holds the prefix) and stay skipped.
+///
+/// `delete`, `add` and `restore` do the system calls (injected so tests need
+/// no routing table); `restore` runs after each successful delete.
+pub(super) fn macos_apply_route_plan(
+    routing: &mut MacosRoutingState,
+    desired: Vec<MacosRoute>,
+    retry_only: bool,
+    delete: &dyn Fn(&MacosRoute) -> anyhow::Result<()>,
+    add: &dyn Fn(&MacosRoute) -> anyhow::Result<MacosRouteInstall>,
+    restore: &dyn Fn(&MacosRoute),
+) -> RouteApplied {
+    let previous = std::mem::take(&mut routing.failing);
+    let current = std::mem::take(&mut routing.routes_added);
     let mut installed: Vec<MacosRoute> = Vec::new();
-    let (mut added, mut removed, mut errors) = (0usize, 0usize, 0usize);
+    let mut failing: Vec<MacosRouteFailure> = Vec::new();
+    let mut applied = RouteApplied::default();
 
     // Remove routes that are no longer desired (e.g. a LAN we just left, or a
     // stale endpoint pin via the previous gateway).
     for route in &current {
-        if !desired.contains(route) {
-            match del_macos_route(route) {
-                Ok(()) => {
-                    removed += 1;
-                    // Joining a LAN the tunnel already routed costs that LAN its
-                    // connected route; dropping ours is only half the repair.
-                    macos_restore_shadowed_lan_route(
-                        route,
-                        &fingerprint.local_subnets,
-                        &inputs.interface,
-                    );
-                }
-                Err(error) => {
-                    errors += 1;
-                    warn!(
-                        destination = %route.destination,
-                        error = %error,
-                        "userspace_helper_reconcile_route_delete_failed"
-                    );
-                }
+        if desired.contains(route) {
+            installed.push(route.clone());
+            continue;
+        }
+        match delete(route) {
+            Ok(()) => {
+                applied.removed += 1;
+                note_retry_succeeded(&previous, route, MacosRouteOperation::Delete);
+                restore(route);
+            }
+            Err(error) => {
+                applied.errors += 1;
+                // Still in the kernel, so still ours.
+                installed.push(route.clone());
+                failing.push(record_failure(
+                    &previous,
+                    route,
+                    MacosRouteOperation::Delete,
+                    &error,
+                ));
             }
         }
     }
@@ -362,12 +436,31 @@ pub(in crate::userspace_helper) fn macos_reconcile_routes(state: &MacosCleanupSt
     // Add newly desired routes; keep the ones already present.
     for route in desired {
         if current.contains(&route) {
-            installed.push(route);
             continue;
         }
-        match add_macos_route(&route) {
+        // `route add` accepts EEXIST as success. While the old gateway is
+        // still installed, that would falsely claim its replacement too;
+        // retrying the old delete would then remove the only kernel entry.
+        if failing.iter().any(|failure| {
+            failure.operation == MacosRouteOperation::Delete
+                && same_route_destination(&failure.route, &route)
+        }) {
+            continue;
+        }
+        let add_failed_before = previous
+            .iter()
+            .any(|f| f.route == route && f.operation == MacosRouteOperation::Add);
+        let replacement_waited = previous.iter().any(|failure| {
+            failure.operation == MacosRouteOperation::Delete
+                && same_route_destination(&failure.route, &route)
+        });
+        if retry_only && !add_failed_before && !replacement_waited {
+            continue;
+        }
+        match add(&route) {
             Ok(MacosRouteInstall::Owned) => {
-                added += 1;
+                applied.added += 1;
+                note_retry_succeeded(&previous, &route, MacosRouteOperation::Add);
                 installed.push(route);
             }
             Ok(MacosRouteInstall::Foreign) => warn!(
@@ -375,28 +468,110 @@ pub(in crate::userspace_helper) fn macos_reconcile_routes(state: &MacosCleanupSt
                 "userspace_helper_route_skipped_physical_prefix"
             ),
             Err(error) => {
-                errors += 1;
-                warn!(
-                    destination = %route.destination,
-                    error = %error,
-                    "userspace_helper_reconcile_route_add_failed"
-                );
+                applied.errors += 1;
+                failing.push(record_failure(
+                    &previous,
+                    &route,
+                    MacosRouteOperation::Add,
+                    &error,
+                ));
             }
         }
     }
 
     routing.routes_added = installed;
-    routing.fingerprint = fingerprint.clone();
-
-    info!(
-        interface = inputs.interface,
-        routes_added = added,
-        routes_removed = removed,
-        errors,
-        "userspace_helper_reconcile_applied"
-    );
-    true
+    routing.failing = failing;
+    applied
 }
+
+/// The kernel key of a route, independent of its gateway or interface. Host
+/// pins have no CIDR suffix; AllowedIPs may have non-canonical host bits.
+fn same_route_destination(left: &MacosRoute, right: &MacosRoute) -> bool {
+    match (
+        super::route_table::macos_route_destination(left),
+        super::route_table::macos_route_destination(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.is_ipv6 == right.is_ipv6 && left.destination == right.destination,
+    }
+}
+
+/// Whether a failure of `operation` on `route` repeats the identical failure of
+/// the pass before.
+fn is_repeated_failure(
+    previous: &[MacosRouteFailure],
+    route: &MacosRoute,
+    operation: MacosRouteOperation,
+    error: &str,
+) -> bool {
+    previous
+        .iter()
+        .any(|f| f.route == *route && f.operation == operation && f.error == error)
+}
+
+/// Log a failed operation and return the record to retry it. The first failure
+/// of a route (or one with a different error than before) is a warning; the
+/// same failure again is debug, so an error that persists does not fill the log
+/// every tick.
+fn record_failure(
+    previous: &[MacosRouteFailure],
+    route: &MacosRoute,
+    operation: MacosRouteOperation,
+    error: &anyhow::Error,
+) -> MacosRouteFailure {
+    let error = error.to_string();
+    let repeated = is_repeated_failure(previous, route, operation, &error);
+    let destination = &route.destination;
+    match (operation, repeated) {
+        (MacosRouteOperation::Add, false) => warn!(
+            destination = %destination,
+            error = %error,
+            "userspace_helper_reconcile_route_add_failed"
+        ),
+        (MacosRouteOperation::Add, true) => debug!(
+            destination = %destination,
+            error = %error,
+            "userspace_helper_reconcile_route_add_failed"
+        ),
+        (MacosRouteOperation::Delete, false) => warn!(
+            destination = %destination,
+            error = %error,
+            "userspace_helper_reconcile_route_delete_failed"
+        ),
+        (MacosRouteOperation::Delete, true) => debug!(
+            destination = %destination,
+            error = %error,
+            "userspace_helper_reconcile_route_delete_failed"
+        ),
+    }
+    MacosRouteFailure {
+        route: route.clone(),
+        operation,
+        error,
+    }
+}
+
+/// Say so when an operation that failed on the pass before now worked.
+fn note_retry_succeeded(
+    previous: &[MacosRouteFailure],
+    route: &MacosRoute,
+    operation: MacosRouteOperation,
+) {
+    if previous
+        .iter()
+        .any(|f| f.route == *route && f.operation == operation)
+    {
+        info!(
+            destination = %route.destination,
+            operation = ?operation,
+            "userspace_helper_reconcile_route_retry_succeeded"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "route_reconcile_tests.rs"]
+mod reconcile_tests;
 
 pub(super) fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
     let mut args = vec!["-n", "get"];

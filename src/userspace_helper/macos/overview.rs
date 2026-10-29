@@ -120,12 +120,16 @@ pub(super) fn log_macos_diagnostic_command(
 /// Shells out to `route`/`ifconfig`/`scutil`, so call it off the async runtime.
 pub(super) fn build_macos_network_overview(state: &MacosCleanupState) -> NetworkOverview {
     let inputs = &state.reconcile;
-    let (routes, route_fingerprint) = {
+    let (routes, route_fingerprint, route_failures) = {
         let routing = state
             .routing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (routing.routes_added.clone(), routing.fingerprint.clone())
+        (
+            routing.routes_added.clone(),
+            routing.fingerprint.clone(),
+            routing.failing.clone(),
+        )
     };
     let (owned_dns, dns_fingerprint) = {
         let dns = state
@@ -153,7 +157,40 @@ pub(super) fn build_macos_network_overview(state: &MacosCleanupState) -> Network
         &|route| macos_route_destination(route).and_then(macos_route_egress_interface),
     );
     overview.dns.dynamic_store = state.dns_store_key.as_ref().map(|key| key.overview());
+    mark_failed_route_removals(&mut overview.routes, &route_failures);
     overview
+}
+
+use super::{MacosRouteFailure, MacosRouteOperation};
+
+/// Desired routes alone cannot say whether a removal worked. Overlay the
+/// last operation's error for LAN exclusions, endpoint pins and leftovers
+/// alike, keeping the live kernel observation next to it.
+fn mark_failed_route_removals(rows: &mut [RouteRow], failures: &[MacosRouteFailure]) {
+    for failure in failures {
+        if failure.operation != MacosRouteOperation::Delete {
+            continue;
+        }
+        let route = &failure.route;
+        let destination = macos_route_display_destination(route);
+        for row in rows.iter_mut().filter(|row| {
+            row.family == macos_ip_family(route.is_ipv6)
+                && (row.destination == destination || row.destination == route.destination)
+        }) {
+            row.outcome = RouteOutcome::RemovalFailed {
+                error: failure.error.clone(),
+            };
+            row.via = match (&route.gateway, &route.interface) {
+                (Some(gateway), _) => RouteVia::Gateway {
+                    address: gateway.clone(),
+                },
+                (None, Some(interface)) => RouteVia::Interface {
+                    name: interface.clone(),
+                },
+                _ => RouteVia::System,
+            };
+        }
+    }
 }
 
 /// Log a full route + DNS overview as one structured field. Called once after
@@ -971,6 +1008,67 @@ mod tests {
             ResolverState::PartiallyTunnel
         );
         assert_eq!(state(&[]), ResolverState::Unset);
+    }
+
+    #[test]
+    fn failed_removals_are_visible_for_lan_routes_endpoint_pins_and_leftovers() {
+        let mut inputs = split_inputs();
+        inputs.allowed_ips = vec!["10.66.77.0/24".into()];
+        inputs.endpoint_needs_pin = true;
+        let lan = MacosRoute {
+            destination: "10.66.77.0/24".into(),
+            is_ipv6: false,
+            interface: Some(inputs.interface.clone()),
+            gateway: None,
+        };
+        let pin = MacosRoute {
+            destination: inputs.endpoint.to_string(),
+            is_ipv6: false,
+            interface: None,
+            gateway: Some("192.168.1.1".into()),
+        };
+        let leftover = MacosRoute {
+            destination: "192.0.2.7/32".into(),
+            ..lan.clone()
+        };
+        let owned = vec![lan, pin, leftover];
+        let fingerprint = MacosNetworkFingerprint {
+            local_subnets: vec![subnet("10.66.77.0/24")],
+            endpoint_gateway: Some("10.66.77.1".into()),
+        };
+        let mut rows =
+            macos_route_overview_rows(&inputs, &fingerprint, &owned, &|_| None, &|_| None);
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.outcome, RouteOutcome::EndpointPinned)));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.outcome, RouteOutcome::ExcludedLocalSubnet { .. })));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.outcome, RouteOutcome::NoLongerDesired)));
+        let failures: Vec<MacosRouteFailure> = owned
+            .into_iter()
+            .map(|route| MacosRouteFailure {
+                route,
+                operation: MacosRouteOperation::Delete,
+                error: "temporarily unavailable".into(),
+            })
+            .collect();
+        mark_failed_route_removals(&mut rows, &failures);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row.outcome,
+                RouteOutcome::RemovalFailed {
+                    error: "temporarily unavailable".into(),
+                }
+            );
+            assert!(matches!(
+                row.via,
+                RouteVia::Interface { .. } | RouteVia::Gateway { .. }
+            ));
+        }
     }
 
     // --- DNS reconciler ---

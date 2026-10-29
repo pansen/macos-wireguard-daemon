@@ -57,6 +57,24 @@ struct MacosRoutingState {
     routes_added: Vec<MacosRoute>,
     /// Last observed network environment. A change drives reconciliation.
     fingerprint: MacosNetworkFingerprint,
+    /// Route operations the last reconcile pass could not complete. Any entry
+    /// makes the next tick reconcile again even if the network did not change;
+    /// an error-free pass empties it.
+    failing: Vec<MacosRouteFailure>,
+}
+
+/// A route operation the reconciler failed at and will try again.
+#[derive(Debug, Clone, PartialEq)]
+struct MacosRouteFailure {
+    route: MacosRoute,
+    operation: MacosRouteOperation,
+    error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosRouteOperation {
+    Add,
+    Delete,
 }
 
 /// DNS state the reconciler keeps in sync with the active LAN.
@@ -432,6 +450,9 @@ pub(super) fn configure_network_macos(
         routing: std::sync::Mutex::new(MacosRoutingState {
             routes_added,
             fingerprint,
+            // Setup treats a route error as fatal and rolls back, so nothing
+            // is pending when the tunnel comes up.
+            failing: Vec::new(),
         }),
         dns: std::sync::Mutex::new(MacosDnsState {
             services: dns_services,

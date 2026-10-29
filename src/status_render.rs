@@ -280,6 +280,7 @@ fn route_in_effect(outcome: &RouteOutcome) -> bool {
         | RouteOutcome::Blocked { .. }
         | RouteOutcome::ReconcilePending
         | RouteOutcome::NoAddressForFamily => false,
+        RouteOutcome::RemovalFailed { .. } => true,
     }
 }
 
@@ -333,6 +334,9 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
             )
         }
         RouteOutcome::NoLongerDesired => "owned: no longer desired, cleanup pending".to_string(),
+        RouteOutcome::RemovalFailed { error } => {
+            format!("route removal failed; retry pending: {error}")
+        }
     }
 }
 
@@ -1130,6 +1134,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn failed_route_removal_is_visible_and_not_muted() {
+        let mut ov = o1();
+        ov.routes = vec![route(
+            "10.66.77.0/24",
+            interface_via("utun6"),
+            IpFamily::Ipv4,
+            present(Some("utun6"), None, Some(1384)),
+            RouteOutcome::RemovalFailed {
+                error: "temporarily unavailable".into(),
+            },
+        )];
+        let text = render_network_overview(&ov, &RenderCtx::ansi());
+        let row = text
+            .lines()
+            .find(|line| line.contains("10.66.77.0/24"))
+            .unwrap();
+        assert!(row.contains("route removal failed; retry pending: temporarily unavailable"));
+        assert!(!row.contains("\u{1b}[2m"));
+        let json = serde_json::to_string(&ov).unwrap();
+        let decoded: NetworkOverview = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ov);
     }
 
     #[test]

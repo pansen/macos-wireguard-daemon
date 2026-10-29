@@ -135,6 +135,11 @@ pub enum RouteOutcome {
     /// The tunnel has no address of the row's family.
     NoAddressForFamily,
     NoLongerDesired,
+    /// The last delete failed. The helper still owns this route and retries
+    /// it on the next reconcile tick and during teardown.
+    RemovalFailed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
