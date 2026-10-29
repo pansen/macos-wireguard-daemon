@@ -375,16 +375,19 @@ pub enum ConnectionCommand {
     /// of setting it on the primary network service with networksetup
     /// (see doc/dns-dynamic-store.md).
     ///
-    /// --link ANCHOR=PREFIX[,PREFIX...] keeps the prefixes off the tunnel
+    /// --set-link ANCHOR=PREFIX[,PREFIX...] keeps the prefixes off the tunnel
     /// while the Mac is attached to the ANCHOR network, for hosts that sit
     /// behind a NAT in that network, for example
-    /// --link 10.66.77.0/24=192.168.188.1/32 (see doc/lan-bypass-links.md).
+    /// --set-link 10.66.77.0/24=192.168.188.1/32 (see doc/lan-bypass-links.md).
     /// ANCHOR and each PREFIX must be AllowedIPs entries of the connection,
     /// and the ANCHOR is the LAN that is kept off the tunnel anyway. Narrower
-    /// entries inside a PREFIX leave the tunnel with it. Repeat
-    /// --link for several networks; the given links replace all earlier ones.
+    /// entries inside a PREFIX leave the tunnel with it. Repeat --set-link for
+    /// several networks; the given links replace all earlier ones.
+    /// --add-link takes the same value and adds to the stored links instead:
+    /// prefixes for an ANCHOR that already has a link join that link.
     ///
-    /// A change applies at the next connect.
+    /// A connected connection is reconnected so a change applies at once;
+    /// with --no-apply it applies at the next connect.
     #[command(verbatim_doc_comment)]
     Config {
         /// Connection id or name, as printed by `add` or `list`
@@ -403,18 +406,37 @@ pub enum ConnectionCommand {
 
         /// Keep PREFIX(es) off the tunnel while attached to ANCHOR; replaces all links
         #[arg(
-            long = "link",
+            long,
+            value_name = "ANCHOR=PREFIX[,PREFIX...]",
+            conflicts_with_all = ["add_link", "no_links"],
+            add = clap_complete::engine::ArgValueCompleter::new(
+                crate::connection_cli::complete_bypass_link
+            )
+        )]
+        set_link: Vec<String>,
+
+        /// Like --set-link, but adds to the stored links
+        #[arg(
+            long,
             value_name = "ANCHOR=PREFIX[,PREFIX...]",
             conflicts_with = "no_links",
             add = clap_complete::engine::ArgValueCompleter::new(
                 crate::connection_cli::complete_bypass_link
             )
         )]
-        link: Vec<String>,
+        add_link: Vec<String>,
 
         /// Remove all links
         #[arg(long)]
         no_links: bool,
+
+        /// Reconnect a connected connection so a change applies now (the default)
+        #[arg(long, conflicts_with = "no_apply")]
+        apply: bool,
+
+        /// Leave a connected connection alone; a change applies at the next connect
+        #[arg(long)]
+        no_apply: bool,
     },
 
     /// Show full detail for one stored connection (owner or root only)
@@ -878,8 +900,11 @@ mod tests {
             let cli = Cli::try_parse_from(args)?;
             match cli.command {
                 TopCommand::Connection {
-                    command: ConnectionCommand::Config { link, no_links, .. },
-                } => Ok((link, no_links)),
+                    command:
+                        ConnectionCommand::Config {
+                            set_link, no_links, ..
+                        },
+                } => Ok((set_link, no_links)),
                 _ => panic!("expected connection config command"),
             }
         };
@@ -893,9 +918,9 @@ mod tests {
                 "connection",
                 "config",
                 "home",
-                "--link",
+                "--set-link",
                 "10.66.77.0/24=192.168.188.1/32,192.168.188.50/32",
-                "--link",
+                "--set-link",
                 "172.16.5.0/24=192.168.9.1/32",
             ])
             .unwrap(),
@@ -916,9 +941,62 @@ mod tests {
             "connection",
             "config",
             "home",
-            "--link",
+            "--set-link",
             "10.66.77.0/24=192.168.188.1/32",
             "--no-links",
+        ])
+        .is_err());
+        // --add-link extends, so it can follow nothing that replaces the set.
+        for other in ["--set-link", "--no-links"] {
+            let mut args = vec![
+                "wgd",
+                "connection",
+                "config",
+                "home",
+                "--add-link",
+                "10.66.77.0/24=192.168.188.1/32",
+                other,
+            ];
+            if other == "--set-link" {
+                args.push("172.16.5.0/24=192.168.9.1/32");
+            }
+            assert!(Cli::try_parse_from(args).is_err(), "{other}");
+        }
+    }
+
+    #[test]
+    fn parse_connection_config_apply_flags() {
+        let parse = |args: &[&str]| -> Result<(Vec<String>, bool, bool), clap::Error> {
+            let cli = Cli::try_parse_from(args)?;
+            match cli.command {
+                TopCommand::Connection {
+                    command:
+                        ConnectionCommand::Config {
+                            add_link,
+                            apply,
+                            no_apply,
+                            ..
+                        },
+                } => Ok((add_link, apply, no_apply)),
+                _ => panic!("expected connection config command"),
+            }
+        };
+        let link = "10.66.77.0/24=192.168.188.1/32";
+        assert_eq!(
+            parse(&["wgd", "connection", "config", "home", "--add-link", link]).unwrap(),
+            (vec![link.to_string()], false, false)
+        );
+        assert_eq!(
+            parse(&["wgd", "connection", "config", "home", "--no-apply"]).unwrap(),
+            (Vec::new(), false, true)
+        );
+        assert!(parse(&[
+            "wgd",
+            "connection",
+            "config",
+            "home",
+            "--apply",
+            "--no-apply"
         ])
         .is_err());
     }

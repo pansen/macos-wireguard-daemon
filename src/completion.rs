@@ -34,7 +34,7 @@ pub fn shells() -> clap_complete::env::Shells<'static> {
 /// bash completion with a registration script of our own.
 ///
 /// `clap_complete` hands bash's `COMP_WORDS` to the binary as they are, and
-/// bash cuts those at `=` and `:`, so `connection config --link A=p1,p2`
+/// bash cuts those at `=` and `:`, so `connection config --set-link A=p1,p2`
 /// arrives in pieces and cannot be completed. Our script
 /// (`completion_bash.sh`) joins the pieces again and trims the candidates to
 /// what bash replaces. Everything on the binary side stays `clap_complete`'s:
@@ -471,7 +471,7 @@ mod tests {
         "10.66.77.0/24=",
         "10.66.77.0/24=192.168.188.1/32",
         "10.66.77.0/24=192.168.188.1/32,100.64.1.0/24",
-        "--link=10.66.77.0/24=",
+        "--set-link=10.66.77.0/24=",
         "fd00::/64=",
         "fd00::/64=fd01::1/128",
         "fd00::/64=fd01::1/128,fd01::2/128",
@@ -480,7 +480,7 @@ mod tests {
     ];
 
     fn link_line(text: &str) -> String {
-        format!("wgd connection config home --link {text}")
+        format!("wgd connection config home --set-link {text}")
     }
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn bash_completion_rejoins_words_cut_at_equals_and_colon() {
-        let head = ["wgd", "connection", "config", "home", "--link"];
+        let head = ["wgd", "connection", "config", "home", "--set-link"];
         let words = |tail: &[&'static str]| -> Vec<&'static str> {
             let mut all = head.to_vec();
             all.extend_from_slice(tail);
@@ -503,7 +503,10 @@ mod tests {
 
             // Nothing was cut: nothing to trim.
             let r = run(&link_line("10."), &words(&["10."]), 5);
-            assert_eq!(r.asked, "5|wgd connection config home --link 10.", "{bash}");
+            assert_eq!(
+                r.asked, "5|wgd connection config home --set-link 10.",
+                "{bash}"
+            );
             assert_eq!(
                 r.reply,
                 strings(&[
@@ -522,7 +525,7 @@ mod tests {
                 6,
             );
             assert_eq!(
-                cut.asked, "5|wgd connection config home --link 10.66.77.0/24=",
+                cut.asked, "5|wgd connection config home --set-link 10.66.77.0/24=",
                 "{bash}"
             );
             assert_eq!(cut.reply, after_equals, "{bash}");
@@ -537,7 +540,7 @@ mod tests {
                 7,
             );
             assert_eq!(
-                r.asked, "5|wgd connection config home --link 10.66.77.0/24=192.168.188.1/32,1",
+                r.asked, "5|wgd connection config home --set-link 10.66.77.0/24=192.168.188.1/32,1",
                 "{bash}"
             );
             assert_eq!(
@@ -553,18 +556,29 @@ mod tests {
                 11,
             );
             assert_eq!(
-                r.asked, "5|wgd connection config home --link fd00::/64=fd01::1",
+                r.asked, "5|wgd connection config home --set-link fd00::/64=fd01::1",
                 "{bash}"
             );
             assert_eq!(r.reply, strings(&["1/128", "1/128,fd01::2/128"]), "{bash}");
 
-            // `--link=VALUE` form.
+            // `--set-link=VALUE` form.
             let r = run(
-                "wgd connection config home --link=10.",
-                &["wgd", "connection", "config", "home", "--link", "=", "10."],
+                "wgd connection config home --set-link=10.",
+                &[
+                    "wgd",
+                    "connection",
+                    "config",
+                    "home",
+                    "--set-link",
+                    "=",
+                    "10.",
+                ],
                 6,
             );
-            assert_eq!(r.asked, "4|wgd connection config home --link=10.", "{bash}");
+            assert_eq!(
+                r.asked, "4|wgd connection config home --set-link=10.",
+                "{bash}"
+            );
             assert_eq!(r.reply, strings(&["10.66.77.0/24="]), "{bash}");
         }
     }
@@ -602,7 +616,7 @@ mod tests {
                     "connection",
                     "config",
                     "home",
-                    "--link",
+                    "--set-link",
                     "fd00::/64",
                     "=",
                     "fd01::1",
@@ -611,7 +625,7 @@ mod tests {
                 CANDIDATES,
             );
             assert_eq!(
-                r.asked, "5|wgd connection config home --link fd00::/64=fd01::1",
+                r.asked, "5|wgd connection config home --set-link fd00::/64=fd01::1",
                 "{bash}"
             );
             assert_eq!(

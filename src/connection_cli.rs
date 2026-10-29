@@ -1,7 +1,7 @@
 //! `wgd connection ...`: the CLI surface over the privileged
 //! connection-store RPCs (`AddConnection`/`ListConnections`/
 //! `RemoveConnection`/`ConnectConnection`/`DisconnectConnection`/
-//! `SetConnectionMode`/`GetConnection`/`RefreshConnection`). This is the Phase 5 CLI: the legacy
+//! `SetConnectionMode`/`GetConnection`/`RefreshConnection`/`ReconnectConnection`). This is the Phase 5 CLI: the legacy
 //! `wgconf`/`connect`/`disconnect`/`autoconnect` surface has been retired in
 //! favor of it (see `doc/connection-store-plan.md`'s Phase 5 addendum for the
 //! mapping). The per-user session-reconciliation LaunchAgent lives under
@@ -17,6 +17,7 @@ use crate::privileged_api::{
     BypassLinkSummary, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
 };
 use crate::privileged_client::PrivilegedClient;
+use crate::ui::{Component, Span, Table};
 
 impl From<StartModeArg> for ConnectionStartMode {
     fn from(value: StartModeArg) -> Self {
@@ -47,23 +48,28 @@ pub fn dispatch(command: ConnectionCommand) -> anyhow::Result<()> {
             id,
             dns_dynamic_store,
             no_dns_dynamic_store,
-            link,
+            set_link,
+            add_link,
             no_links,
+            apply: _,
+            no_apply,
         } => {
             let dns = match (dns_dynamic_store, no_dns_dynamic_store) {
                 (true, _) => Some(true),
                 (_, true) => Some(false),
                 _ => None,
             };
-            // `--link` replaces the full set, `--no-links` clears it.
+            // `--set-link` replaces the full set, `--no-links` clears it.
             let links = if no_links {
-                Some(Vec::new())
-            } else if link.is_empty() {
-                None
+                Some(LinkChange::Set(Vec::new()))
+            } else if !set_link.is_empty() {
+                Some(LinkChange::Set(set_link))
+            } else if !add_link.is_empty() {
+                Some(LinkChange::Add(add_link))
             } else {
-                Some(link)
+                None
             };
-            cmd_config(&id, dns, links)
+            cmd_config(&id, dns, links, !no_apply)
         }
         ConnectionCommand::Get { id } => cmd_get(&id),
     }
@@ -248,11 +254,11 @@ pub fn complete_connection_id(
     candidates
 }
 
-/// Completion candidates for the value of `connection config --link`
-/// (`<anchor>=<prefix>[,<prefix>...]`), taken from the AllowedIPs of the
-/// connection named on the same command line, or from every connection the
+/// Completion candidates for the value of `connection config --set-link` and
+/// `--add-link` (`<anchor>=<prefix>[,<prefix>...]`), taken from the AllowedIPs
+/// of the connection named on the same command line, or from every connection the
 /// caller can name when `<ID>` has not been typed yet (`wgd connection config
-/// --link <TAB>`). Same failure behaviour as [`complete_connection_id`]:
+/// --set-link <TAB>`). Same failure behaviour as [`complete_connection_id`]:
 /// anything that goes wrong is "no candidates".
 ///
 /// `ArgValueCompleter` only receives the value being completed, so the
@@ -333,14 +339,14 @@ fn completion_words() -> Vec<std::ffi::OsString> {
 
 /// The `<ID>` of `wgd connection config <ID> ...` among the words of a command
 /// line, which may be incomplete and may have the options before or after it.
-/// The first word is the binary. `--link` takes a value, `--link=VALUE` is one
-/// word (the bash registration joins words bash cut at `=` and `:` before it
-/// calls us, see `completion::WgdBash`).
+/// The first word is the binary. `--set-link` and `--add-link` take a value,
+/// `--set-link=VALUE` is one word (the bash registration joins words bash cut
+/// at `=` and `:` before it calls us, see `completion::WgdBash`).
 fn config_target_from_words(words: &[String]) -> Option<String> {
     let mut words = words.iter().skip(1);
     let mut stage = 0;
     while let Some(word) = words.next() {
-        if word == "--link" {
+        if word == "--set-link" || word == "--add-link" {
             words.next();
         } else if word.starts_with('-') {
             continue;
@@ -552,22 +558,10 @@ fn print_connections(scope: ConnectionScope) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    for conn in connections {
-        println!(
-            "{id}  {name:<20}  global={global:<5}  owner={owner:<6}  mode={mode:<9}  \
-             connected={connected:<5}  interface={interface}",
-            id = conn.id,
-            name = conn.name.as_deref().unwrap_or("-"),
-            global = conn.global,
-            owner = conn
-                .owner_uid
-                .map(|uid| uid.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            mode = format!("{:?}", conn.start_mode),
-            connected = conn.connected,
-            interface = conn.interface,
-        );
-    }
+    let mut out = String::new();
+    crate::status::connection_table(&connections, scope == ConnectionScope::All)
+        .render(&crate::ui::RenderCtx::stdout(), &mut out);
+    print!("{out}");
     Ok(())
 }
 
@@ -680,27 +674,51 @@ fn needs_session_agent(client: &PrivilegedClient, id: ConnectionId) -> bool {
         .is_ok_and(|conn| !conn.global && conn.start_mode == ConnectionStartMode::Automatic)
 }
 
+/// The `--set-link` or `--add-link` values of `connection config`: raw
+/// strings from the command line, links once parsed.
+enum LinkChange<T> {
+    Set(Vec<T>),
+    Add(Vec<T>),
+}
+
 /// `dns` and `links` are `None` to leave the setting alone; with both `None`
-/// the settings are only printed. `links` holds the raw `--link` values and
-/// replaces the stored set.
-fn cmd_config(id: &str, dns: Option<bool>, links: Option<Vec<String>>) -> anyhow::Result<()> {
+/// the settings are only printed. With `apply`, a connected connection is
+/// reconnected so a change takes effect now.
+fn cmd_config(
+    id: &str,
+    dns: Option<bool>,
+    links: Option<LinkChange<String>>,
+    apply: bool,
+) -> anyhow::Result<()> {
     // Parse before any daemon call, so a typo changes nothing.
-    let links = links.map(|specs| parse_links(&specs)).transpose()?;
+    let links = links
+        .map(|change| match change {
+            LinkChange::Set(specs) => parse_links(&specs).map(LinkChange::Set),
+            LinkChange::Add(specs) => parse_links(&specs).map(LinkChange::Add),
+        })
+        .transpose()?;
     let client = PrivilegedClient::new();
     let id = resolve_id(&client, id)?;
+    let before = client.get_connection(id)?;
     if dns.is_none() && links.is_none() {
-        let conn = client.get_connection(id)?;
-        println!("{}", conn.label());
-        println!("  dns-dynamic-store: {}", on_off(conn.dns_dynamic_store));
-        for line in format_bypass_links("links", &conn.bypass_links) {
-            println!("  {line}");
-        }
+        print_config(&before);
         return Ok(());
     }
     // Links first: the daemon may reject them, and that must not leave the DNS
     // switch half applied.
     let links_set = links.is_some();
-    if let Some(links) = links {
+    if let Some(change) = links {
+        let links = match change {
+            LinkChange::Set(links) => links,
+            LinkChange::Add(added) => {
+                let stored: Vec<BypassLink> = before
+                    .bypass_links
+                    .iter()
+                    .map(|summary| summary.link.clone())
+                    .collect();
+                crate::bypass_links::merge_links(&stored, &added)
+            }
+        };
         client.set_connection_bypass_links(id, links)?;
     }
     if let Some(enabled) = dns {
@@ -716,23 +734,45 @@ fn cmd_config(id: &str, dns: Option<bool>, links: Option<Vec<String>>) -> anyhow
     }
     if links_set {
         println!("Set links for {}", conn.label());
-        for line in format_bypass_links("links", &conn.bypass_links) {
-            println!("  {line}");
+        print_config(&conn);
+    }
+    let changed = conn.dns_dynamic_store != before.dns_dynamic_store
+        || conn.bypass_links != before.bypass_links;
+    if conn.connected && changed {
+        if apply {
+            reconnect(&client, &conn)?;
+        } else {
+            let name = conn.name.clone().unwrap_or_else(|| conn.id.to_string());
+            println!();
+            println!("takes effect at the next connect:");
+            println!("  wgd connection disconnect {name} && wgd connection connect {name}");
         }
     }
-    if conn.connected {
-        let name = conn.name.clone().unwrap_or_else(|| conn.id.to_string());
+    Ok(())
+}
+
+/// Bring a connected connection down and up again so changed settings take
+/// effect. The daemon does both steps under one lock and keeps the helper's
+/// debug flag; a connection that went down meanwhile is left down.
+fn reconnect(client: &PrivilegedClient, conn: &ConnectionSummary) -> anyhow::Result<()> {
+    let reconnected = client.reconnect_connection(conn.id).with_context(|| {
+        format!(
+            "could not apply the change to {} by reconnecting it",
+            conn.label()
+        )
+    })?;
+    if !reconnected {
         println!(
-            "  takes effect at the next connect: wgd connection disconnect {name} && \
-             wgd connection connect {name}"
+            "{} is no longer connected; the change takes effect at the next connect",
+            conn.label()
         );
     }
     Ok(())
 }
 
-/// Parse the `--link` values into canonical links. Host bits that had to be
-/// cleared are reported once here; the daemon validates the links against
-/// AllowedIPs.
+/// Parse `--set-link` or `--add-link` values into canonical links. Host bits
+/// that had to be cleared are reported once here; the daemon validates the
+/// links against AllowedIPs.
 fn parse_links(specs: &[String]) -> anyhow::Result<Vec<BypassLink>> {
     let mut links = Vec::new();
     for spec in specs {
@@ -748,7 +788,46 @@ fn parse_links(specs: &[String]) -> anyhow::Result<Vec<BypassLink>> {
     Ok(links)
 }
 
-/// The "links" lines of `connection config` and `connection get`, with the
+fn print_config(conn: &ConnectionSummary) {
+    let mut out = String::new();
+    config_table(&conn.label(), conn.dns_dynamic_store, &conn.bypass_links)
+        .render(&crate::ui::RenderCtx::stdout(), &mut out);
+    print!("{out}");
+}
+
+/// The settings of `connection config`, one row each. A link takes one row
+/// per bypass prefix, its anchor only on the first.
+fn config_table(label: &str, dns_dynamic_store: bool, links: &[BypassLinkSummary]) -> Table {
+    let mut table = Table::new(&[label, "State"]);
+    table.row(vec![
+        Span::plain("dns-dynamic-store"),
+        Span::plain(on_off(dns_dynamic_store)),
+    ]);
+    if links.is_empty() {
+        table.row(vec![Span::plain("linked networks"), Span::plain("none")]);
+        return table;
+    }
+    table.row(vec![Span::plain("linked networks:"), Span::plain("")]);
+    for summary in links {
+        let anchor = summary.link.anchor.to_string();
+        let blank = " ".repeat(anchor.len());
+        for (index, prefix) in summary.link.bypass.prefixes().iter().enumerate() {
+            let network = if index == 0 { &anchor } else { &blank };
+            let network = Span::plain(format!("  {network} -> {prefix}"));
+            match &summary.invalid {
+                None => table.row(vec![network, Span::plain("ok")]),
+                Some(reason) if index == 0 => table.muted_row(vec![
+                    network,
+                    Span::plain(format!("ignored at connect: {reason}")),
+                ]),
+                Some(_) => table.muted_row(vec![network, Span::plain("ignored")]),
+            }
+        }
+    }
+    table
+}
+
+/// The "links" lines of `connection get`, with the
 /// validation state against the current AllowedIPs.
 fn format_bypass_links(label: &str, links: &[BypassLinkSummary]) -> Vec<String> {
     if links.is_empty() {
@@ -946,23 +1025,24 @@ mod dns_custody_note_tests {
     fn config_target_is_found_before_and_after_the_options() {
         let target = |line: &str| config_target_from_words(&words(line));
         let home = Some("home".to_string());
-        // `--link` and its value are two words, `--link=VALUE` is one.
-        assert_eq!(target("wgd connection config home --link 10."), home);
+        // `--set-link` (or `--add-link`) and its value are two words,
+        // `--set-link=VALUE` is one.
+        assert_eq!(target("wgd connection config home --set-link 10."), home);
         assert_eq!(
-            target("wgd connection config --link 10.66.77.0/24= home"),
+            target("wgd connection config --add-link 10.66.77.0/24= home"),
             home
         );
         assert_eq!(
-            target("wgd connection config --dns-dynamic-store home --link "),
+            target("wgd connection config --dns-dynamic-store home --set-link "),
             home
         );
-        assert_eq!(target("wgd -v connection config home --link=10."), home);
+        assert_eq!(target("wgd -v connection config home --set-link=10."), home);
         assert_eq!(
-            target("wgd connection config home --link 10.66.77.0/24=1 --link 1"),
+            target("wgd connection config home --set-link 10.66.77.0/24=1 --set-link 1"),
             home
         );
         // Not typed yet, or another command.
-        assert_eq!(target("wgd connection config --link 10."), None);
+        assert_eq!(target("wgd connection config --set-link 10."), None);
         assert_eq!(target("wgd connection config"), None);
         assert_eq!(target("wgd connection get home"), None);
         assert_eq!(target("wgd status home"), None);
@@ -992,5 +1072,37 @@ mod dns_custody_note_tests {
             link_candidates_for_connections("172.16.0.0/24=", [home, office]),
             vec!["172.16.0.0/24=10.66.77.0/24"]
         );
+    }
+}
+
+#[cfg(test)]
+mod config_table_tests {
+    use super::*;
+    use crate::ui::{render, RenderCtx};
+
+    fn summary(spec: &str, invalid: Option<&str>) -> BypassLinkSummary {
+        BypassLinkSummary {
+            link: crate::bypass_links::parse_link_spec(spec).unwrap().0,
+            invalid: invalid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn links_take_one_row_per_bypass_prefix() {
+        let links = [
+            summary("10.66.77.0/24=192.168.188.1/32,192.168.189.1/32", None),
+            summary(
+                "10.0.0.0/8=172.16.0.0/24",
+                Some("172.16.0.0/24 is not in AllowedIPs"),
+            ),
+        ];
+        let table = config_table("abc::home", true, &links);
+        insta::assert_snapshot!(render(&table, &RenderCtx::plain()));
+    }
+
+    #[test]
+    fn no_links_reads_none() {
+        let table = config_table("abc::home", false, &[]);
+        insta::assert_snapshot!(render(&table, &RenderCtx::plain()));
     }
 }

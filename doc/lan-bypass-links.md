@@ -59,7 +59,7 @@ A **link** is a per-connection rule: *while anchor `A` is a connected subnet,
 treat prefixes `P1..Pn` as if they were local too.* For the example:
 
 ```
-wgd connection config home --link 10.66.77.0/24=192.168.188.1/32
+wgd connection config home --set-link 10.66.77.0/24=192.168.188.1/32
 ```
 
 The anchor is evaluated with exactly the rule the helper already uses for its
@@ -178,18 +178,25 @@ server-side config change into an outage.
 ### CLI
 
 ```
-wgd connection config <id> --link <anchor>=<prefix>[,<prefix>...]   # repeatable, replaces all links
+wgd connection config <id> --set-link <anchor>=<prefix>[,<prefix>...]   # repeatable, replaces all links
+wgd connection config <id> --add-link <anchor>=<prefix>[,<prefix>...]   # repeatable, adds to the links
 wgd connection config <id> --no-links
-wgd connection get <id>                                              # lists links and their validation state
+wgd connection get <id>                                                 # lists links and their validation state
 ```
 
-Replacing the full set on every `--link` call keeps the command idempotent
-and avoids index-based removal. Both the connection and the `--link` value
+Replacing the full set on every `--set-link` call keeps the command idempotent
+and avoids index-based removal. `--add-link` reads the stored links, folds the
+new ones in (prefixes for a known anchor join its link) and stores the result
+the same way, so it is idempotent too. Both the connection and the link value
 complete with <TAB> from the connection's AllowedIPs (anchor and prefixes, in
 bash, zsh and fish; bash needs wgd's own registration function, which joins
-the words bash cuts at `=` and `:`). Like `--dns-dynamic-store`, changes take effect
-at the next connect; `connection config` prints that hint when the connection
-is up.
+the words bash cuts at `=` and `:`). Like `--dns-dynamic-store`, a change to a
+connected connection is applied by reconnecting it (`ReconnectConnection`): the
+daemon disconnects and connects under one hold of the connection's lock, so the
+session agent cannot bring it back in between. That leaves no intent to stay
+down, and the helper keeps the debug flag it was started with. A connection
+that went down meanwhile stays down. With `--no-apply` the change
+waits for the next connect and `connection config` prints that hint.
 
 ### Helper input
 
@@ -283,7 +290,7 @@ store, API, CLI and spawn, one filter step, status lines.
 
 ### Phase 1b: dormant connection (`*` bypass)
 
-`--link 10.66.77.0/24=*` turns the VPN off while the anchor is connected,
+`--set-link 10.66.77.0/24=*` turns the VPN off while the anchor is connected,
 without disconnecting. The helper, `utun` and the WireGuard device keep
 running; only what the helper owns is withdrawn.
 
@@ -324,7 +331,7 @@ with `user_disconnected`, and 1b gives the same user-visible result.
 
 ### Phase 2: reachability check (optional per link)
 
-`--link 10.66.77.0/24=192.168.188.1/32@2`: bypass only if the host answers
+`--set-link 10.66.77.0/24=192.168.188.1/32@2`: bypass only if the host answers
 within 2 hops over the anchor's interface, bound to it so the probe cannot
 use the tunnel.
 
@@ -354,7 +361,7 @@ This turns "the anchor is up" into "the bypass actually works". Constraints:
 
 A second anchor type for networks with generic subnets such as
 `192.168.1.0/24`, where a plain subnet match could fire in a hotel:
-`--link dhcp-domain:pansen.lan=...` or `dhcp-server:10.66.77.1=...`.
+`--set-link dhcp-domain:pansen.lan=...` or `dhcp-server:10.66.77.1=...`.
 
 *Verified* readable without Location authorization on macOS 27.2,
 2026-10-29: `ipconfig getpacket en0` and
@@ -420,7 +427,7 @@ Phase 1 acceptance, each in both DNS modes:
 
 Phase 1b acceptance, each in both DNS modes:
 
-9. With `--link 10.66.77.0/24=*`, joining the home LAN removes every tunnel
+9. With `--set-link 10.66.77.0/24=*`, joining the home LAN removes every tunnel
    route and the tunnel DNS within one tick; `scutil --dns` shows no tunnel
    resolver; `wgd status` reports the connection as dormant; WgdBar shows it
    as dormant.

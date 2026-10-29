@@ -56,10 +56,11 @@ impl PeerOrigin {
 }
 
 /// Outcome of one dispatch call. `Pending` is used only by
-/// `ConnectConnection`/`DisconnectConnection`/`RefreshConnection`: the actual work runs on a
-/// spawned worker thread (see the design plan's concurrency correction) so a
-/// slow connect/disconnect on one connection cannot freeze the single-threaded
-/// accept loop that also has to keep serving every other client.
+/// `ConnectConnection`/`DisconnectConnection`/`ReconnectConnection`/
+/// `RefreshConnection`: the actual work runs on a spawned worker thread (see
+/// the design plan's concurrency correction) so a slow connect/disconnect on
+/// one connection cannot freeze the single-threaded accept loop that also has
+/// to keep serving every other client.
 pub(super) enum DispatchOutcome {
     Immediate(PrivilegedResponse),
     Pending(std::sync::mpsc::Receiver<PrivilegedResponse>),
@@ -196,6 +197,8 @@ pub(super) fn dispatch(
         PrivilegedRequest::DisconnectConnection { id, reason } => {
             handle_disconnect_connection(origin, id, reason)
         }
+
+        PrivilegedRequest::ReconnectConnection { id } => handle_reconnect_connection(origin, id),
 
         PrivilegedRequest::SetConnectionMode {
             id,
@@ -572,10 +575,12 @@ fn refresh_connection(
         return response;
     }
 
-    let was_active = match connection_store::is_active(id) {
-        Ok(active) => active,
+    // The debug flag of the running helper, so the reconnect keeps it.
+    let active_debug = match connection_store::active_debug(id) {
+        Ok(active_debug) => active_debug,
         Err(error) => return error_response(error),
     };
+    let was_active = active_debug.is_some();
     // Tear down with the old record still on disk: `disconnect` runs the old
     // config's PreDown/PostDown hooks from it.
     if was_active {
@@ -612,7 +617,9 @@ fn refresh_connection(
     // `connect` directly rather than through `resolve_connect_intent`: this
     // is not a new connect request, so `user_disconnected` stays as it was.
     if was_active {
-        if let Err(error) = super::connection_ops::connect(&conn_lock, id, false) {
+        if let Err(error) =
+            super::connection_ops::connect(&conn_lock, id, active_debug.unwrap_or(false))
+        {
             return PrivilegedResponse::Error {
                 code: "Other".into(),
                 message: format!(
@@ -794,6 +801,70 @@ fn handle_disconnect_connection(
         let _ = tx.send(response);
     });
     DispatchOutcome::Pending(rx)
+}
+
+/// `ReconnectConnection`: see the request's doc comment for the contract.
+/// Runs on a worker thread like `ConnectConnection`, since both halves can be
+/// slow.
+fn handle_reconnect_connection(origin: PeerOrigin, id: ConnectionId) -> DispatchOutcome {
+    let stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return DispatchOutcome::Immediate(not_found()),
+        Err(error) => return DispatchOutcome::Immediate(error_response(error)),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return DispatchOutcome::Immediate(response);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // See `handle_connect_connection` for why the test root is carried over.
+    #[cfg(test)]
+    let test_root = connection_store::current_test_root();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(root) = test_root {
+            connection_store::set_test_root(root);
+        }
+        let response = match connection_store::lock_connection_patient(id) {
+            Ok(conn_lock) => reconnect_connection(&conn_lock, id),
+            Err(error) => lock_error_response(error),
+        };
+        let _ = tx.send(response);
+    });
+    DispatchOutcome::Pending(rx)
+}
+
+/// Worker-thread body of `ReconnectConnection`. Whether the connection is up
+/// is read under the lock, so a disconnect that committed meanwhile makes this
+/// a no-op instead of starting a tunnel the user turned off. `connect` is
+/// called directly rather than through `resolve_connect_intent`:
+/// `user_disconnected` is not touched, and the helper keeps the debug flag it
+/// had.
+fn reconnect_connection(
+    conn_lock: &connection_store::ConnectionLock,
+    id: ConnectionId,
+) -> PrivilegedResponse {
+    let debug_enabled = match connection_store::active_debug(id) {
+        Ok(Some(debug_enabled)) => debug_enabled,
+        Ok(None) => return PrivilegedResponse::Bool(false),
+        Err(error) => return error_response(error),
+    };
+    if let Err(error) = super::connection_ops::disconnect(conn_lock, id) {
+        return PrivilegedResponse::Error {
+            code: "Other".into(),
+            message: format!(
+                "could not disconnect before reconnecting; the connection may still be up: {error}"
+            ),
+        };
+    }
+    if let Err(error) = super::connection_ops::connect(conn_lock, id, debug_enabled) {
+        return PrivilegedResponse::Error {
+            code: "Other".into(),
+            message: format!(
+                "disconnected, but connecting again failed (the connection is down): {error}"
+            ),
+        };
+    }
+    PrivilegedResponse::Bool(true)
 }
 
 /// Record `StoredConnection::user_disconnected` for an explicit
@@ -2037,6 +2108,7 @@ mod tests {
                     changed_sec: 0,
                     changed_nsec: 0,
                     connected_at: connection_store::now_unix(),
+                    debug: false,
                 },
             )
             .unwrap();
@@ -2110,6 +2182,106 @@ mod tests {
                     panic!("unauthorized disconnect must not spawn a worker")
                 }
             }
+        });
+    }
+
+    #[test]
+    fn reconnect_on_nonexistent_connection_is_not_found() {
+        with_test_store("reconnect-missing", || {
+            match handle_reconnect_connection(PeerOrigin::Socket(0), ConnectionId::new()) {
+                DispatchOutcome::Immediate(response) => {
+                    assert_eq!(error_code(&response), "NotFound")
+                }
+                DispatchOutcome::Pending(_) => {
+                    panic!("nonexistent connection must not spawn a worker")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reconnect_rejects_a_non_owner_before_spawning_a_worker() {
+        with_test_store("reconnect-ownership", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            match handle_reconnect_connection(PeerOrigin::Socket(502), id) {
+                DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
+                DispatchOutcome::Pending(_) => {
+                    panic!("unauthorized reconnect must not spawn a worker")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reconnect_of_an_inactive_connection_does_nothing() {
+        with_test_store("reconnect-inactive", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let DispatchOutcome::Pending(rx) =
+                handle_reconnect_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("authorized reconnect must spawn a worker");
+            };
+            let response = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("worker thread must eventually respond");
+            assert!(matches!(response, PrivilegedResponse::Bool(false)));
+            assert!(!connection_store::is_active(id).unwrap());
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn active_debug_reports_the_flag_of_a_running_helper_only() {
+        with_test_store("active-debug", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            assert_eq!(connection_store::active_debug(id).unwrap(), None);
+            let socket = std::env::temp_dir().join(format!(
+                "{}-{:016x}.sock",
+                id.interface_name(),
+                rand::random::<u64>()
+            ));
+            std::fs::write(&socket, b"").unwrap();
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            connection_store::save_active(
+                &conn_lock,
+                id,
+                &connection_store::ActiveConnectionState {
+                    fingerprint: "sha256:whatever".to_string(),
+                    interface: id.interface_name(),
+                    socket: socket.clone(),
+                    device: 0,
+                    inode: 0,
+                    changed_sec: 0,
+                    changed_nsec: 0,
+                    connected_at: connection_store::now_unix(),
+                    debug: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(connection_store::active_debug(id).unwrap(), Some(true));
+            let _ = std::fs::remove_file(&socket);
+            // The marker outlives the helper: a missing socket means not active.
+            assert_eq!(connection_store::active_debug(id).unwrap(), None);
         });
     }
 

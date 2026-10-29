@@ -371,6 +371,20 @@ impl PrivilegedClient {
         })
     }
 
+    /// Bring a connected connection down and up again in one daemon-side
+    /// step, keeping the debug flag it was started with, so changed settings
+    /// take effect. Returns `false`, having started nothing, when the
+    /// connection was not up. Like a teardown it records no intent to stay
+    /// down.
+    pub fn reconnect_connection(&self, id: ConnectionId) -> Result<bool> {
+        match self.send(PrivilegedRequest::ReconnectConnection { id })? {
+            PrivilegedResponse::Bool(reconnected) => Ok(reconnected),
+            _ => Err(AppError::Other(
+                "invalid privileged response for ReconnectConnection".into(),
+            )),
+        }
+    }
+
     /// Change a stored connection's start mode. Only transitions a global
     /// connection from `Manual` to `Automatic` require admin authentication
     /// (see the design plan); every other transition is ownership-gated.

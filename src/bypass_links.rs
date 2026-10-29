@@ -69,7 +69,7 @@ impl BypassLink {
         }
     }
 
-    /// `<anchor>=<prefix>[,<prefix>...]`, the syntax of `--link`.
+    /// `<anchor>=<prefix>[,<prefix>...]`, the syntax of `--set-link`.
     #[must_use]
     pub fn spec(&self) -> String {
         let prefixes: Vec<String> = self
@@ -203,7 +203,7 @@ pub struct HostBitsCleared {
     pub canonical: IpNet,
 }
 
-/// Parse one `--link` value. Returns the canonical link plus every CIDR whose
+/// Parse one `--set-link` or `--add-link` value. Returns the canonical link plus every CIDR whose
 /// host bits had to be cleared, so the caller can report them once.
 pub fn parse_link_spec(spec: &str) -> Result<(BypassLink, Vec<HostBitsCleared>), LinkError> {
     let syntax = || LinkError::Syntax {
@@ -406,6 +406,29 @@ impl std::fmt::Display for Removed {
     }
 }
 
+/// `stored` with `added` folded in, for `connection config --add-link`. The
+/// prefixes of an added link join the stored link with the same anchor, missing
+/// ones appended in order; a link for a new anchor goes at the end.
+#[must_use]
+pub fn merge_links(stored: &[BypassLink], added: &[BypassLink]) -> Vec<BypassLink> {
+    let mut merged: Vec<BypassLink> = stored.iter().map(canonical_link).collect();
+    for link in added.iter().map(canonical_link) {
+        match merged.iter_mut().find(|known| known.anchor == link.anchor) {
+            Some(known) => {
+                let mut prefixes = known.bypass.prefixes().to_vec();
+                for &prefix in link.bypass.prefixes() {
+                    if !prefixes.contains(&prefix) {
+                        prefixes.push(prefix);
+                    }
+                }
+                *known = BypassLink::new(known.anchor, prefixes);
+            }
+            None => merged.push(link),
+        }
+    }
+    merged
+}
+
 /// Result of [`prune_links`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pruned {
@@ -456,7 +479,8 @@ pub fn prune_links(links: &[BypassLink], allowed_ips: &[IpNet]) -> Pruned {
     pruned
 }
 
-/// Completion candidates for the value of `--link` (`<anchor>=<prefix>[,...]`)
+/// Completion candidates for the value of `--set-link` and `--add-link`
+/// (`<anchor>=<prefix>[,...]`)
 /// given the AllowedIPs of the connection it is for.
 ///
 /// Without `=` the candidates are the anchors, written with the `=` that comes
@@ -539,6 +563,22 @@ mod tests {
         "10.66.77.0/24",
         "192.168.188.1/32",
     ];
+
+    #[test]
+    fn merge_joins_prefixes_of_a_known_anchor_and_appends_new_anchors() {
+        let stored = [link("10.66.77.0/24", &["192.168.188.1/32"])];
+        let added = [
+            link("10.66.77.0/24", &["192.168.188.1/32", "100.64.1.0/24"]),
+            link("172.16.5.0/24", &["192.168.9.1/32"]),
+        ];
+        assert_eq!(
+            merge_links(&stored, &added),
+            vec![
+                link("10.66.77.0/24", &["192.168.188.1/32", "100.64.1.0/24"]),
+                link("172.16.5.0/24", &["192.168.9.1/32"]),
+            ]
+        );
+    }
 
     #[test]
     fn parses_the_cli_syntax() {

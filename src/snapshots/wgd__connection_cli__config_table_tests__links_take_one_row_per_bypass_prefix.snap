@@ -1,0 +1,12 @@
+---
+source: src/connection_cli.rs
+expression: "render(&table, &RenderCtx::plain())"
+---
+
+abc::home                           | State
+------------------------------------+-------------------------------------------------------
+dns-dynamic-store                   | on
+linked networks:                    |
+  10.66.77.0/24 -> 192.168.188.1/32 | ok
+                -> 192.168.189.1/32 | ok
+  10.0.0.0/8 -> 172.16.0.0/24       | ignored at connect: 172.16.0.0/24 is not in AllowedIPs

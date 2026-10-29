@@ -100,11 +100,12 @@ classDiagram
         +u64 device · inode
         +i64 changed_sec · changed_nsec
         +u64 connected_at
+        +bool debug
     }
     class PrivilegedRequest {
         <<enum>>
         AddConnection · RefreshConnection · RemoveConnection
-        ConnectConnection · DisconnectConnection
+        ConnectConnection · DisconnectConnection · ReconnectConnection
         SetConnectionMode · SetConnectionDnsDynamicStore
         ListConnections · GetConnection · ListDnsCustody
         LeaseAcquire · LeaseRelease · ShutdownIfIdle
@@ -238,7 +239,7 @@ flowchart TB
     REMOVE -->|"delete"| CONND
     MODE["SetConnectionMode /<br/>SetConnectionDnsDynamicStore"] --> LOCKD
     MODE --> CONND
-    CONNECT["ConnectConnection /<br/>DisconnectConnection"] --> LOCKD
+    CONNECT["ConnectConnection /<br/>DisconnectConnection /<br/>ReconnectConnection"] --> LOCKD
     CONNECT --> NETLK
     CONNECT --> ACTD
     SWEEP["DNS custody sweep"] --> NETLK
@@ -258,7 +259,13 @@ record. For a connection that is up: check duplicates, require admin
 authentication, disconnect with the old record (its `PreDown`/`PostDown`
 hooks live there), write the new record, release the index lock, reconnect.
 The reconnect calls `connect` directly, so `user_disconnected` stays as it
-was; if it fails, the error says the new record is already stored.
+was; if it fails, the error says the new record is already stored. The
+reconnect reuses the debug flag the running helper was started with, kept in
+the active-connection marker.
+
+`ReconnectConnection` (used by `connection config` to apply a changed setting)
+holds the per-id lock across a disconnect and a connect, with the same debug
+flag reuse. It does nothing and answers `false` when the connection is not up.
 
 ## Admin authentication
 

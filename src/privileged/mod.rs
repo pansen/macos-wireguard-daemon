@@ -473,6 +473,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::RemoveConnection { .. } => "RemoveConnection",
         PrivilegedRequest::ConnectConnection { .. } => "ConnectConnection",
         PrivilegedRequest::DisconnectConnection { .. } => "DisconnectConnection",
+        PrivilegedRequest::ReconnectConnection { .. } => "ReconnectConnection",
         PrivilegedRequest::SetConnectionMode { .. } => "SetConnectionMode",
         PrivilegedRequest::SetConnectionDnsDynamicStore { .. } => "SetConnectionDnsDynamicStore",
         PrivilegedRequest::SetConnectionBypassLinks { .. } => "SetConnectionBypassLinks",

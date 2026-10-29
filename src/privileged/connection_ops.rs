@@ -238,6 +238,7 @@ pub(super) fn connect(
             changed_sec: metadata.ctime(),
             changed_nsec: metadata.ctime_nsec(),
             connected_at: connection_store::now_unix(),
+            debug: debug_enabled,
         },
     )?;
     debug!(id = %id, interface = %stored.interface, "connection_connected");

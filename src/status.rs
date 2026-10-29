@@ -193,7 +193,7 @@ fn render_status_at(report: &StatusReport, now_unix: u64, ctx: &RenderCtx) -> St
             "No stored connections. Add one with: wgd connection add --file <path>"
         );
     } else {
-        connection_table(&report.connections).render(ctx, &mut out);
+        connection_table(&report.connections, false).render(ctx, &mut out);
         for detail in &report.details {
             if let Some(device) = &detail.wg {
                 let _ = writeln!(out);
@@ -225,17 +225,34 @@ fn render_status_at(report: &StatusReport, now_unix: u64, ctx: &RenderCtx) -> St
     out
 }
 
-fn connection_table(connections: &[ConnectionSummary]) -> Table {
-    let mut table = Table::new(&["Id", "Name", "Global", "Mode", "Connected", "Interface"]);
+/// One row per connection, shared by `wgd status` and `wgd connection list`.
+/// `owner` adds the owner's UID, which only tells connections apart when they
+/// can belong to other users (`connection list --all`).
+pub(crate) fn connection_table(connections: &[ConnectionSummary], owner: bool) -> Table {
+    let mut headers = vec!["Id", "Name", "Global"];
+    if owner {
+        headers.push("Owner");
+    }
+    headers.extend(["Mode", "Connected", "Interface"]);
+    let mut table = Table::new(&headers);
     for conn in connections {
-        table.row(vec![
+        let mut cells = vec![
             Span::plain(conn.id.to_string()),
             Span::plain(conn.name.clone().unwrap_or_else(|| "-".to_string())),
             Span::plain(conn.global.to_string()),
+        ];
+        if owner {
+            cells.push(Span::plain(
+                conn.owner_uid
+                    .map_or_else(|| "-".to_string(), |uid| uid.to_string()),
+            ));
+        }
+        cells.extend([
             Span::plain(format!("{:?}", conn.start_mode)),
             Span::plain(conn.connected.to_string()),
             Span::plain(conn.interface.as_str()),
         ]);
+        table.row(cells);
     }
     table
 }
@@ -310,6 +327,25 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn connection_table_shows_owner_only_on_request() {
+        let connections = [
+            sample_conn("home", false, Some(501)),
+            sample_conn("office", true, None),
+        ];
+        let render =
+            |owner| ui::render(&connection_table(&connections, owner), &RenderCtx::plain());
+
+        let without = render(false);
+        assert!(!without.contains("Owner"), "{without}");
+
+        let with = render(true);
+        let lines: Vec<&str> = with.lines().collect();
+        assert!(lines[1].contains("| Global | Owner | Mode"), "{with}");
+        assert!(lines[3].contains("| false  | 501   | Manual"), "{with}");
+        assert!(lines[4].contains("| true   | -     | Manual"), "{with}");
     }
 
     fn sample_device(interface: &str) -> WgDeviceStatus {

@@ -98,6 +98,11 @@ pub struct ActiveConnectionState {
     pub changed_sec: i64,
     pub changed_nsec: i64,
     pub connected_at: u64,
+    /// Whether the helper was started with debug logging, so a reconnect can
+    /// start its replacement the same way. `#[serde(default)]` for markers
+    /// written before it existed.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 #[must_use]
@@ -816,10 +821,15 @@ fn clear_active_in(root: &Path, id: ConnectionId) -> Result<()> {
 /// socket is gone: stale marker" branch `connection_ops::connect` already
 /// has for its own idempotency check.
 pub fn is_active(id: ConnectionId) -> Result<bool> {
-    match load_active(id)? {
-        Some(active) => Ok(active.socket.try_exists().unwrap_or(false)),
-        None => Ok(false),
-    }
+    Ok(active_debug(id)?.is_some())
+}
+
+/// The debug flag `id`'s helper was started with, or `None` when `id` is not
+/// genuinely connected (see [`is_active`]).
+pub fn active_debug(id: ConnectionId) -> Result<Option<bool>> {
+    Ok(load_active(id)?
+        .filter(|active| active.socket.try_exists().unwrap_or(false))
+        .map(|active| active.debug))
 }
 
 /// Directory of the helpers' UAPI sockets.
@@ -1343,6 +1353,7 @@ mod tests {
             changed_sec: 3,
             changed_nsec: 4,
             connected_at: now_unix(),
+            debug: false,
         };
         assert!(load_active_in(&root, id).unwrap().is_none());
         save_active_in(&root, id, &state).unwrap();
@@ -1475,6 +1486,7 @@ mod tests {
                 changed_sec: 0,
                 changed_nsec: 0,
                 connected_at: now_unix(),
+                debug: false,
             },
         )
         .unwrap();
@@ -1508,6 +1520,7 @@ mod tests {
                 changed_sec: 0,
                 changed_nsec: 0,
                 connected_at: now_unix(),
+                debug: false,
             },
         )
         .unwrap();

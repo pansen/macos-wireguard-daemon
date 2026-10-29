@@ -192,12 +192,15 @@ that while the Mac is attached to an anchor network, some prefixes should stay
 off the tunnel too:
 
 ```bash
-wgd connection config <id-or-name>                                       # show the settings
-wgd connection config <id-or-name> --link 10.66.77.0/24=192.168.188.1/32 # anchor=prefix[,prefix...]
+wgd connection config <id-or-name>                                           # show the settings
+wgd connection config <id-or-name> --set-link 10.66.77.0/24=192.168.188.1/32 # anchor=prefix[,prefix...]
+wgd connection config <id-or-name> --add-link 10.66.77.0/24=100.64.1.0/24
 wgd connection config <id-or-name> --no-links
 ```
 
-`--link` can be repeated and replaces all earlier links. Every network in a
+`--set-link` can be repeated and replaces all earlier links. `--add-link`
+adds to them instead; prefixes for an anchor that already has a link join that
+link. Every network in a
 link must exist in the connection's AllowedIPs as it stands, and a mistake is
 rejected with a message that says which. The anchor must be an AllowedIPs
 entry, which makes it the LAN the exclusion already keeps off the tunnel.
@@ -211,7 +214,8 @@ contains it. A bypass prefix takes every route inside it along: with
 tunnel too. Links are stored with the connection, not in the `.conf`, and
 `refresh` keeps them.
 
-A change applies at the next connect. When `refresh` or `add --force` brings
+A connected connection is reconnected so a change applies at once; with
+`--no-apply` it applies at the next connect. When `refresh` or `add --force` brings
 new AllowedIPs, the links are pruned to match: prefixes that are no longer
 valid are dropped, and a link goes when its anchor is gone or no prefix is
 left. The command lists what it removed. As a safety net, a link that still
@@ -225,7 +229,7 @@ failed, the row says so instead. Details and
 limits: [doc/lan-bypass-links.md](doc/lan-bypass-links.md).
 
 With shell completion installed, <TAB> completes the connection and then the
-`--link` value from that connection's AllowedIPs: first the anchor (written
+`--set-link` or `--add-link` value from that connection's AllowedIPs: first the anchor (written
 with its `=`), then the prefixes, which are offered only while they would
 validate and not twice, and further prefixes after a `,`. This works in bash
 (3.2 and current), zsh and fish. bash cuts words at `=` and `:`, so wgd
@@ -264,7 +268,8 @@ wgd connection config --no-dns-dynamic-store <id-or-name>   # back to networkset
 
 `wgd` then adds its own resolver and never changes your network services'
 DNS. The resolver lives only as long as the tunnel's helper, so a crash or a
-reboot leaves nothing to repair. The change applies at the next connect. The
+reboot leaves nothing to repair. A connected connection is reconnected to
+apply the change, unless `--no-apply` leaves that to the next connect. The
 mode is new and so far tested on macOS 27.2 only; queries an app binds to one
 interface bypass it, which matters for full tunnels. Details and open
 questions: [doc/dns-dynamic-store.md](doc/dns-dynamic-store.md).

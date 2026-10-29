@@ -343,6 +343,18 @@ pub enum PrivilegedRequest {
         reason: DisconnectReason,
     },
 
+    /// Bring a connection that is up down and up again so changed settings
+    /// (`SetConnectionDnsDynamicStore`, `SetConnectionBypassLinks`) take
+    /// effect. Disconnect and connect run under one hold of the connection's
+    /// lock, so reconciliation cannot bring it back up in between. The helper
+    /// is restarted with the debug flag it was started with. Answers
+    /// `Bool(true)` when it was reconnected and `Bool(false)` when the
+    /// connection was not up, in which case nothing is started. Not a new
+    /// connect request: `user_disconnected` is left as it was.
+    ReconnectConnection {
+        id: ConnectionId,
+    },
+
     SetConnectionMode {
         id: ConnectionId,
         start_mode: ConnectionStartMode,
@@ -544,6 +556,7 @@ impl PrivilegedRequest {
             Self::RemoveConnection { .. } => Ok(()),
             Self::ConnectConnection { .. } => Ok(()),
             Self::DisconnectConnection { .. } => Ok(()),
+            Self::ReconnectConnection { .. } => Ok(()),
             Self::SetConnectionMode { .. } => Ok(()),
             Self::SetConnectionDnsDynamicStore { .. } => Ok(()),
             Self::SetConnectionBypassLinks { .. } => Ok(()),
