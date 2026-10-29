@@ -60,7 +60,7 @@ anyhow = "1"
 # features -- cargo unifies both onto the single resolved x25519-dalek crate.
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 zeroize = { version = "1", features = ["derive"] }
 x25519-dalek = { version = "2.0.1", features = ["zeroize", "static_secrets"] }
 

@@ -341,6 +341,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
 #[cfg(unix)]
 async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
     let parsed_config = parse_config_from_env()?;
+    let bypass_links = bypass_links_from_env()?;
     let tun_name = helper_tun_name(interface);
     let tun = TunDevice::from_name(&tun_name)
         .map_err(|e| anyhow::anyhow!("failed to create TUN device {}: {}", interface, e))?;
@@ -387,7 +388,14 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
         let custody = connection_id
             .filter(|_| dns_mode == crate::dns_dynamic_store::StoreKeyMode::Shadow)
             .and_then(|id| custody_identity(interface, id));
-        match configure_network(&interface_name, config, connection_id, custody, dns_mode) {
+        match configure_network(
+            &interface_name,
+            config,
+            connection_id,
+            custody,
+            dns_mode,
+            bypass_links,
+        ) {
             Ok(cleanup) => cleanup,
             Err(e) => {
                 device.stop().await;
@@ -541,6 +549,26 @@ fn connection_id_from_env() -> Option<crate::privileged_api::ConnectionId> {
     }
 }
 
+/// The validated bypass links the daemon passed in (`doc/lan-bypass-links.md`).
+/// Unset means none. The daemon wrote the value, so one that does not parse is
+/// a bug, not user input: fail the start instead of silently routing without
+/// the links.
+#[cfg(unix)]
+fn bypass_links_from_env() -> anyhow::Result<Vec<crate::bypass_links::BypassLink>> {
+    let Some(raw) = std::env::var_os(crate::bypass_links::ENV) else {
+        return Ok(Vec::new());
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", crate::bypass_links::ENV))?;
+    let links = crate::bypass_links::from_env_value(&raw)
+        .with_context(|| format!("failed to parse {}", crate::bypass_links::ENV))?;
+    if !links.is_empty() {
+        info!(links = links.len(), "userspace_helper_bypass_links_loaded");
+    }
+    Ok(links)
+}
+
 /// Active when the connection is opted in (`StoredConnection::dns_dynamic_store`,
 /// passed by the daemon as `ACTIVE_ENV`). The key is derived from the
 /// connection id, so without one the helper stays on `networksetup`.
@@ -590,8 +618,16 @@ fn configure_network(
     connection_id: Option<crate::privileged_api::ConnectionId>,
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
     dns_mode: crate::dns_dynamic_store::StoreKeyMode,
+    bypass_links: Vec<crate::bypass_links::BypassLink>,
 ) -> anyhow::Result<CleanupState> {
-    let cleanup = configure_network_macos(interface, config, connection_id, custody, dns_mode)?;
+    let cleanup = configure_network_macos(
+        interface,
+        config,
+        connection_id,
+        custody,
+        dns_mode,
+        bypass_links,
+    )?;
     Ok(CleanupState::Macos(std::sync::Arc::new(cleanup)))
 }
 

@@ -1,3 +1,4 @@
+mod bypass_links;
 mod cli;
 mod completion;
 mod config;
@@ -42,7 +43,9 @@ fn main() {
     // <TAB> keystroke can never fall through into daemon-spawning or
     // privileged code paths. The command tree is introspected fresh from
     // `Cli` on every request, so completions track `--help` automatically.
-    clap_complete::CompleteEnv::with_factory(cli::Cli::command).complete();
+    clap_complete::CompleteEnv::with_factory(cli::Cli::command)
+        .shells(completion::shells())
+        .complete();
 
     let cli = Cli::parse();
     if cli.verbose || defaults_to_debug(&cli.command) {

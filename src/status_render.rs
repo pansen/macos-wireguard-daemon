@@ -272,12 +272,15 @@ fn route_in_effect(outcome: &RouteOutcome) -> bool {
         | RouteOutcome::Owned
         | RouteOutcome::OwnedAbsentFromKernel
         | RouteOutcome::OwnedKernelDisagrees
+        | RouteOutcome::LinkedStillTunneled { .. }
         | RouteOutcome::NoLongerDesired => true,
         RouteOutcome::EndpointPinMissing
         | RouteOutcome::ExcludedLocalSubnet { .. }
+        | RouteOutcome::ExcludedLinked { .. }
         | RouteOutcome::Blocked { .. }
         | RouteOutcome::ReconcilePending
         | RouteOutcome::NoAddressForFamily => false,
+        RouteOutcome::RemovalFailed { .. } => true,
     }
 }
 
@@ -292,6 +295,26 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
         RouteOutcome::ExcludedLocalSubnet { subnet } => {
             format!("excluded: we are inside {subnet}, kept off the tunnel")
         }
+        RouteOutcome::ExcludedLinked {
+            anchor,
+            device,
+            egress,
+        } => {
+            let mut text = match device {
+                Some(device) => format!("excluded: link {anchor} on {device}, kept off the tunnel"),
+                None => format!("excluded: link {anchor}, kept off the tunnel"),
+            };
+            if let Some(egress) = egress {
+                text.push_str(&format!(
+                    " (warning: traffic leaves via {egress}, not {})",
+                    device.as_deref().unwrap_or("the anchor interface")
+                ));
+            }
+            text
+        }
+        RouteOutcome::LinkedStillTunneled { anchor } => format!(
+            "link {anchor} active, but still routed through the tunnel (removal pending or failed)"
+        ),
         RouteOutcome::Owned => "owned".to_string(),
         RouteOutcome::OwnedAbsentFromKernel => {
             "owned, but absent from the kernel table (drift)".to_string()
@@ -311,6 +334,9 @@ fn outcome_text(outcome: &RouteOutcome, family: IpFamily) -> String {
             )
         }
         RouteOutcome::NoLongerDesired => "owned: no longer desired, cleanup pending".to_string(),
+        RouteOutcome::RemovalFailed { error } => {
+            format!("route removal failed; retry pending: {error}")
+        }
     }
 }
 
@@ -1111,6 +1137,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_route_removal_is_visible_and_not_muted() {
+        let mut ov = o1();
+        ov.routes = vec![route(
+            "10.66.77.0/24",
+            interface_via("utun6"),
+            IpFamily::Ipv4,
+            present(Some("utun6"), None, Some(1384)),
+            RouteOutcome::RemovalFailed {
+                error: "temporarily unavailable".into(),
+            },
+        )];
+        let text = render_network_overview(&ov, &RenderCtx::ansi());
+        let row = text
+            .lines()
+            .find(|line| line.contains("10.66.77.0/24"))
+            .unwrap();
+        assert!(row.contains("route removal failed; retry pending: temporarily unavailable"));
+        assert!(!row.contains("\u{1b}[2m"));
+        let json = serde_json::to_string(&ov).unwrap();
+        let decoded: NetworkOverview = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ov);
+    }
+
+    #[test]
     fn direct_route_names_the_device_when_known() {
         let mut ov = o1();
         ov.routes = vec![route(
@@ -1125,6 +1175,97 @@ mod tests {
             },
         )];
         assert!(render_network_overview(&ov, &PLAIN).contains("direct (en0) | "));
+    }
+
+    #[test]
+    fn linked_route_names_the_anchor_and_warns_about_a_foreign_egress() {
+        let render = |device: Option<&str>, egress: Option<&str>| {
+            let mut ov = o1();
+            ov.routes = vec![route(
+                "192.168.188.1/32",
+                RouteVia::Direct {
+                    device: device.map(str::to_string),
+                },
+                IpFamily::Ipv4,
+                LiveRoute::Absent,
+                RouteOutcome::ExcludedLinked {
+                    anchor: "10.66.77.0/24".to_string(),
+                    device: device.map(str::to_string),
+                    egress: egress.map(str::to_string),
+                },
+            )];
+            render_network_overview(&ov, &PLAIN)
+        };
+        assert!(render(Some("en0"), None)
+            .contains("excluded: link 10.66.77.0/24 on en0, kept off the tunnel"));
+        assert!(render(None, None).contains("excluded: link 10.66.77.0/24, kept off the tunnel"));
+        assert!(
+            render(Some("en0"), Some("en1")).contains("(warning: traffic leaves via en1, not en0)")
+        );
+    }
+
+    #[test]
+    fn link_still_routed_through_the_tunnel_is_not_called_excluded_and_not_muted() {
+        let mut ov = o1();
+        ov.routes = vec![
+            route(
+                "192.168.188.1/32",
+                interface_via("utun6"),
+                IpFamily::Ipv4,
+                present(Some("utun6"), None, Some(1384)),
+                RouteOutcome::LinkedStillTunneled {
+                    anchor: "10.66.77.0/24".to_string(),
+                },
+            ),
+            route(
+                "192.168.188.9/32",
+                RouteVia::Direct {
+                    device: Some("en0".to_string()),
+                },
+                IpFamily::Ipv4,
+                LiveRoute::Absent,
+                RouteOutcome::ExcludedLinked {
+                    anchor: "10.66.77.0/24".to_string(),
+                    device: Some("en0".to_string()),
+                    egress: None,
+                },
+            ),
+        ];
+        let plain = render_network_overview(&ov, &PLAIN);
+        let pending = plain
+            .lines()
+            .find(|line| line.starts_with("192.168.188.1/32"))
+            .unwrap();
+        assert!(pending.contains(
+            "link 10.66.77.0/24 active, but still routed through the tunnel (removal pending or failed)"
+        ));
+        assert!(!pending.contains("kept off the tunnel"), "{pending}");
+
+        // The tunnel holds the route, so the row is not muted like the
+        // excluded one next to it.
+        let ansi = render_network_overview(&ov, &RenderCtx::ansi());
+        let muted = |prefix: &str| {
+            ansi.lines()
+                .find(|line| line.contains(prefix))
+                .unwrap()
+                .contains("\u{1b}[2m")
+        };
+        assert!(!muted("192.168.188.1/32"));
+        assert!(muted("192.168.188.9/32"));
+    }
+
+    #[test]
+    fn linked_outcome_without_optional_fields_deserializes() {
+        let outcome: RouteOutcome =
+            serde_json::from_str(r#"{"kind":"excluded_linked","anchor":"10.66.77.0/24"}"#).unwrap();
+        assert_eq!(
+            outcome,
+            RouteOutcome::ExcludedLinked {
+                anchor: "10.66.77.0/24".to_string(),
+                device: None,
+                egress: None,
+            }
+        );
     }
 
     #[test]

@@ -585,6 +585,7 @@ mod tests {
             fingerprint: None,
             source_path: None,
             dns_dynamic_store: false,
+            bypass_links: Vec::new(),
             created_at: 0,
             updated_at: 0,
         }

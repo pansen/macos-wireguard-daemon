@@ -3,6 +3,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bypass_links::BypassLink;
 use crate::status_model::{NetworkOverview, WgDeviceStatus};
 
 /// Opaque, randomly generated identity for a stored connection (see
@@ -205,8 +206,23 @@ pub struct ConnectionSummary {
     /// responses from a daemon that predates it, like `user_disconnected`.
     #[serde(default)]
     pub dns_dynamic_store: bool,
+    /// See `StoredConnection::bypass_links`, each with its state against the
+    /// current AllowedIPs. `#[serde(default)]` for responses from a daemon
+    /// that predates it.
+    #[serde(default)]
+    pub bypass_links: Vec<BypassLinkSummary>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+/// A stored bypass link and whether it still validates against the
+/// connection's current AllowedIPs. An invalid link is ignored at connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BypassLinkSummary {
+    pub link: BypassLink,
+    /// Why the link is ignored; `None` when it is valid.
+    #[serde(default)]
+    pub invalid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +343,18 @@ pub enum PrivilegedRequest {
         reason: DisconnectReason,
     },
 
+    /// Bring a connection that is up down and up again so changed settings
+    /// (`SetConnectionDnsDynamicStore`, `SetConnectionBypassLinks`) take
+    /// effect. Disconnect and connect run under one hold of the connection's
+    /// lock, so reconciliation cannot bring it back up in between. The helper
+    /// is restarted with the debug flag it was started with. Answers
+    /// `Bool(true)` when it was reconnected and `Bool(false)` when the
+    /// connection was not up, in which case nothing is started. Not a new
+    /// connect request: `user_disconnected` is left as it was.
+    ReconnectConnection {
+        id: ConnectionId,
+    },
+
     SetConnectionMode {
         id: ConnectionId,
         start_mode: ConnectionStartMode,
@@ -339,6 +367,14 @@ pub enum PrivilegedRequest {
     SetConnectionDnsDynamicStore {
         id: ConnectionId,
         enabled: bool,
+    },
+
+    /// Replace a connection's LAN bypass links (`doc/lan-bypass-links.md`);
+    /// an empty list clears them. Validated against the connection's
+    /// AllowedIPs. Applies at the next connect.
+    SetConnectionBypassLinks {
+        id: ConnectionId,
+        links: Vec<BypassLink>,
     },
 
     ListConnections {
@@ -373,12 +409,17 @@ pub enum PrivilegedResponse {
 }
 
 /// Result of a `RefreshConnection` call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshOutcome {
     /// The configuration's fingerprint differed and the record was replaced.
     pub changed: bool,
     /// The connection was up and was brought back up on the new config.
     pub reconnected: bool,
+    /// Bypass links, or prefixes of them, the new AllowedIPs no longer
+    /// support and the refresh therefore dropped, one line each.
+    /// `#[serde(default)]` for responses from a daemon that predates it.
+    #[serde(default)]
+    pub links_removed: Vec<String>,
 }
 
 /// A custody record for `wgd status`. Records whose helper is live are normal
@@ -515,8 +556,10 @@ impl PrivilegedRequest {
             Self::RemoveConnection { .. } => Ok(()),
             Self::ConnectConnection { .. } => Ok(()),
             Self::DisconnectConnection { .. } => Ok(()),
+            Self::ReconnectConnection { .. } => Ok(()),
             Self::SetConnectionMode { .. } => Ok(()),
             Self::SetConnectionDnsDynamicStore { .. } => Ok(()),
+            Self::SetConnectionBypassLinks { .. } => Ok(()),
             Self::ListConnections { .. } => Ok(()),
             Self::GetConnection { .. } => Ok(()),
             Self::ListDnsCustody => Ok(()),

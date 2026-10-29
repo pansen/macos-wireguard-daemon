@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
+use crate::bypass_links::BypassLink;
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
@@ -370,6 +371,20 @@ impl PrivilegedClient {
         })
     }
 
+    /// Bring a connected connection down and up again in one daemon-side
+    /// step, keeping the debug flag it was started with, so changed settings
+    /// take effect. Returns `false`, having started nothing, when the
+    /// connection was not up. Like a teardown it records no intent to stay
+    /// down.
+    pub fn reconnect_connection(&self, id: ConnectionId) -> Result<bool> {
+        match self.send(PrivilegedRequest::ReconnectConnection { id })? {
+            PrivilegedResponse::Bool(reconnected) => Ok(reconnected),
+            _ => Err(AppError::Other(
+                "invalid privileged response for ReconnectConnection".into(),
+            )),
+        }
+    }
+
     /// Change a stored connection's start mode. Only transitions a global
     /// connection from `Manual` to `Automatic` require admin authentication
     /// (see the design plan); every other transition is ownership-gated.
@@ -388,6 +403,17 @@ impl PrivilegedClient {
 
     pub fn set_connection_dns_dynamic_store(&self, id: ConnectionId, enabled: bool) -> Result<()> {
         self.send(PrivilegedRequest::SetConnectionDnsDynamicStore { id, enabled })
+            .map(|_| ())
+    }
+
+    /// Replace the connection's LAN bypass links; an empty list clears them.
+    /// The daemon validates them against the connection's AllowedIPs.
+    pub fn set_connection_bypass_links(
+        &self,
+        id: ConnectionId,
+        links: Vec<BypassLink>,
+    ) -> Result<()> {
+        self.send(PrivilegedRequest::SetConnectionBypassLinks { id, links })
             .map(|_| ())
     }
 

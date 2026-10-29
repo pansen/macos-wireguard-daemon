@@ -100,11 +100,12 @@ classDiagram
         +u64 device · inode
         +i64 changed_sec · changed_nsec
         +u64 connected_at
+        +bool debug
     }
     class PrivilegedRequest {
         <<enum>>
         AddConnection · RefreshConnection · RemoveConnection
-        ConnectConnection · DisconnectConnection
+        ConnectConnection · DisconnectConnection · ReconnectConnection
         SetConnectionMode · SetConnectionDnsDynamicStore
         ListConnections · GetConnection · ListDnsCustody
         LeaseAcquire · LeaseRelease · ShutdownIfIdle
@@ -238,7 +239,7 @@ flowchart TB
     REMOVE -->|"delete"| CONND
     MODE["SetConnectionMode /<br/>SetConnectionDnsDynamicStore"] --> LOCKD
     MODE --> CONND
-    CONNECT["ConnectConnection /<br/>DisconnectConnection"] --> LOCKD
+    CONNECT["ConnectConnection /<br/>DisconnectConnection /<br/>ReconnectConnection"] --> LOCKD
     CONNECT --> NETLK
     CONNECT --> ACTD
     SWEEP["DNS custody sweep"] --> NETLK
@@ -258,7 +259,13 @@ record. For a connection that is up: check duplicates, require admin
 authentication, disconnect with the old record (its `PreDown`/`PostDown`
 hooks live there), write the new record, release the index lock, reconnect.
 The reconnect calls `connect` directly, so `user_disconnected` stays as it
-was; if it fails, the error says the new record is already stored.
+was; if it fails, the error says the new record is already stored. The
+reconnect reuses the debug flag the running helper was started with, kept in
+the active-connection marker.
+
+`ReconnectConnection` (used by `connection config` to apply a changed setting)
+holds the per-id lock across a disconnect and a connect, with the same debug
+flag reuse. It does nothing and answers `false` when the connection is not up.
 
 ## Admin authentication
 
@@ -420,6 +427,7 @@ classDiagram
         +endpoint, allowed_ips, dns_servers
         +Option~DnsCustodyIdentity~ custody
         +StoreKeyMode dns_mode
+        +Vec~BypassLink~ bypass_links
     }
     MacosCleanupState *-- MacosRoutingState
     MacosCleanupState *-- MacosDnsState
@@ -434,6 +442,19 @@ roaming into a subnet the tunnel also routes: `add_macos_route` clears a
 stale entry only when a tunnel device owns it, and
 `macos_restore_shadowed_lan_route` re-adds the connected route whenever
 removing a tunnel route leaves a local subnet uncovered.
+
+**Bypass links:** a per-connection `BypassLink { anchor, bypass }`
+(`doc/lan-bypass-links.md`) takes more routes off the tunnel while the anchor
+is attached. The daemon validates the stored links against the current
+AllowedIPs at connect and hands the valid ones to the helper as JSON in
+`WGD_BYPASS_LINKS`. After the connected-subnet filter, `macos_desired_routes`
+also drops a route whose normalised destination equals a prefix of an active
+link, where a link is active when some connected subnet contains its anchor
+(`macos_route_excluded_by_link`). The decision depends only on `local_subnets`
+and the static links, so the route fingerprint needs no new field, and the
+initial connect and the 3 s tick behave the same. Linked prefixes never join
+`local_subnets`, because `macos_restore_shadowed_lan_route` would re-add them
+as connected routes.
 
 **DNS, `networksetup` path:** `dns_decision` yields `Apply(targets)`,
 `RestoreAll` (a tunnel DNS server is inside a connected LAN) or `Hold` (no

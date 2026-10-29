@@ -57,6 +57,24 @@ struct MacosRoutingState {
     routes_added: Vec<MacosRoute>,
     /// Last observed network environment. A change drives reconciliation.
     fingerprint: MacosNetworkFingerprint,
+    /// Route operations the last reconcile pass could not complete. Any entry
+    /// makes the next tick reconcile again even if the network did not change;
+    /// an error-free pass empties it.
+    failing: Vec<MacosRouteFailure>,
+}
+
+/// A route operation the reconciler failed at and will try again.
+#[derive(Debug, Clone, PartialEq)]
+struct MacosRouteFailure {
+    route: MacosRoute,
+    operation: MacosRouteOperation,
+    error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosRouteOperation {
+    Add,
+    Delete,
 }
 
 /// DNS state the reconciler keeps in sync with the active LAN.
@@ -90,6 +108,10 @@ pub(super) struct MacosReconcileInputs {
     /// `networksetup` path (capture, custody, reconcile) is skipped.
     /// `Shadow`: `networksetup` as always, plus an inert probe key.
     dns_mode: crate::dns_dynamic_store::StoreKeyMode,
+    /// Validated by the daemon (`doc/lan-bypass-links.md`); static for the
+    /// life of the helper. Whether a link is active follows from the
+    /// fingerprint's `local_subnets`, so the fingerprint needs no field.
+    bypass_links: Vec<crate::bypass_links::BypassLink>,
 }
 
 /// A snapshot of the host network environment relevant to tunnel routing.
@@ -284,6 +306,7 @@ pub(super) fn configure_network_macos(
     connection_id: Option<crate::privileged_api::ConnectionId>,
     custody: Option<crate::dns_custody::DnsCustodyIdentity>,
     dns_mode: crate::dns_dynamic_store::StoreKeyMode,
+    bypass_links: Vec<crate::bypass_links::BypassLink>,
 ) -> anyhow::Result<MacosCleanupState> {
     let has_ipv4_address = config
         .addresses
@@ -310,6 +333,7 @@ pub(super) fn configure_network_macos(
         has_ipv6_address,
         custody,
         dns_mode,
+        bypass_links,
     };
     log_macos_network_diagnostics("before_connect", &inputs);
 
@@ -426,6 +450,9 @@ pub(super) fn configure_network_macos(
         routing: std::sync::Mutex::new(MacosRoutingState {
             routes_added,
             fingerprint,
+            // Setup treats a route error as fatal and rolls back, so nothing
+            // is pending when the tunnel comes up.
+            failing: Vec::new(),
         }),
         dns: std::sync::Mutex::new(MacosDnsState {
             services: dns_services,

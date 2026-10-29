@@ -177,8 +177,76 @@ connections.
 - Continuously reconciles **routes** against the live network: tunnel routes
   that would hijack the currently active LAN are dropped, so a split tunnel
   behaves correctly whether you are at home, in the office, or tethered.
+  [LAN bypass links](#lan-bypass-links) extend that to hosts behind a NAT in
+  your LAN.
 - Reconciles **DNS** as well as it can, so lookups for your internal names
   keep resolving through the tunnel as the network underneath changes.
+
+### LAN bypass links
+
+The LAN exclusion only knows the subnets your Mac is attached to. A host one
+NAT layer further out, such as the upstream router at `192.168.188.1` behind
+your gateway `10.66.77.1`, is not attached, so its AllowedIPs route stays on
+the tunnel and the traffic leaves the house and comes back. A link tells `wgd`
+that while the Mac is attached to an anchor network, some prefixes should stay
+off the tunnel too:
+
+```bash
+wgd connection config <id-or-name>                                           # show the settings
+wgd connection config <id-or-name> --set-link 10.66.77.0/24=192.168.188.1/32 # anchor=prefix[,prefix...]
+wgd connection config <id-or-name> --add-link 10.66.77.0/24=100.64.1.0/24
+wgd connection config <id-or-name> --no-links
+```
+
+`--set-link` can be repeated and replaces all earlier links. `--add-link`
+adds to them instead; prefixes for an anchor that already has a link join that
+link. Every network in a
+link must exist in the connection's AllowedIPs as it stands, and a mistake is
+rejected with a message that says which. The anchor must be an AllowedIPs
+entry, which makes it the LAN the exclusion already keeps off the tunnel.
+`wgd` only removes routes the tunnel owns, so a bypass prefix that is not
+listed, one inside a broader entry such as `192.168.0.0/16`, and any prefix
+under a `0.0.0.0/0` or `::/0` entry are rejected as well. Host bits are
+cleared (`10.66.77.5/24` becomes `10.66.77.0/24`). The anchor is matched like
+the LAN exclusion itself: it is active while one of your attached subnets
+contains it. A bypass prefix takes every route inside it along: with
+`192.168.188.0/24` bypassed, a separate `192.168.188.7/32` entry leaves the
+tunnel too. Links are stored with the connection, not in the `.conf`, and
+`refresh` keeps them.
+
+A connected connection is reconnected so a change applies at once; with
+`--no-apply` it applies at the next connect. When `refresh` or `add --force` brings
+new AllowedIPs, the links are pruned to match: prefixes that are no longer
+valid are dropped, and a link goes when its anchor is gone or no prefix is
+left. The command lists what it removed. As a safety net, a link that still
+fails to validate at connect is ignored, and `wgd connection get` and the log
+(`connection_bypass_link_invalid`) say why. `wgd status` marks a bypassed
+route as `excluded: link 10.66.77.0/24 on en0, kept off the tunnel` and warns
+if the kernel sends it out through another interface than the anchor's, which
+can happen with Ethernet and Wi-Fi up on different networks. If the kernel
+still routes it through the tunnel because removing the route is pending or
+failed, the row says so instead. Details and
+limits: [doc/lan-bypass-links.md](doc/lan-bypass-links.md).
+
+With shell completion installed, <TAB> completes the connection and then the
+`--set-link` or `--add-link` value from that connection's AllowedIPs: first the anchor (written
+with its `=`), then the prefixes, which are offered only while they would
+validate and not twice, and further prefixes after a `,`. This works in bash
+(3.2 and current), zsh and fish. bash cuts words at `=` and `:`, so wgd
+registers its own bash completion function (`COMPLETE=bash wgd` prints it,
+which is what the block from `wgd completion install` evaluates) that joins those pieces before asking wgd and
+trims the candidates to the part bash replaces. It reads `COMP_WORDBREAKS` and
+never changes it, and it does not need the bash-completion package. Shells
+that sourced an earlier registration need a new shell, or a new `eval`, to get
+it. The candidates come from the daemon; if it does not answer quickly,
+nothing is offered. bash lists a second prefix together with the ones before
+it (`192.168.188.1/32,100.64.1.0/24`) because it replaces only the text after
+the `=`.
+
+A link trusts the anchor network by its subnet alone. Another network that
+uses the same subnet, such as a hotel on `192.168.1.0/24`, activates it, and
+the bypassed traffic then goes unencrypted into that network. Do not use links
+for prefixes whose traffic must never leave the tunnel.
 
 ### DNS
 
@@ -200,7 +268,8 @@ wgd connection config --no-dns-dynamic-store <id-or-name>   # back to networkset
 
 `wgd` then adds its own resolver and never changes your network services'
 DNS. The resolver lives only as long as the tunnel's helper, so a crash or a
-reboot leaves nothing to repair. The change applies at the next connect. The
+reboot leaves nothing to repair. A connected connection is reconnected to
+apply the change, unless `--no-apply` leaves that to the next connect. The
 mode is new and so far tested on macOS 27.2 only; queries an app binds to one
 interface bypass it, which matters for full tunnels. Details and open
 questions: [doc/dns-dynamic-store.md](doc/dns-dynamic-store.md).

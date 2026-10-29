@@ -1,0 +1,9 @@
+---
+source: src/connection_cli.rs
+expression: "render(&table, &RenderCtx::plain())"
+---
+
+abc::home         | State
+------------------+------
+dns-dynamic-store | off
+linked networks   | none

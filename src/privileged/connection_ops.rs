@@ -113,6 +113,22 @@ pub(super) fn connect(
         )));
     }
 
+    // Links are checked against the AllowedIPs as they are now. A link that
+    // no longer validates (the server side changed the config, then `connection
+    // refresh`) is dropped; failing the connect would turn that into an outage.
+    let bypass_links = {
+        let report = stored.bypass_link_report();
+        for (link, error) in &report.invalid {
+            warn!(
+                id = %id,
+                link = %link.spec(),
+                reason = %error,
+                "connection_bypass_link_invalid"
+            );
+        }
+        report.valid
+    };
+
     let socket = socket_path(&stored.interface);
 
     // A helper that died without teardown (SIGKILL, panic) leaves its socket
@@ -185,6 +201,7 @@ pub(super) fn connect(
             &stored.raw_conf,
             None,
             stored.dns_dynamic_store,
+            &bypass_links,
             debug_enabled,
         );
         // Success or not: watch the helper's record if it wrote one, and drop
@@ -221,6 +238,7 @@ pub(super) fn connect(
             changed_sec: metadata.ctime(),
             changed_nsec: metadata.ctime_nsec(),
             connected_at: connection_store::now_unix(),
+            debug: debug_enabled,
         },
     )?;
     debug!(id = %id, interface = %stored.interface, "connection_connected");

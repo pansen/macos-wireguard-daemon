@@ -297,7 +297,10 @@ impl Table {
         let mut line = " ".repeat(self.indent);
         let last = cells.len().saturating_sub(1);
         for (index, (text, width)) in cells.iter().enumerate() {
-            if index > 0 {
+            if index > 0 && index == last && text.is_empty() {
+                // An empty last cell leaves no trailing blank.
+                line.push_str(COLUMN_SEPARATOR.trim_end());
+            } else if index > 0 {
                 line.push_str(COLUMN_SEPARATOR);
             }
             line.push_str(text);

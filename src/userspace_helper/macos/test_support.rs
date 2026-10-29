@@ -21,6 +21,7 @@ pub(super) fn split_inputs() -> MacosReconcileInputs {
         has_ipv6_address: false,
         custody: None,
         dns_mode: crate::dns_dynamic_store::StoreKeyMode::Shadow,
+        bypass_links: Vec::new(),
     }
 }
 

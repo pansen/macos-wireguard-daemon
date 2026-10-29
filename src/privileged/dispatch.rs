@@ -1,8 +1,9 @@
+use crate::bypass_links::BypassLink;
 use crate::error::AppError;
 use crate::privileged_api::{
-    ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode, ConnectionSummary,
-    DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest, PrivilegedResponse,
-    RefreshOutcome,
+    BypassLinkSummary, ConnectReason, ConnectionId, ConnectionScope, ConnectionStartMode,
+    ConnectionSummary, DisconnectReason, DnsCustodyEntry, PeerSummary, PrivilegedRequest,
+    PrivilegedResponse, RefreshOutcome,
 };
 
 use super::authz;
@@ -55,10 +56,11 @@ impl PeerOrigin {
 }
 
 /// Outcome of one dispatch call. `Pending` is used only by
-/// `ConnectConnection`/`DisconnectConnection`/`RefreshConnection`: the actual work runs on a
-/// spawned worker thread (see the design plan's concurrency correction) so a
-/// slow connect/disconnect on one connection cannot freeze the single-threaded
-/// accept loop that also has to keep serving every other client.
+/// `ConnectConnection`/`DisconnectConnection`/`ReconnectConnection`/
+/// `RefreshConnection`: the actual work runs on a spawned worker thread (see
+/// the design plan's concurrency correction) so a slow connect/disconnect on
+/// one connection cannot freeze the single-threaded accept loop that also has
+/// to keep serving every other client.
 pub(super) enum DispatchOutcome {
     Immediate(PrivilegedResponse),
     Pending(std::sync::mpsc::Receiver<PrivilegedResponse>),
@@ -196,6 +198,8 @@ pub(super) fn dispatch(
             handle_disconnect_connection(origin, id, reason)
         }
 
+        PrivilegedRequest::ReconnectConnection { id } => handle_reconnect_connection(origin, id),
+
         PrivilegedRequest::SetConnectionMode {
             id,
             start_mode,
@@ -209,6 +213,10 @@ pub(super) fn dispatch(
 
         PrivilegedRequest::SetConnectionDnsDynamicStore { id, enabled } => {
             DispatchOutcome::Immediate(handle_set_connection_dns_dynamic_store(origin, id, enabled))
+        }
+
+        PrivilegedRequest::SetConnectionBypassLinks { id, links } => {
+            DispatchOutcome::Immediate(handle_set_connection_bypass_links(origin, id, links))
         }
 
         PrivilegedRequest::ListConnections { scope } => {
@@ -334,6 +342,7 @@ fn handle_add_connection(
         source_path,
         mtu_override,
         dns_dynamic_store: false,
+        bypass_links: Vec::new(),
     };
     match connection_store::create(&index_lock, &stored) {
         Ok(()) => PrivilegedResponse::ConnectionId(id),
@@ -537,6 +546,7 @@ fn refresh_connection(
         return PrivilegedResponse::Refreshed(RefreshOutcome {
             changed: false,
             reconnected: false,
+            links_removed: Vec::new(),
         });
     }
 
@@ -565,10 +575,12 @@ fn refresh_connection(
         return response;
     }
 
-    let was_active = match connection_store::is_active(id) {
-        Ok(active) => active,
+    // The debug flag of the running helper, so the reconnect keeps it.
+    let active_debug = match connection_store::active_debug(id) {
+        Ok(active_debug) => active_debug,
         Err(error) => return error_response(error),
     };
+    let was_active = active_debug.is_some();
     // Tear down with the old record still on disk: `disconnect` runs the old
     // config's PreDown/PostDown hooks from it.
     if was_active {
@@ -588,6 +600,14 @@ fn refresh_connection(
     if source_path.is_some() {
         stored.source_path = source_path;
     }
+    // Links the new AllowedIPs no longer support go in the same update as the
+    // config, so a record never holds links its config contradicts.
+    let pruned = crate::bypass_links::prune_links(&stored.bypass_links, &stored.allowed_ips());
+    stored.bypass_links = pruned.links;
+    let links_removed: Vec<String> = pruned.removed.iter().map(ToString::to_string).collect();
+    for line in &links_removed {
+        info!(%id, removed = %line, "privileged_bypass_link_pruned");
+    }
     stored.updated_at = connection_store::now_unix();
     if let Err(error) = connection_store::update(&conn_lock, &stored) {
         return error_response(error);
@@ -597,11 +617,18 @@ fn refresh_connection(
     // `connect` directly rather than through `resolve_connect_intent`: this
     // is not a new connect request, so `user_disconnected` stays as it was.
     if was_active {
-        if let Err(error) = super::connection_ops::connect(&conn_lock, id, false) {
+        if let Err(error) =
+            super::connection_ops::connect(&conn_lock, id, active_debug.unwrap_or(false))
+        {
             return PrivilegedResponse::Error {
                 code: "Other".into(),
                 message: format!(
-                    "the connection record was updated, but reconnecting failed (the connection is down): {error}"
+                    "the connection record was updated{}, but reconnecting failed (the connection is down): {error}",
+                    if links_removed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (links dropped: {})", links_removed.join("; "))
+                    }
                 ),
             };
         }
@@ -609,6 +636,7 @@ fn refresh_connection(
     PrivilegedResponse::Refreshed(RefreshOutcome {
         changed: true,
         reconnected: was_active,
+        links_removed,
     })
 }
 
@@ -775,6 +803,70 @@ fn handle_disconnect_connection(
     DispatchOutcome::Pending(rx)
 }
 
+/// `ReconnectConnection`: see the request's doc comment for the contract.
+/// Runs on a worker thread like `ConnectConnection`, since both halves can be
+/// slow.
+fn handle_reconnect_connection(origin: PeerOrigin, id: ConnectionId) -> DispatchOutcome {
+    let stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return DispatchOutcome::Immediate(not_found()),
+        Err(error) => return DispatchOutcome::Immediate(error_response(error)),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return DispatchOutcome::Immediate(response);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    // See `handle_connect_connection` for why the test root is carried over.
+    #[cfg(test)]
+    let test_root = connection_store::current_test_root();
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(root) = test_root {
+            connection_store::set_test_root(root);
+        }
+        let response = match connection_store::lock_connection_patient(id) {
+            Ok(conn_lock) => reconnect_connection(&conn_lock, id),
+            Err(error) => lock_error_response(error),
+        };
+        let _ = tx.send(response);
+    });
+    DispatchOutcome::Pending(rx)
+}
+
+/// Worker-thread body of `ReconnectConnection`. Whether the connection is up
+/// is read under the lock, so a disconnect that committed meanwhile makes this
+/// a no-op instead of starting a tunnel the user turned off. `connect` is
+/// called directly rather than through `resolve_connect_intent`:
+/// `user_disconnected` is not touched, and the helper keeps the debug flag it
+/// had.
+fn reconnect_connection(
+    conn_lock: &connection_store::ConnectionLock,
+    id: ConnectionId,
+) -> PrivilegedResponse {
+    let debug_enabled = match connection_store::active_debug(id) {
+        Ok(Some(debug_enabled)) => debug_enabled,
+        Ok(None) => return PrivilegedResponse::Bool(false),
+        Err(error) => return error_response(error),
+    };
+    if let Err(error) = super::connection_ops::disconnect(conn_lock, id) {
+        return PrivilegedResponse::Error {
+            code: "Other".into(),
+            message: format!(
+                "could not disconnect before reconnecting; the connection may still be up: {error}"
+            ),
+        };
+    }
+    if let Err(error) = super::connection_ops::connect(conn_lock, id, debug_enabled) {
+        return PrivilegedResponse::Error {
+            code: "Other".into(),
+            message: format!(
+                "disconnected, but connecting again failed (the connection is down): {error}"
+            ),
+        };
+    }
+    PrivilegedResponse::Bool(true)
+}
+
 /// Record `StoredConnection::user_disconnected` for an explicit
 /// (`DisconnectReason::User`) disconnect *before* tearing the tunnel down --
 /// not only on success, so that a teardown that half-fails still leaves the
@@ -882,6 +974,51 @@ fn handle_set_connection_dns_dynamic_store(
     match connection_store::update(&conn_lock, &stored) {
         Ok(()) => {
             info!(%id, enabled, "privileged_dns_dynamic_store_set");
+            PrivilegedResponse::Unit
+        }
+        Err(error) => error_response(error),
+    }
+}
+
+/// Ownership alone is enough, like the DNS switch: a link only decides which
+/// of the owner's own AllowedIPs routes stay off the tunnel and runs nothing
+/// as root. The links are validated against the stored AllowedIPs here, so a
+/// typo is a hard error at `connection config` time instead of a silent no-op
+/// at connect.
+fn handle_set_connection_bypass_links(
+    origin: PeerOrigin,
+    id: ConnectionId,
+    links: Vec<BypassLink>,
+) -> PrivilegedResponse {
+    let conn_lock = match connection_store::lock_connection(id) {
+        Ok(lock) => lock,
+        Err(error) => return lock_error_response(error),
+    };
+    let mut stored = match connection_store::load(id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return not_found(),
+        Err(error) => return error_response(error),
+    };
+    if let Some(response) = authorize_access(&stored, origin) {
+        return response;
+    }
+    let links = match crate::bypass_links::validate_links_strict(&links, &stored.allowed_ips()) {
+        Ok(links) => links,
+        Err(error) => {
+            return PrivilegedResponse::Error {
+                code: "InvalidLink".into(),
+                message: error.to_string(),
+            }
+        }
+    };
+    if stored.bypass_links == links {
+        return PrivilegedResponse::Unit;
+    }
+    stored.bypass_links = links;
+    stored.updated_at = connection_store::now_unix();
+    match connection_store::update(&conn_lock, &stored) {
+        Ok(()) => {
+            info!(%id, links = stored.bypass_links.len(), "privileged_bypass_links_set");
             PrivilegedResponse::Unit
         }
         Err(error) => error_response(error),
@@ -1008,6 +1145,18 @@ fn require_admin_auth(
     }
 }
 
+/// The stored links, each marked invalid with its reason when the current
+/// AllowedIPs no longer support it.
+fn bypass_link_summaries(conn: &StoredConnection) -> Vec<BypassLinkSummary> {
+    crate::bypass_links::check_links(&conn.bypass_links, &conn.allowed_ips())
+        .into_iter()
+        .map(|(link, verdict)| BypassLinkSummary {
+            link,
+            invalid: verdict.err().map(|error| error.to_string()),
+        })
+        .collect()
+}
+
 fn summarize(
     conn: &StoredConnection,
     connected: bool,
@@ -1059,6 +1208,7 @@ fn summarize(
             None
         },
         dns_dynamic_store: conn.dns_dynamic_store,
+        bypass_links: bypass_link_summaries(conn),
         created_at: conn.created_at,
         updated_at: conn.updated_at,
     }
@@ -1299,7 +1449,8 @@ mod tests {
                 outcome,
                 RefreshOutcome {
                     changed: false,
-                    reconnected: false
+                    reconnected: false,
+                    links_removed: Vec::new(),
                 }
             );
             let after = connection_store::load(id).unwrap().unwrap();
@@ -1349,7 +1500,8 @@ mod tests {
                 outcome,
                 RefreshOutcome {
                     changed: true,
-                    reconnected: false
+                    reconnected: false,
+                    links_removed: Vec::new(),
                 }
             );
 
@@ -1956,6 +2108,7 @@ mod tests {
                     changed_sec: 0,
                     changed_nsec: 0,
                     connected_at: connection_store::now_unix(),
+                    debug: false,
                 },
             )
             .unwrap();
@@ -2029,6 +2182,106 @@ mod tests {
                     panic!("unauthorized disconnect must not spawn a worker")
                 }
             }
+        });
+    }
+
+    #[test]
+    fn reconnect_on_nonexistent_connection_is_not_found() {
+        with_test_store("reconnect-missing", || {
+            match handle_reconnect_connection(PeerOrigin::Socket(0), ConnectionId::new()) {
+                DispatchOutcome::Immediate(response) => {
+                    assert_eq!(error_code(&response), "NotFound")
+                }
+                DispatchOutcome::Pending(_) => {
+                    panic!("nonexistent connection must not spawn a worker")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reconnect_rejects_a_non_owner_before_spawning_a_worker() {
+        with_test_store("reconnect-ownership", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            match handle_reconnect_connection(PeerOrigin::Socket(502), id) {
+                DispatchOutcome::Immediate(response) => assert_eq!(error_code(&response), "Auth"),
+                DispatchOutcome::Pending(_) => {
+                    panic!("unauthorized reconnect must not spawn a worker")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reconnect_of_an_inactive_connection_does_nothing() {
+        with_test_store("reconnect-inactive", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            let DispatchOutcome::Pending(rx) =
+                handle_reconnect_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("authorized reconnect must spawn a worker");
+            };
+            let response = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("worker thread must eventually respond");
+            assert!(matches!(response, PrivilegedResponse::Bool(false)));
+            assert!(!connection_store::is_active(id).unwrap());
+            assert!(
+                !connection_store::load(id)
+                    .unwrap()
+                    .unwrap()
+                    .user_disconnected
+            );
+        });
+    }
+
+    #[test]
+    fn active_debug_reports_the_flag_of_a_running_helper_only() {
+        with_test_store("active-debug", || {
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                SAMPLE_CONF,
+                false,
+                valid_auth(),
+            ));
+            assert_eq!(connection_store::active_debug(id).unwrap(), None);
+            let socket = std::env::temp_dir().join(format!(
+                "{}-{:016x}.sock",
+                id.interface_name(),
+                rand::random::<u64>()
+            ));
+            std::fs::write(&socket, b"").unwrap();
+            let conn_lock = connection_store::lock_connection(id).unwrap();
+            connection_store::save_active(
+                &conn_lock,
+                id,
+                &connection_store::ActiveConnectionState {
+                    fingerprint: "sha256:whatever".to_string(),
+                    interface: id.interface_name(),
+                    socket: socket.clone(),
+                    device: 0,
+                    inode: 0,
+                    changed_sec: 0,
+                    changed_nsec: 0,
+                    connected_at: connection_store::now_unix(),
+                    debug: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(connection_store::active_debug(id).unwrap(), Some(true));
+            let _ = std::fs::remove_file(&socket);
+            // The marker outlives the helper: a missing socket means not active.
+            assert_eq!(connection_store::active_debug(id).unwrap(), None);
         });
     }
 
@@ -2481,6 +2734,150 @@ mod tests {
                     .unwrap()
                     .dns_dynamic_store
             );
+        });
+    }
+
+    fn split_conf(allowed_ips: &str) -> String {
+        SAMPLE_CONF.replace("0.0.0.0/0", allowed_ips)
+    }
+
+    fn home_link() -> BypassLink {
+        BypassLink::new(
+            "10.66.77.0/24".parse().unwrap(),
+            vec!["192.168.188.1/32".parse().unwrap()],
+        )
+    }
+
+    #[test]
+    fn set_bypass_links_persists_validates_and_is_pruned_by_refresh() {
+        with_test_store("bypass-links", || {
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32");
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                &conf,
+                false,
+                valid_auth(),
+            ));
+
+            // Host bits are cleared before storing.
+            let sloppy = BypassLink::new(
+                "10.66.77.9/24".parse().unwrap(),
+                vec!["192.168.188.1/32".parse().unwrap()],
+            );
+            let ok = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![sloppy]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // A prefix outside AllowedIPs is a hard error and changes nothing.
+            let typo = BypassLink::new(
+                "10.66.77.0/24".parse().unwrap(),
+                vec!["192.168.188.2/32".parse().unwrap()],
+            );
+            let rejected =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![typo]);
+            assert_eq!(error_code(&rejected), "InvalidLink");
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // The summary reports the link as valid.
+            let PrivilegedResponse::Connection(summary) =
+                handle_get_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("expected a Connection response");
+            };
+            assert_eq!(summary.bypass_links.len(), 1);
+            assert_eq!(summary.bypass_links[0].link, home_link());
+            assert!(summary.bypass_links[0].invalid.is_none());
+
+            // A refresh that drops the prefix prunes the link in the same
+            // update and says so.
+            let dropped = split_conf("10.66.77.0/24");
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &dropped,
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.changed);
+            assert_eq!(
+                outcome.links_removed.len(),
+                2,
+                "{:?}",
+                outcome.links_removed
+            );
+            assert!(outcome.links_removed[0].contains("dropped prefix 192.168.188.1/32"));
+            let stored = connection_store::load(id).unwrap().unwrap();
+            assert!(stored.bypass_links.is_empty());
+            let PrivilegedResponse::Connection(summary) =
+                handle_get_connection(PeerOrigin::Socket(501), id)
+            else {
+                panic!("expected a Connection response");
+            };
+            assert!(summary.bypass_links.is_empty());
+
+            // A refresh that keeps the AllowedIPs keeps the links.
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32, 100.64.1.0/24");
+            let ok = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &conf,
+                None,
+                valid_auth(),
+            ));
+            let ok =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![home_link()]);
+            assert!(matches!(ok, PrivilegedResponse::Unit));
+            let again = split_conf("10.66.77.0/24, 192.168.188.1/32, 100.64.2.0/24");
+            let outcome = refreshed(refresh(
+                PeerOrigin::Socket(501),
+                id,
+                &again,
+                None,
+                valid_auth(),
+            ));
+            assert!(outcome.links_removed.is_empty());
+            assert_eq!(
+                connection_store::load(id).unwrap().unwrap().bypass_links,
+                vec![home_link()]
+            );
+
+            // An empty list clears the links.
+            let cleared = handle_set_connection_bypass_links(PeerOrigin::Socket(501), id, vec![]);
+            assert!(matches!(cleared, PrivilegedResponse::Unit));
+            assert!(connection_store::load(id)
+                .unwrap()
+                .unwrap()
+                .bypass_links
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn set_bypass_links_is_denied_to_another_user() {
+        with_test_store("bypass-links-other-user", || {
+            let conf = split_conf("10.66.77.0/24, 192.168.188.1/32");
+            let id = connection_id(&add_connection(
+                PeerOrigin::Socket(501),
+                &conf,
+                false,
+                valid_auth(),
+            ));
+            let response =
+                handle_set_connection_bypass_links(PeerOrigin::Socket(502), id, vec![home_link()]);
+            assert_eq!(error_code(&response), "Auth");
+            assert!(connection_store::load(id)
+                .unwrap()
+                .unwrap()
+                .bypass_links
+                .is_empty());
         });
     }
 
