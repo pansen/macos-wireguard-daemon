@@ -129,6 +129,52 @@ jobs:
           make -C macos/WgdBar app VERSION="${version#v}" \
             SIGN_IDENTITY="Developer ID Application"
 
+      - name: Prepare notarization
+        shell: bash
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${ASC_KEY_P8}" > "$RUNNER_TEMP/asc-key.p8"
+          # stapler fetches the ticket from api.apple-cloudkit.com over HTTP/3
+          # (QUIC, UDP 443), and that path drops on GitHub-hosted macOS runners
+          # (NSURLError -1005, stapler error 68; actions/runner-images#14924).
+          # Blocking outbound UDP 443 makes it fall back to HTTPS over TCP,
+          # which works. The runner VM is discarded after the job.
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
+          # Keep a retry for the remaining transient CloudKit failures.
+          cat > "$RUNNER_TEMP/retry.sh" <<'EOF'
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "::warning::'$*' failed (attempt ${attempt}/5), retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+            done
+            "$@"
+          }
+          EOF
+
+      - name: Notarize and staple menu bar app
+        shell: bash
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/retry.sh"
+          # The cask copies WgdBar.app out of the DMG, leaving the DMG's ticket
+          # behind. Without its own stapled ticket, Gatekeeper must look the
+          # app up online at first launch and rejects it when that fails.
+          ditto -c -k --keepParent target/WgdBar.app "$RUNNER_TEMP/WgdBar.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/WgdBar.zip" \
+            --key "$RUNNER_TEMP/asc-key.p8" --key-id "${ASC_KEY_ID}" \
+            --issuer "${ASC_ISSUER_ID}" --wait
+          rm "$RUNNER_TEMP/WgdBar.zip"
+          retry xcrun stapler staple target/WgdBar.app
+          retry xcrun stapler validate target/WgdBar.app
+
       - name: Package artifact
         shell: bash
         run: |
@@ -166,35 +212,17 @@ jobs:
       - name: Notarize and staple DMG
         shell: bash
         env:
-          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/retry.sh"
           key_file="$RUNNER_TEMP/asc-key.p8"
-          printf '%s' "${ASC_KEY_P8}" > "${key_file}"
           dmg=(dist/*.dmg)
           xcrun notarytool submit "${dmg[0]}" \
             --key "${key_file}" --key-id "${ASC_KEY_ID}" \
             --issuer "${ASC_ISSUER_ID}" --wait
           rm "${key_file}"
-          # stapler fetches the ticket from api.apple-cloudkit.com over HTTP/3
-          # (QUIC, UDP 443), and that path drops on GitHub-hosted macOS runners
-          # (NSURLError -1005, stapler error 68; actions/runner-images#14924).
-          # Blocking outbound UDP 443 makes it fall back to HTTPS over TCP,
-          # which works. The runner VM is discarded after the job.
-          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
-          sudo pfctl -E
-          # Keep a retry for the remaining transient CloudKit failures.
-          retry() {
-            local attempt
-            for attempt in 1 2 3 4 5; do
-              "$@" && return 0
-              echo "::warning::'$*' failed (attempt ${attempt}/5), retrying in $((attempt * 15))s"
-              sleep $((attempt * 15))
-            done
-            "$@"
-          }
           retry xcrun stapler staple "${dmg[0]}"
           retry xcrun stapler validate "${dmg[0]}"
 
