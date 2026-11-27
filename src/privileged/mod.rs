@@ -19,6 +19,7 @@ mod daemon;
 mod dispatch;
 mod dns_sweep;
 mod dns_watch;
+mod helper_supervisor;
 pub(crate) mod managed_pids;
 mod runtime_files;
 mod socket;
@@ -177,6 +178,7 @@ pub fn serve(
 
     let mut control_state = ControlState::new(cli_autostarted);
     dns_watch::init();
+    helper_supervisor::init();
     let resident = dns_watch::resident_count();
     // Phase 3: bring up global `Automatic` connections in the background,
     // only once the listener above is already bound and accepting -- doing
@@ -197,6 +199,9 @@ pub fn serve(
                 tracing::warn!(error = %error, "privileged_dns_sweep_failed");
             }
             connection_store::reconcile_boot();
+            // Tunnels that outlived a daemon restart; the ones started above
+            // are already watched.
+            helper_supervisor::watch_running();
             background_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
     }

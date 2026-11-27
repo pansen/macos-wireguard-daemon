@@ -68,6 +68,7 @@ pub(super) struct ExitWatcher<T> {
 
 impl<T: Send + 'static> ExitWatcher<T> {
     pub(super) fn new(
+        thread_name: &str,
         hold: Arc<AtomicUsize>,
         on_exit: impl Fn(u32, T) + Send + 'static,
     ) -> io::Result<Self> {
@@ -78,7 +79,7 @@ impl<T: Send + 'static> ExitWatcher<T> {
             let entries = Arc::clone(&entries);
             let hold = Arc::clone(&hold);
             std::thread::Builder::new()
-                .name("dns-custody-watch".into())
+                .name(thread_name.into())
                 .spawn(move || watch_loop(&kqueue, &entries, &hold, on_exit))?;
         }
         Ok(Self {
@@ -215,9 +216,13 @@ pub(super) fn resident_count() -> Arc<AtomicUsize> {
 /// sentinel and the retry loop still cover crash recovery, just not within
 /// seconds.
 pub(super) fn init() {
-    let result = ExitWatcher::new(resident_count(), |pid, helper: WatchedHelper| {
-        handle_exit(pid, helper);
-    });
+    let result = ExitWatcher::new(
+        "dns-custody-watch",
+        resident_count(),
+        |pid, helper: WatchedHelper| {
+            handle_exit(pid, helper);
+        },
+    );
     match result {
         Ok(watcher) => {
             let _ = WATCHER.set(watcher);
@@ -227,7 +232,7 @@ pub(super) fn init() {
 }
 
 /// Run `work` on its own thread while holding one resident count.
-fn spawn_held(work: impl FnOnce() + Send + 'static) {
+pub(super) fn spawn_held(work: impl FnOnce() + Send + 'static) {
     let resident = resident_count();
     resident.fetch_add(1, Ordering::SeqCst);
     std::thread::spawn(move || {
@@ -498,9 +503,13 @@ mod tests {
         let hold = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
-        let watcher = ExitWatcher::new(Arc::clone(&hold), move |pid, token: &'static str| {
-            tx.lock().unwrap().send((pid, token)).unwrap();
-        })
+        let watcher = ExitWatcher::new(
+            "test-watch",
+            Arc::clone(&hold),
+            move |pid, token: &'static str| {
+                tx.lock().unwrap().send((pid, token)).unwrap();
+            },
+        )
         .unwrap();
 
         let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
@@ -525,7 +534,7 @@ mod tests {
     #[test]
     fn registering_a_dead_pid_reports_gone_immediately() {
         let hold = Arc::new(AtomicUsize::new(0));
-        let watcher = ExitWatcher::new(Arc::clone(&hold), |_, _: u8| {
+        let watcher = ExitWatcher::new("test-watch", Arc::clone(&hold), |_, _: u8| {
             panic!("no exit event expected");
         })
         .unwrap();
@@ -543,7 +552,7 @@ mod tests {
     #[test]
     fn registering_the_same_pid_twice_is_ignored() {
         let hold = Arc::new(AtomicUsize::new(0));
-        let watcher = ExitWatcher::new(Arc::clone(&hold), |_, _: u8| {}).unwrap();
+        let watcher = ExitWatcher::new("test-watch", Arc::clone(&hold), |_, _: u8| {}).unwrap();
         let mut child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
         watcher.register(child.id(), 1).unwrap();
         assert!(matches!(

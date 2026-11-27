@@ -62,6 +62,9 @@ pub fn dispatch(mut args: LogsArgs) -> anyhow::Result<()> {
 
     let log_dir = config::root_log_dir();
     let mut files = matching_log_files_in(&log_dir, filter.as_deref())?;
+    if let Some(stem) = filter.as_deref() {
+        prepend_previous_session(&mut files, &log_dir, stem, args.all, SystemTime::now());
+    }
     let mut skipped = 0;
     if filter.is_none() && !args.all {
         (files, skipped) = keep_recent_logs(files, SystemTime::now());
@@ -149,6 +152,30 @@ fn is_recent(modified: SystemTime, now: SystemTime) -> bool {
     now.duration_since(modified)
         .map(|age| age <= RECENT_LOG_AGE)
         .unwrap_or(true)
+}
+
+/// For a named connection, put its previous helper session
+/// (`<stem>.1.log`, rotated away by the latest connect) in front of the
+/// current one. A helper that died is usually followed by a manual or
+/// automatic reconnect, and without this its cause would vanish from view.
+/// Skipped when older than [`RECENT_LOG_AGE`] unless `all` is set.
+fn prepend_previous_session(
+    files: &mut Vec<PathBuf>,
+    log_dir: &Path,
+    stem: &str,
+    all: bool,
+    now: SystemTime,
+) {
+    if !stem.starts_with("wg-") {
+        return;
+    }
+    let previous = log_dir.join(format!("{stem}.1.log"));
+    let Ok(modified) = fs::metadata(&previous).and_then(|m| m.modified()) else {
+        return;
+    };
+    if all || is_recent(modified, now) {
+        files.insert(0, previous);
+    }
 }
 
 /// Query unified logging for `sender == "launchd"` entries mentioning `wgd` in
@@ -450,6 +477,39 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(kept, vec![daemon]);
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn named_connection_shows_a_recent_previous_session_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "wgd-logs-prev-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("wg-1ce3a4a1.log");
+        let previous = dir.join("wg-1ce3a4a1.1.log");
+        fs::write(&current, "now\n").unwrap();
+        fs::write(&previous, "before\n").unwrap();
+
+        let mut files = vec![current.clone()];
+        prepend_previous_session(&mut files, &dir, "wg-1ce3a4a1", false, SystemTime::now());
+        assert_eq!(files, vec![previous.clone(), current.clone()]);
+
+        // A week later only `--all` still shows it.
+        let later = SystemTime::now() + Duration::from_secs(7 * 24 * 60 * 60);
+        let mut files = vec![current.clone()];
+        prepend_previous_session(&mut files, &dir, "wg-1ce3a4a1", false, later);
+        assert_eq!(files, vec![current.clone()]);
+        prepend_previous_session(&mut files, &dir, "wg-1ce3a4a1", true, later);
+        assert_eq!(files, vec![previous, current.clone()]);
+
+        // The daemon's logs have no rotated sessions.
+        let mut files = vec![current.clone()];
+        prepend_previous_session(&mut files, &dir, "privileged", true, SystemTime::now());
+        assert_eq!(files, vec![current]);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

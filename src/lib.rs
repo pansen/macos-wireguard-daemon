@@ -19,6 +19,7 @@ pub mod doctor;
 // positionals, so `cli` cannot compile without it.
 pub mod connection_cli;
 pub mod error;
+pub mod helper_exit;
 pub mod launchctl;
 pub mod launchd;
 pub mod logging;

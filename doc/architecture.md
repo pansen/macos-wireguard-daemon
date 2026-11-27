@@ -324,8 +324,20 @@ authenticated_external_form_verifies_once_without_reprompting -- --ignored`
   teardown, connects every `Automatic` connection that is neither connected
   nor `user_disconnected`, then waits in `sigwait(3)`. On logout it
   disconnects what is connected (`SessionTeardown`) and exits. It reconciles
-  only once: a crashed helper stays down until the next login or an explicit
-  `connect`. Fast user switching is not covered.
+  only once; a helper that dies later is the helper supervisor's job (below).
+  Fast user switching is not covered.
+- **Helper supervisor** (`helper_supervisor`): every helper `connect` starts
+  is watched with kqueue `NOTE_EXIT`, as are helpers found running at daemon
+  start. On exit it takes the connection lock; a cleared `active/<id>.json` or
+  a newer live helper means a disconnect or reconnect did it. Otherwise it
+  logs `privileged_helper_exited_unexpectedly` with the reason the helper
+  wrote to `<iface>.wgd.exit` (`crate::helper_exit`; no file means a crash).
+  Requested exits (SIGTERM, SIGINT, socket removed) and connections that are
+  `Manual` or `user_disconnected` stay down. Otherwise the supervisor
+  reconnects with backoff (1 s doubling to 60 s, 12 failed attempts), each
+  attempt only once `State:/Network/Global/IPv4` or `IPv6` exists, because a
+  helper that died with the network (sleep, Wi-Fi loss) would fail again
+  right away.
 
 `wgd connection add|mode|connect|refresh` and `sudo wgd launchd install`
 install a missing session agent when a per-user `Automatic` connection needs
@@ -343,7 +355,7 @@ flowchart TB
         ACT -->|no| BIND["bind ctl.sock itself"]
         FD --> SPAWN
         BIND --> SPAWN
-        SPAWN["dns_watch::init(); background thread:<br/>DNS sweep, reconcile_boot()"] --> LOOP
+        SPAWN["dns_watch::init(), helper_supervisor::init();<br/>background thread: DNS sweep,<br/>reconcile_boot(), watch_running()"] --> LOOP
     end
 
     LOOP["socket::serve<br/>nonblocking accept loop"]
@@ -364,7 +376,7 @@ interface-keyed `WgShow`/`NetworkOverview`/`InterfaceActive` whenever the
 interface belongs to a stored connection. `background_work` keeps the daemon
 up during the startup sweep and boot reconcile (otherwise it could idle-exit
 before `active/<id>.json` is written); `resident` is held by the DNS custody
-watch. Limits: 32 clients, 1 MiB per request, 2 MiB per response, 10 s I/O
+watch and the helper supervisor, so a daemon with a live tunnel stays up. Limits: 32 clients, 1 MiB per request, 2 MiB per response, 10 s I/O
 per client. The wire format is newline-delimited JSON tagged by `kind`, with
 optional `{"log": ...}` frames before the response.
 

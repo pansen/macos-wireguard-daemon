@@ -1585,11 +1585,44 @@ fn bootstrap() -> anyhow::Result<()> {
 
     // Not loaded yet is fine; ignore failure.
     run_ignore_failure("/bin/launchctl", &["bootout", &target]);
+    // `bootout` can return while launchd is still tearing the job down, and
+    // a `bootstrap` in that window fails with EIO ("Bootstrap failed: 5").
+    wait_for_job_gone(&target);
     // Clear any stale "disabled" override left over from a previous
     // uninstall — bootstrapping a disabled label fails with EIO.
     run_checked("/bin/launchctl", &["enable", &target])?;
-    run_checked("/bin/launchctl", &["bootstrap", "system", PLIST_PATH])?;
-    Ok(())
+    let mut attempt = 1;
+    loop {
+        match run_checked("/bin/launchctl", &["bootstrap", "system", PLIST_PATH]) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < BOOTSTRAP_ATTEMPTS => {
+                tracing::debug!(attempt, error = %error, "launchd_bootstrap_retry");
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                wait_for_job_gone(&target);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+const BOOTSTRAP_ATTEMPTS: u32 = 4;
+
+/// Wait up to 10 s until `launchctl print <target>` no longer finds the job.
+fn wait_for_job_gone(target: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let loaded = std::process::Command::new("/bin/launchctl")
+            .args(["print", target])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !loaded {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::debug!(target, "launchd_bootout_still_in_progress");
 }
 
 /// Block until launchd accepts connections on the control socket again.

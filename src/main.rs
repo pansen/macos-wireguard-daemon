@@ -7,6 +7,7 @@ mod dns_custody;
 mod dns_dynamic_store;
 mod doctor;
 mod error;
+mod helper_exit;
 mod launchctl;
 mod launchd;
 mod logging;

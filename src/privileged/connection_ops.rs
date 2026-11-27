@@ -160,6 +160,9 @@ pub(super) fn connect(
                 return Err(conflict());
             }
             return if active.fingerprint == stored.fingerprint {
+                // Already up. Watching is idempotent, and covers a helper
+                // that predates this daemon process.
+                super::helper_supervisor::watch(id, &stored.interface);
                 Ok(())
             } else {
                 Err(conflict())
@@ -242,6 +245,7 @@ pub(super) fn connect(
         },
     )?;
     debug!(id = %id, interface = %stored.interface, "connection_connected");
+    super::helper_supervisor::watch(id, &stored.interface);
     crate::status_notify::post(Trigger::Connected {
         id,
         interface: &stored.interface,

@@ -298,7 +298,8 @@ connect would start it and hide the state you want to see.
 `wgd logs` prints the last 150 lines (`-n`) of `/var/log/wgd/*.log`: the
 daemon's `privileged.{out,err}.log` and one `<interface>.log` per helper,
 plus the previous session in `<interface>.1.log`. A connection name, id or
-interface filters to one helper; logs untouched for 24 hours need `--all`.
+interface filters to one helper, previous session first, so the reason a
+helper died survives the reconnect; logs untouched for 24 hours need `--all`.
 `--launchd` shows launchd's last 10 minutes about wgd, where a daemon that
 fails to start shows up. The session agent logs to
 `~/Library/Logs/wgd-session-agent.{out,err}.log`.

@@ -26,6 +26,9 @@ use tokio::signal::unix::{signal, SignalKind};
 #[cfg(unix)]
 use tracing::{debug, info, warn};
 
+#[cfg(unix)]
+use crate::helper_exit::HelperExitReason;
+
 mod config;
 mod exec;
 #[cfg(target_os = "macos")]
@@ -269,10 +272,12 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             }
 
             let shutdown_started = std::time::Instant::now();
-            let wait_result = rt.block_on(wait_for_shutdown(&mut running));
+            let mut exit_reason = HelperExitReason::Failed;
+            let wait_result = rt.block_on(wait_for_shutdown(&mut running, &mut exit_reason));
             info!(
                 interface = running.control_interface_name,
                 elapsed_ms = shutdown_started.elapsed().as_millis(),
+                reason = exit_reason.as_str(),
                 result = ?wait_result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
                 "userspace_helper_shutdown_triggered"
             );
@@ -322,6 +327,14 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 Ok(()) => "ok\n".to_string(),
                 Err(error) => format!("error: {error}\n"),
             };
+            // Before the cleanup status: the daemon's supervisor reads this
+            // once the process is gone, to decide whether to restart it.
+            if let Err(error) = write_runtime_file_atomic(
+                &crate::helper_exit::path(interface),
+                &format!("{}\n", exit_reason.as_str()),
+            ) {
+                warn!(interface, error = %error, "userspace_helper_exit_reason_write_failed");
+            }
             write_runtime_file_atomic(&gotatun_cleanup_status_path(interface), &status)?;
             let _ = std::fs::remove_file(&control_socket_path);
             let _ = std::fs::remove_file(&pid_path);
@@ -421,7 +434,12 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown(running: &mut RunningDevice) -> anyhow::Result<()> {
+/// Runs until something ends the helper and records why in `reason`. It
+/// stays [`HelperExitReason::Failed`] when an error ends the loop.
+async fn wait_for_shutdown(
+    running: &mut RunningDevice,
+    reason: &mut HelperExitReason,
+) -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -436,21 +454,25 @@ async fn wait_for_shutdown(running: &mut RunningDevice) -> anyhow::Result<()> {
         tokio::select! {
             _ = running.device.wait() => {
                 warn!(interface = running.control_interface_name, trigger = "device_error", "userspace_helper_shutdown_requested");
+                *reason = HelperExitReason::DeviceError;
                 // Return through the normal cleanup path to restore DNS/routes,
                 // stop the device and record the failure before exiting.
                 anyhow::bail!("gotatun device reported an unrecoverable error");
             },
             _ = sigint.recv() => {
                 info!(interface = running.control_interface_name, trigger = "sigint", "userspace_helper_shutdown_requested");
+                *reason = HelperExitReason::Sigint;
                 break;
             },
             _ = sigterm.recv() => {
                 info!(interface = running.control_interface_name, trigger = "sigterm", "userspace_helper_shutdown_requested");
+                *reason = HelperExitReason::Sigterm;
                 break;
             },
             _ = ticker.tick() => {
                 if !running.control_socket_path.exists() {
                     info!(interface = running.control_interface_name, trigger = "control_socket_removed", "userspace_helper_shutdown_requested");
+                    *reason = HelperExitReason::ControlSocketRemoved;
                     break;
                 }
 

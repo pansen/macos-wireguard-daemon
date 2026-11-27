@@ -238,6 +238,7 @@ pub(super) fn run_gotatun_up(
         gotatun_pid_path(interface),
         gotatun_name_path(interface),
         gotatun_cleanup_status_path(interface),
+        crate::helper_exit::path(interface),
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -420,10 +421,25 @@ pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
         "gotatun_shutdown_complete"
     );
 
-    for path in [pid_path, name_path, cleanup_status_path] {
+    for path in [
+        pid_path,
+        name_path,
+        cleanup_status_path,
+        crate::helper_exit::path(interface),
+    ] {
         let _ = std::fs::remove_file(path);
     }
     Ok(())
+}
+
+/// What the helper on `interface` recorded as the reason it ended, or `None`
+/// when it left no record (killed, panicked, or never got that far).
+pub(super) fn read_helper_exit_reason(
+    interface: &str,
+) -> Option<crate::helper_exit::HelperExitReason> {
+    std::fs::read_to_string(crate::helper_exit::path(interface))
+        .ok()
+        .and_then(|text| crate::helper_exit::HelperExitReason::parse(&text))
 }
 
 fn wait_for_cleanup_status(path: &std::path::Path, timeout: Duration) -> Option<String> {
