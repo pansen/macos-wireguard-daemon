@@ -86,13 +86,6 @@ pub(crate) fn is_autostart_connect_error(err: &std::io::Error) -> bool {
         || err.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
-/// Whether `wgd launchd install` registered the privileged daemon with
-/// launchd. If so, launchd is the only thing allowed to start it: see
-/// `PrivilegedClient::wait_for_launchd_socket`.
-fn launchd_daemon_installed() -> bool {
-    std::path::Path::new(crate::launchd::PLIST_PATH).exists()
-}
-
 /// The running wgd binary, if root may execute it. A daemon or stdio helper
 /// started from anywhere else (e.g. Homebrew's user-owned `/opt/homebrew`)
 /// answers requests but refuses to spawn tunnel helpers (see
@@ -173,14 +166,22 @@ impl PrivilegedClient {
             }
         }
 
+        // launchd is the only thing allowed to start a launchd-managed daemon;
+        // a manually started one would refuse to bind the socket.
+        let launchd_managed = crate::launchd::daemon_installed();
         if !self.autostart_enabled {
+            let fix = if launchd_managed {
+                format!("sudo {} launchd restart", crate::launchd::TRUSTED_BIN_PATH)
+            } else {
+                self.manual_start_command()
+            };
             return Err(AppError::Other(format!(
                 "autostart disabled and privileged socket unavailable; run: {}",
-                self.manual_start_command()
+                fix
             )));
         }
 
-        if launchd_daemon_installed() {
+        if launchd_managed {
             return self.wait_for_launchd_socket();
         }
 

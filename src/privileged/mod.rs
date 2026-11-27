@@ -83,6 +83,13 @@ pub fn serve(
     debug!(
         autostarted = ?cli_autostarted,
         idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64, "privileged_service_start");
+    // Decide whether this process may own the socket before touching the
+    // authorizationdb or any directory: a refused start must leave the
+    // running daemon's setup alone.
+    let activated = launchd_activated_listener()?;
+    if activated.is_none() {
+        prepare_self_bind(&config::privileged_socket_path())?;
+    }
     // Upgrade authorizationdb before any client can authenticate against the
     // old zero-timeout rule. Do not serve mutations with an incompatible rule.
     crate::launchd::register_authorization_right()
@@ -107,8 +114,6 @@ pub fn serve(
             gid = ?gid, "socket_dir_chowned");
     }
 
-    let activated = launchd_activated_listener()?;
-
     let listener = match activated {
         Some(listener) => {
             info!("privileged_service_socket_activation");
@@ -126,38 +131,6 @@ pub fn serve(
         }
         None => {
             let socket_path = config::privileged_socket_path();
-            if socket_path.exists() {
-                // A stale socket file (left behind by a crashed or killed
-                // predecessor) is safe to unlink and rebind over. A socket
-                // file that still has a live listener behind it is not:
-                // unlinking it would silently orphan that daemon (its
-                // listening fd stays open and functional, but no new client
-                // can ever reach it again to ask it to shut down), leaving a
-                // second privileged root process running forever. Probe
-                // liveness first and refuse to start rather than steal it.
-                match std::os::unix::net::UnixStream::connect(&socket_path) {
-                    Ok(_) => {
-                        anyhow::bail!(
-                            "a privileged wgd daemon is already listening on {}; refusing to start a duplicate",
-                            socket_path.display()
-                        );
-                    }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::ConnectionRefused
-                            || e.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        let _ = std::fs::remove_file(&socket_path);
-                    }
-                    Err(e) => {
-                        anyhow::bail!(
-                            "failed to probe existing socket {} before startup: {}",
-                            socket_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-
             let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
             let perms = std::fs::Permissions::from_mode(0o660);
             std::fs::set_permissions(&socket_path, perms)?;
@@ -324,6 +297,86 @@ extern "C" {
         fds: *mut *mut std::ffi::c_int,
         cnt: *mut usize,
     ) -> std::ffi::c_int;
+}
+
+/// What a daemon that launchd did not activate does about the control socket.
+#[derive(Debug)]
+enum SelfBindPlan {
+    /// The launchd plist is installed: only launchd may own the socket.
+    RefuseLaunchdManaged,
+    /// Another daemon accepts on the socket.
+    RefuseLive,
+    RefuseProbeFailed(std::io::Error),
+    /// The socket file is stale (left behind by a crashed or killed
+    /// predecessor) and safe to unlink.
+    UnlinkStaleAndBind,
+    /// No socket file exists.
+    Bind,
+}
+
+/// Decide how to bind the control socket outside launchd. `probe` is `None`
+/// when no socket file exists, otherwise the result of connecting to it.
+///
+/// With the plist installed this refuses regardless of the probe: launchd
+/// briefly leaves a dead socket file behind during `launchd install`, and a
+/// live daemon with a full accept queue answers `ECONNREFUSED` on macOS.
+/// Treating either as stale would replace launchd's socket with one that
+/// `bootout`/`bootstrap` never see, orphaning launchd's own listener.
+///
+/// Without the plist, unlinking a refused socket is the only way to recover
+/// from a crashed daemon, so the accept-queue case is an accepted risk there.
+/// A socket that accepts is never unlinked: that would orphan a running
+/// daemon nobody could reach to shut it down.
+fn self_bind_plan(launchd_managed: bool, probe: Option<std::io::Result<()>>) -> SelfBindPlan {
+    if launchd_managed {
+        return SelfBindPlan::RefuseLaunchdManaged;
+    }
+    match probe {
+        None => SelfBindPlan::Bind,
+        Some(Ok(())) => SelfBindPlan::RefuseLive,
+        Some(Err(e))
+            if e.kind() == std::io::ErrorKind::ConnectionRefused
+                || e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            SelfBindPlan::UnlinkStaleAndBind
+        }
+        Some(Err(e)) => SelfBindPlan::RefuseProbeFailed(e),
+    }
+}
+
+/// Apply `self_bind_plan` to `socket_path`: fail if this process must not
+/// bind it, unlink a stale socket file otherwise. Touches nothing but the
+/// socket file, so `serve` runs it before any other setup.
+fn prepare_self_bind(socket_path: &std::path::Path) -> anyhow::Result<()> {
+    let launchd_managed = crate::launchd::daemon_installed();
+    // Only probe when the plist is absent: with launchd managing the daemon
+    // the probe result is irrelevant, and connecting would socket-activate
+    // the launchd job for nothing.
+    let probe = (!launchd_managed && socket_path.exists())
+        .then(|| std::os::unix::net::UnixStream::connect(socket_path).map(drop));
+    match self_bind_plan(launchd_managed, probe) {
+        SelfBindPlan::RefuseLaunchdManaged => anyhow::bail!(
+            "privileged daemon is managed by launchd ({}); refusing to bind {} outside launchd.\n\
+             Restart it with: sudo {} launchd restart",
+            crate::launchd::PLIST_PATH,
+            socket_path.display(),
+            crate::launchd::TRUSTED_BIN_PATH
+        ),
+        SelfBindPlan::RefuseLive => anyhow::bail!(
+            "a privileged wgd daemon is already listening on {}; refusing to start a duplicate",
+            socket_path.display()
+        ),
+        SelfBindPlan::RefuseProbeFailed(e) => anyhow::bail!(
+            "failed to probe existing socket {} before startup: {}",
+            socket_path.display(),
+            e
+        ),
+        SelfBindPlan::UnlinkStaleAndBind => {
+            let _ = std::fs::remove_file(socket_path);
+            Ok(())
+        }
+        SelfBindPlan::Bind => Ok(()),
+    }
 }
 
 /// Retrieve a launchd socket-activation listener for the `Listeners` socket
@@ -528,6 +581,65 @@ fn read_group_gid(group_name: &str) -> Option<u32> {
         .ok()
         .flatten()
         .map(|g| g.gid.as_raw())
+}
+
+#[cfg(test)]
+mod self_bind_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn refused() -> Option<std::io::Result<()>> {
+        Some(Err(Error::from(ErrorKind::ConnectionRefused)))
+    }
+
+    #[test]
+    fn launchd_managed_refuses_whatever_the_probe_says() {
+        for probe in [
+            None,
+            Some(Ok(())),
+            refused(),
+            Some(Err(Error::from(ErrorKind::NotFound))),
+            Some(Err(Error::from(ErrorKind::PermissionDenied))),
+        ] {
+            assert!(matches!(
+                self_bind_plan(true, probe),
+                SelfBindPlan::RefuseLaunchdManaged
+            ));
+        }
+    }
+
+    #[test]
+    fn without_plist_missing_socket_binds() {
+        assert!(matches!(self_bind_plan(false, None), SelfBindPlan::Bind));
+    }
+
+    #[test]
+    fn without_plist_live_socket_is_not_stolen() {
+        assert!(matches!(
+            self_bind_plan(false, Some(Ok(()))),
+            SelfBindPlan::RefuseLive
+        ));
+    }
+
+    #[test]
+    fn without_plist_refused_or_vanished_socket_is_stale() {
+        assert!(matches!(
+            self_bind_plan(false, refused()),
+            SelfBindPlan::UnlinkStaleAndBind
+        ));
+        assert!(matches!(
+            self_bind_plan(false, Some(Err(Error::from(ErrorKind::NotFound)))),
+            SelfBindPlan::UnlinkStaleAndBind
+        ));
+    }
+
+    #[test]
+    fn without_plist_other_probe_errors_refuse() {
+        assert!(matches!(
+            self_bind_plan(false, Some(Err(Error::from(ErrorKind::PermissionDenied)))),
+            SelfBindPlan::RefuseProbeFailed(_)
+        ));
+    }
 }
 
 #[cfg(test)]

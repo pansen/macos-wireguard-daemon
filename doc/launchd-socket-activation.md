@@ -52,13 +52,18 @@ ownership; the gid is only logged.
 
 ## Server startup (`privileged::serve`, `src/privileged/mod.rs`)
 
-1. Register the authorization right (refuse to start on failure), ensure the
-   directories, chown the socket dir to `wgd`.
-2. `launch_activate_socket("Listeners")`: a launchd job gets its fd (extra fds
-   are closed) and re-applies 0660 and the group in case the plist's gid is
-   stale. A `sudo`-spawned daemon gets nothing and binds itself, after probing
-   an existing socket file: a live listener means another daemon owns the
-   path, so it refuses to start; a stale file is unlinked.
+1. `launch_activate_socket("Listeners")`: a launchd job gets its fd (extra fds
+   are closed). A `sudo`-spawned daemon gets nothing and has to bind the
+   socket itself. It refuses to start when the plist exists, since only
+   launchd may own the socket then (a dead socket file during `launchd
+   install` and a full accept queue both answer `ECONNREFUSED`). Without the
+   plist it probes an existing socket file: a live listener means another
+   daemon owns the path, so it refuses to start; a stale file is unlinked.
+   This runs before any other setup, so a refused start changes nothing.
+2. Register the authorization right (refuse to start on failure), ensure the
+   directories, chown the socket dir to `wgd`. A launchd job then re-applies
+   0660 and the group to its socket in case the plist's gid is stale; a
+   self-binding daemon binds and sets both.
 3. Start the DNS custody watch; on a background thread sweep DNS left by dead
    helpers and run `reconcile_boot()`.
 4. Enter the accept loop.

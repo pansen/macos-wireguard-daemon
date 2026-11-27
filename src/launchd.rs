@@ -24,6 +24,13 @@ use crate::privileged_client::PrivilegedClient;
 pub(crate) const LABEL: &str = "me.pansen.wgd.privileged";
 pub(crate) const PLIST_PATH: &str = "/Library/LaunchDaemons/me.pansen.wgd.privileged.plist";
 
+/// Whether `wgd launchd install` registered the privileged daemon with
+/// launchd. If so, launchd is the only thing allowed to start it: clients
+/// never autostart it and the daemon refuses to bind the socket itself.
+pub(crate) fn daemon_installed() -> bool {
+    std::path::Path::new(PLIST_PATH).exists()
+}
+
 /// Group whose members may talk to the privileged daemon's control socket.
 /// Must match `AUTH_GROUP_NAME` in `src/privileged/mod.rs`, which is private
 /// to that module and therefore unavailable from here.
